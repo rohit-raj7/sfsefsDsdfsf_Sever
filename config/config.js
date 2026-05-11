@@ -1,6 +1,26 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+const rawCorsOrigin = process.env.CORS_ORIGIN ;
+const corsOrigins = rawCorsOrigin
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const hasWildcardOrigin = corsOrigins.includes('*');
+const corsOrigin = hasWildcardOrigin
+  ? '*'
+  : (origin, callback) => {
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (corsOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error('Not allowed by CORS'));
+    };
+
 export default {
   // Server configuration
   PORT: process.env.PORT || 3002,
@@ -44,7 +64,7 @@ export default {
 
   // CORS configuration
   cors: {
-    origin: process.env.CORS_ORIGIN || '*',
+    origin: corsOrigin,
     credentials: true
   },
 

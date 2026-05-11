@@ -46,8 +46,8 @@ async function getFollowSnapshot(currentUserId, listenerUserId) {
     followersCount: Number(row.followers_count ?? 0)
   };
 }
-// GET /api/users
-router.get('/', authenticate, async (req, res) => {
+// GET /api/users (admin only)
+router.get('/', authenticateAdmin, async (req, res) => {
   try {
     const params = [];
     const conditions = [];
@@ -99,6 +99,10 @@ router.get('/', authenticate, async (req, res) => {
           user_id,
           full_name,
           display_name,
+          email,
+          phone_number,
+          mobile_number,
+          auth_provider,
           gender,
           date_of_birth,
           city,

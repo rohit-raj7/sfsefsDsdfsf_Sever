@@ -28,6 +28,9 @@ const ADMIN_GOOGLE_CLIENT_ID =
   process.env.admin_google_client_id_override ||
   process.env.ADMIN_GOOGLE_CLIENT_ID ||
   process.env.admin_google_client_id;
+const ADMIN_SEED_EMAIL = String(process.env.ADMIN_SEED_EMAIL || '').trim().toLowerCase();
+const ADMIN_SEED_PASSWORD = String(process.env.ADMIN_SEED_PASSWORD || '');
+const ADMIN_SEED_FULL_NAME = String(process.env.ADMIN_SEED_FULL_NAME || 'Admin').trim();
 const googleClient = new OAuth2Client(ADMIN_GOOGLE_CLIENT_ID);
 const allowedAdminEmails = (
   process.env.ADMIN_ALLOWED_EMAILS || ''
@@ -90,12 +93,34 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const admin = await Admin.findByEmail(email);
+    let admin = await Admin.findByEmail(email);
+    const isSeedAdminLogin = ADMIN_SEED_EMAIL && email === ADMIN_SEED_EMAIL;
+
+    // Self-heal missing seed admin account for environments that rely on .env credentials.
+    if (!admin && isSeedAdminLogin && ADMIN_SEED_PASSWORD) {
+      const seedPasswordHash = await Admin.hashPassword(ADMIN_SEED_PASSWORD);
+      admin = await Admin.create({
+        email: ADMIN_SEED_EMAIL,
+        password_hash: seedPasswordHash,
+        full_name: ADMIN_SEED_FULL_NAME
+      });
+    }
+
     if (!admin) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const isPasswordValid = await Admin.comparePassword(password, admin.password_hash);
+    let isPasswordValid = await Admin.comparePassword(password, admin.password_hash);
+
+    // Self-heal seed admin credentials when account password was replaced earlier
+    // (for example via legacy seed scripts or Google-created random password).
+    if (!isPasswordValid && isSeedAdminLogin && ADMIN_SEED_PASSWORD && password === ADMIN_SEED_PASSWORD) {
+      const repairedHash = await Admin.hashPassword(ADMIN_SEED_PASSWORD);
+      await Admin.updatePassword(admin.admin_id, repairedHash, { activate: true });
+      admin = await Admin.findById(admin.admin_id);
+      isPasswordValid = true;
+    }
+
     if (!isPasswordValid) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }

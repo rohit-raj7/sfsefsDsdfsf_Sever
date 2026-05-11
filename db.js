@@ -694,6 +694,11 @@ async function ensureSchema() {
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_minutes_limit INTEGER;
     `;
     await pool.query(alterSql);
+    // Backfill legacy rows where admins.is_active may be NULL.
+    await pool.query(`UPDATE admins SET is_active = TRUE WHERE is_active IS NULL`);
+    // Keep admin activity flag consistent and non-null for auth checks.
+    await pool.query(`ALTER TABLE admins ALTER COLUMN is_active SET DEFAULT TRUE`);
+    await pool.query(`ALTER TABLE admins ALTER COLUMN is_active SET NOT NULL`);
     console.log('✓ Ensured users and listeners table schema');
 
     const createRateConfigSql = `
