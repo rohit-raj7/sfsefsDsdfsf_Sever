@@ -77,6 +77,16 @@ router.get('/', async (req, res) => {
       params.push(isActive == 'true');
     }
 
+    const userIds = req.query.user_ids?.toString()
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean)
+      .slice(0, 500);
+    if (userIds && userIds.length > 0) {
+      conditions.push(`user_id::text = ANY($${index++})`);
+      params.push(userIds);
+    }
+
     const activeCallExists = `
       EXISTS (
         SELECT 1
@@ -102,7 +112,7 @@ router.get('/', async (req, res) => {
     const limitValue = Number.parseInt(req.query.limit?.toString() ?? '100', 10);
     const offsetValue = Number.parseInt(req.query.offset?.toString() ?? '0', 10);
     const limit = Number.isFinite(limitValue)
-      ? Math.min(Math.max(limitValue, 1), 100)
+      ? Math.min(Math.max(limitValue, 1), 500)
       : 100;
     const offset = Number.isFinite(offsetValue) ? Math.max(offsetValue, 0) : 0;
 
