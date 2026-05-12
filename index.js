@@ -951,7 +951,7 @@ io.on('connection', (socket) => {
         );
     }
 
-    const callerSocketId = connectedUsers.get(callerId);
+    const callerSocketId = _resolveSocketId(callerId);
     if (callerSocketId) {
       io.to(callerSocketId).emit('call:accepted', {
         callId,
@@ -966,6 +966,22 @@ io.on('connection', (socket) => {
         reason: 'caller_unavailable',
       });
     }
+
+    // Watchdog: if call:joined never fires (LiveKit fail, app crash, etc.),
+    // the busy flag stays forever. Auto-clear after 45s if no active timer set.
+    if (listenerUserId && callId) {
+      setTimeout(() => {
+        if (busyListeners.has(listenerUserId) &&
+            busyListeners.get(listenerUserId) === callId &&
+            !activeCallTimers.has(callId)) {
+          busyListeners.delete(listenerUserId);
+          io.emit('listener_busy_status', { listenerUserId, busy: false });
+          Listener.clearBusyByUserId(listenerUserId).catch(e =>
+            console.error('[SOCKET] clearBusy watchdog error:', e.message));
+          console.log(`[SOCKET] Watchdog: cleared stale busy for listener ${listenerUserId} (call ${callId} never connected)`);
+        }
+      }, 45000);
+    }
   });
 
   // Reject call: Listener -> User
@@ -976,7 +992,7 @@ io.on('connection', (socket) => {
     const pending = clearPendingCall(callId);
     const listenerUserId = pending?.listenerUserId || socket.userId;
 
-    const callerSocketId = connectedUsers.get(callerId);
+    const callerSocketId = _resolveSocketId(callerId);
     if (callerSocketId) {
       io.to(callerSocketId).emit('call:rejected', {
         callId,
@@ -1124,6 +1140,15 @@ io.on('connection', (socket) => {
                 });
               }
             });
+            // Clear busy for zero-balance disconnect
+            channelUsers.forEach(uid => {
+              if (busyListeners.has(uid)) {
+                busyListeners.delete(uid);
+                io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+                Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusy zero-balance error:', e.message));
+              }
+            });
+            activeChannels.delete(channelName);
           }
         } catch (err) {
           console.error(`[SOCKET] Error in call:joined handler for call ${callId}:`, err);
@@ -1134,6 +1159,18 @@ io.on('connection', (socket) => {
           });
         } finally {
           processingCalls.delete(String(callId));
+          // Safety: if no activeCallTimer was set (error/zero-balance), clear busy
+          // so listeners don't get stuck as permanently busy.
+          if (!activeCallTimers.has(callId)) {
+            channelUsers.forEach(uid => {
+              if (busyListeners.has(uid) && busyListeners.get(uid) === callId) {
+                busyListeners.delete(uid);
+                io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+                Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusy safety error:', e.message));
+                console.log(`[SOCKET] Safety: cleared stale busy for ${uid} (call ${callId})`);
+              }
+            });
+          }
         }
       })();
     }
@@ -1628,7 +1665,7 @@ io.on('connection', (socket) => {
         if (users.has(userId)) {
           users.forEach(otherUid => {
             if (otherUid !== userId) {
-              const otherSid = connectedUsers.get(otherUid);
+              const otherSid = _resolveSocketId(otherUid);
               if (otherSid) {
                 io.to(otherSid).emit('call:ended', {
                   callId: channelName,
