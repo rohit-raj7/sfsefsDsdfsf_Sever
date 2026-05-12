@@ -1,0 +1,59 @@
+{
+  "name": "call-to-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Dost Talk - Connect with listeners/experts platform",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/migrate_subs.js && node scripts/start_pm2.js",
+    "start:dev": "node scripts/migrate_subs.js && node index.js",
+    "stop:pm2": "pm2 stop callto-backend",
+    "reload:pm2": "pm2 reload callto-backend",
+    "logs:pm2": "pm2 logs callto-backend",
+    "dev": "nodemon index.js",
+    "db:setup": "node scripts/setupDatabase.js",
+    "build": "echo No build step required"
+  },
+  "keywords": [
+    "nodejs",
+    "postgresql",
+    "aws",
+    "rds",
+    "express",
+    "socket.io"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.998.0",
+    "@aws-sdk/s3-request-presigner": "^3.998.0",
+    "aws-sdk": "^2.1506.0",
+    "axios": "^1.13.2",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.9.0",
+    "compression": "^1.7.4",
+    "cors": "^2.8.6",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "firebase-admin": "^13.8.0",
+    "google-auth-library": "^10.5.0",
+    "helmet": "^7.1.0",
+    "joi": "^17.11.0",
+    "jsonwebtoken": "^9.0.2",
+    "livekit-server-sdk": "^2.15.0",
+    "morgan": "^1.10.0",
+    "multer": "^2.1.1",
+    "pg": "^8.20.0",
+    "pm2": "^5.4.3",
+    "razorpay": "^2.9.6",
+    "socket.io": "^4.6.1",
+    "twilio": "^4.19.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
