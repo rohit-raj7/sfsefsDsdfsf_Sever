@@ -3,37 +3,6 @@ const router = express.Router();
 import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 
-const FREE_RANDOM_CALL_LIMIT = 9999;
-
-const getRandomCallUsage = async (userId) => {
-    const userResult = await pool.query(
-        `SELECT
-           CASE
-             WHEN last_random_call_date = CURRENT_DATE THEN COALESCE(random_calls_today, 0)
-             ELSE 0
-           END AS calls_today
-         FROM users
-         WHERE user_id = $1`,
-        [userId]
-    );
-    return Number(userResult.rows[0]?.calls_today || 0);
-};
-
-const consumeRandomCallUsage = async (userId) => {
-    const updateResult = await pool.query(
-        `UPDATE users
-         SET random_calls_today = CASE
-               WHEN last_random_call_date = CURRENT_DATE THEN COALESCE(random_calls_today, 0) + 1
-               ELSE 1
-             END,
-             last_random_call_date = CURRENT_DATE
-         WHERE user_id = $1
-         RETURNING random_calls_today`,
-        [userId]
-    );
-    return Number(updateResult.rows[0]?.random_calls_today || 0);
-};
-
 // GET /api/subscriptions/status
 // Check if user has an active premium subscription
 router.get('/status', authenticate, async (req, res) => {
@@ -63,13 +32,22 @@ router.get('/status', authenticate, async (req, res) => {
         }
 
         // Also return daily random call usage for free users
-        const callsToday = await getRandomCallUsage(req.userId);
+        const userResult = await pool.query(
+            `SELECT random_calls_today, last_random_call_date FROM users WHERE user_id = $1`,
+            [req.userId]
+        );
+        const user = userResult.rows[0] || {};
+        const today = new Date().toISOString().split('T')[0];
+        const lastDate = user.last_random_call_date
+            ? new Date(user.last_random_call_date).toISOString().split('T')[0]
+            : null;
+        const callsToday = lastDate === today ? (user.random_calls_today || 0) : 0;
 
         return res.json({
             success: true,
             isPremium: false,
             freeCallsUsed: callsToday,
-            freeCallsLimit: FREE_RANDOM_CALL_LIMIT,
+            freeCallsLimit: 2,
             maxFreeCallMinutes: 3,
         });
     } catch (error) {
@@ -193,10 +171,37 @@ router.post('/check-random-call', authenticate, async (req, res) => {
         }
 
         // Free user — check daily limit
-        const callsToday = await getRandomCallUsage(req.userId);
-        const nextCallCount = callsToday + 1;
+        const today = new Date().toISOString().split('T')[0];
+        const userResult = await pool.query(
+            `SELECT random_calls_today, last_random_call_date FROM users WHERE user_id = $1`,
+            [req.userId]
+        );
+
+        const user = userResult.rows[0] || {};
+        const lastDate = user.last_random_call_date
+            ? new Date(user.last_random_call_date).toISOString().split('T')[0]
+            : null;
+        let callsToday = lastDate === today ? (user.random_calls_today || 0) : 0;
+
+        // Increment counter
+        if (lastDate !== today) {
+            // Reset for new day
+            callsToday = 0;
+            await pool.query(
+                `UPDATE users SET random_calls_today = 1, last_random_call_date = CURRENT_DATE WHERE user_id = $1`,
+                [req.userId]
+            );
+        } else {
+            await pool.query(
+                `UPDATE users SET random_calls_today = random_calls_today + 1 WHERE user_id = $1`,
+                [req.userId]
+            );
+        }
+
+        const currentCallCount = callsToday + 1;
         // Show ad on the 1st call and then every 5th call (e.g., 1, 5, 10, 15...)
-        const adRequired = (nextCallCount % 5 === 0);
+        // Or if user meant "Every 5 random call", perhaps currentCallCount % 5 === 0.
+        const adRequired = (currentCallCount % 5 === 0);
 
         return res.json({
             allowed: true,
@@ -204,49 +209,12 @@ router.post('/check-random-call', authenticate, async (req, res) => {
             adRequired: adRequired,
             maxMinutes: null, // Unlimited minutes for random call
             filtersEnabled: false,
-            freeCallsUsed: callsToday,
-            nextFreeCallsUsed: nextCallCount,
-            freeCallsLimit: FREE_RANDOM_CALL_LIMIT,
-            consumed: false,
+            freeCallsUsed: currentCallCount,
+            freeCallsLimit: 9999, // practically unlimited
         });
     } catch (error) {
         console.error('Check random call error:', error);
         res.status(500).json({ error: 'Failed to check random call eligibility' });
-    }
-});
-
-// POST /api/subscriptions/consume-random-call
-// Consume one free random-call slot when an actual match/call is started.
-router.post('/consume-random-call', authenticate, async (req, res) => {
-    try {
-        const subResult = await pool.query(
-            `SELECT subscription_id FROM subscriptions
-       WHERE user_id = $1 AND is_active = TRUE AND expires_at > CURRENT_TIMESTAMP
-       LIMIT 1`,
-            [req.userId]
-        );
-
-        if (subResult.rows.length > 0) {
-            return res.json({
-                allowed: true,
-                isPremium: true,
-                consumed: false,
-                freeCallsUsed: null,
-                freeCallsLimit: null,
-            });
-        }
-
-        const currentCallCount = await consumeRandomCallUsage(req.userId);
-        return res.json({
-            allowed: true,
-            isPremium: false,
-            consumed: true,
-            freeCallsUsed: currentCallCount,
-            freeCallsLimit: FREE_RANDOM_CALL_LIMIT,
-        });
-    } catch (error) {
-        console.error('Consume random call error:', error);
-        res.status(500).json({ error: 'Failed to consume random call eligibility' });
     }
 });
 

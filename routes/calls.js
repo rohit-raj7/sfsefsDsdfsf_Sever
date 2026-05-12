@@ -11,62 +11,6 @@ import { finalizeCallBilling } from '../services/callBillingService.js';
 import { getRateConfig, pool } from '../db.js';
 import { resolveRateForListener } from '../services/rateSettingsService.js';
 
-const CALL_AUTO_TIMEOUT_MS = 45000;
-const pendingCallTimeouts = new Map();
-
-const getLiveKitConfigErrors = () => {
-  const errors = [];
-  if (!config.livekit?.apiKey) errors.push('LIVEKIT_API_KEY');
-  if (!config.livekit?.apiSecret) errors.push('LIVEKIT_API_SECRET');
-  if (!config.livekit?.url) errors.push('LIVEKIT_URL');
-  return errors;
-};
-
-const liveKitConfigErrors = getLiveKitConfigErrors();
-if (config.NODE_ENV === 'production' && liveKitConfigErrors.length > 0) {
-  throw new Error(`LiveKit is missing required env: ${liveKitConfigErrors.join(', ')}`);
-}
-
-const getLiveKitCredentials = () => {
-  if (liveKitConfigErrors.length > 0) {
-    const error = new Error(`LiveKit is not configured: ${liveKitConfigErrors.join(', ')}`);
-    error.statusCode = 500;
-    throw error;
-  }
-  return config.livekit;
-};
-
-const clearCallAutoTimeout = (callId) => {
-  const timeoutId = pendingCallTimeouts.get(callId);
-  if (timeoutId) {
-    clearTimeout(timeoutId);
-    pendingCallTimeouts.delete(callId);
-  }
-};
-
-const scheduleCallAutoTimeout = (callId, listenerId, logPrefix) => {
-  clearCallAutoTimeout(callId);
-  const timeoutId = setTimeout(async () => {
-    pendingCallTimeouts.delete(callId);
-    try {
-      const checkCall = await Call.findById(callId);
-      if (
-        checkCall &&
-        ['pending', 'ringing', 'initiated'].includes(checkCall.status)
-      ) {
-        console.log(`${logPrefix} ${callId} timed out after 45s. Forcing fail.`);
-        await Call.updateStatus(callId, 'failed');
-        if (listenerId) {
-          try { await Listener.clearBusy(listenerId); } catch (e) { }
-        }
-      }
-    } catch (err) {
-      console.error('[CALLS] Auto-timeout error:', err);
-    }
-  }, CALL_AUTO_TIMEOUT_MS);
-  pendingCallTimeouts.set(callId, timeoutId);
-};
-
 const resolveDurationSeconds = (call, durationSeconds) => {
   const endedAt = new Date();
   if (call.started_at) {
@@ -180,7 +124,22 @@ router.post('/', authenticate, async (req, res) => {
       offer_minutes_limit: offerMinutesLimit,
     });
 
-    scheduleCallAutoTimeout(call.call_id, listener_id, '[CALLS] Call');
+    // AUTO-DISCONNECT: If call is not answered within 45 seconds, automatically fail it
+    setTimeout(async () => {
+      try {
+        const checkCall = await Call.findById(call.call_id);
+        if (
+          checkCall &&
+          ['pending', 'ringing', 'initiated'].includes(checkCall.status)
+        ) {
+          console.log(`[CALLS] Call ${call.call_id} timed out after 45s. Forcing fail.`);
+          await Call.updateStatus(call.call_id, 'failed');
+          try { await Listener.clearBusy(listener_id); } catch (e) { }
+        }
+      } catch (err) {
+        console.error('[CALLS] Auto-timeout error:', err);
+      }
+    }, 45000);
 
     res.status(201).json({
       message: 'Call initiated',
@@ -277,7 +236,21 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
       offer_minutes_limit: offerMinutesLimit,
     });
 
-    scheduleCallAutoTimeout(call.call_id, listener.listener_id, '[CALLS] Listener-initiated call');
+    // AUTO-DISCONNECT
+    setTimeout(async () => {
+      try {
+        const checkCall = await Call.findById(call.call_id);
+        if (
+          checkCall &&
+          ['pending', 'ringing', 'initiated'].includes(checkCall.status)
+        ) {
+          console.log(`[CALLS] Listener-initiated call ${call.call_id} timed out after 45s.`);
+          await Call.updateStatus(call.call_id, 'failed');
+        }
+      } catch (err) {
+        console.error('[CALLS] Auto-timeout error:', err);
+      }
+    }, 45000);
 
     res.status(201).json({
       message: 'Call initiated by listener',
@@ -343,10 +316,6 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
 
     if (call.caller_id !== req.userId && !isListener) {
       return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    if (['ongoing', 'completed', 'missed', 'rejected', 'cancelled'].includes(status)) {
-      clearCallAutoTimeout(req.params.call_id);
     }
 
     if (status === 'completed') {
@@ -776,7 +745,10 @@ router.post('/livekit/token', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'channel_name is required' });
     }
 
-    const { apiKey, apiSecret, url } = getLiveKitCredentials();
+    // Prefer env-configured LiveKit credentials for self-hosted deployments.
+    // Keep hardcoded values as fallback for legacy setup.
+    const apiKey = process.env.LIVEKIT_API_KEY || 'devkey';
+    const apiSecret = process.env.LIVEKIT_API_SECRET || 'appdostlivekitsecretkey2024productionxyz1234ab';
     const participantIdentity = req.userId.toString();
     const participantName = `User_${participantIdentity.substring(0, 5)}`;
 
@@ -795,7 +767,7 @@ router.post('/livekit/token', authenticate, async (req, res) => {
       // Use plain WebSocket ws:// directly to port 7880 on the VPS.
       // Coolify's SSL proxy does NOT terminate WebSocket on this port.
       // Using wss:// causes TLS handshake failure: WRONG_VERSION_NUMBER
-      url
+      url: process.env.LIVEKIT_URL || 'ws://91.108.111.194:7880'
     });
   } catch (error) {
     console.error('Fatal error generating LiveKit token:', error);

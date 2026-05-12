@@ -209,6 +209,7 @@ router.post('/:chat_id/messages', authenticate, async (req, res) => {
       io.to(`chat_${req.params.chat_id}`).emit('chat:message', messageData);
 
       // Also send notification to the other user
+      const otherUserId = chat.user1_id === req.userId ? chat.user2_id : chat.user1_id;
       io.to(`user_${otherUserId}`).emit('chat:new_message_notification', messageData);
       
       console.log(`[REST API] Message sent in chat ${req.params.chat_id}, emitted to socket`);

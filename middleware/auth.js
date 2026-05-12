@@ -21,7 +21,7 @@ const authenticate = async (req, res, next) => {
     // Get user from database
     const user = await User.findById(decoded.user_id);
 
-    if (!user || user.is_active === false) {
+    if (!user || !user.is_active) {
       return res.status(401).json({ error: 'User not found or inactive' });
     }
 
@@ -83,11 +83,10 @@ const authenticateAdmin = async (req, res, next) => {
       return res.status(401).json({ error: 'Invalid admin token' });
     }
 
-    // Get admin from database using immutable id from token.
-    // This avoids accidental auth failures if email case/format changes.
-    const admin = await Admin.findById(decoded.admin_id);
+    // Get admin from database
+    const admin = await Admin.findByEmail(decoded.email);
 
-    if (!admin || admin.is_active === false) {
+    if (!admin || !admin.is_active) {
       return res.status(401).json({ error: 'Admin not found or inactive' });
     }
 

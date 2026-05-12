@@ -46,8 +46,8 @@ async function getFollowSnapshot(currentUserId, listenerUserId) {
     followersCount: Number(row.followers_count ?? 0)
   };
 }
-// GET /api/users (admin only)
-router.get('/', authenticateAdmin, async (req, res) => {
+// GET /api/users
+router.get('/', async (req, res) => {
   try {
     const params = [];
     const conditions = [];
@@ -99,10 +99,6 @@ router.get('/', authenticateAdmin, async (req, res) => {
           user_id,
           full_name,
           display_name,
-          email,
-          phone_number,
-          mobile_number,
-          auth_provider,
           gender,
           date_of_birth,
           city,
@@ -381,8 +377,9 @@ router.get('/offer-banner', authenticate, async (req, res) => {
       [req.userId]
     );
 
-    const [walletResult, activeNonExpiredResult] = await Promise.all([
+    const [walletResult, activeNonExpiredResult, activeAnyResult] = await Promise.all([
       pool.query('SELECT balance FROM wallets WHERE user_id = $1 LIMIT 1', [req.userId]),
+      // 1) Try to find an active, non-expired banner
       pool.query(
         `SELECT config_id, title, headline, subtext, button_text, countdown_prefix,
                 min_wallet_balance, expires_at, is_active, updated_at
@@ -393,10 +390,39 @@ router.get('/offer-banner', authenticate, async (req, res) => {
          ORDER BY updated_at DESC
          LIMIT 1`
       ),
+      // 2) Also fetch any active banner (even if expired) for auto-extend
+      pool.query(
+        `SELECT config_id, title, headline, subtext, button_text, countdown_prefix,
+                min_wallet_balance, expires_at, is_active, updated_at
+         FROM offer_banner_config
+         WHERE is_active = TRUE
+         ORDER BY updated_at DESC
+         LIMIT 1`
+      ),
     ]);
 
     const walletBalance = Number(walletResult.rows[0]?.balance ?? 0);
-    const activeBanner = activeNonExpiredResult.rows[0];
+    let activeBanner = activeNonExpiredResult.rows[0];
+
+    // Auto-extend: if there's an active banner but it's expired, extend by 12 hours
+    if (!activeBanner && activeAnyResult.rows[0]) {
+      const expiredBanner = activeAnyResult.rows[0];
+      const newStartsAt = new Date();
+      const newExpiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
+
+      console.log('[offer-banner] Auto-extending expired active banner:', expiredBanner.config_id,
+        'old expires_at:', expiredBanner.expires_at, '-> new expires_at:', newExpiresAt);
+
+      const updated = await pool.query(
+        `UPDATE offer_banner_config
+         SET starts_at = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP
+         WHERE config_id = $3
+         RETURNING config_id, title, headline, subtext, button_text, countdown_prefix,
+                   min_wallet_balance, expires_at, is_active, updated_at`,
+        [newStartsAt, newExpiresAt, expiredBanner.config_id]
+      );
+      activeBanner = updated.rows[0] || null;
+    }
 
     console.log('[offer-banner] userId:', req.userId, '| walletBalance:', walletBalance,
       '| activeBannerFound:', Boolean(activeBanner));
@@ -447,39 +473,9 @@ router.post('/wallet/add', authenticate, async (req, res) => {
   try {
     const { amount, payment_id, payment_method, description, pack_id } = req.body;
     const parsedAmount = Number(amount);
-    const normalizedPaymentId = payment_id ? String(payment_id).trim() : null;
 
     if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
       return res.status(400).json({ error: 'Valid amount is required' });
-    }
-
-    if (normalizedPaymentId) {
-      const existingPayment = await pool.query(
-        `SELECT transaction_id
-         FROM transactions
-         WHERE user_id = $1
-           AND payment_gateway_id = $2
-           AND status = 'completed'
-         LIMIT 1`,
-        [req.userId, normalizedPaymentId]
-      );
-
-      if (existingPayment.rows.length > 0) {
-        const wallet = await User.getWallet(req.userId);
-        const userResult = await pool.query(
-          'SELECT unlimited_expires_at FROM users WHERE user_id = $1',
-          [req.userId]
-        );
-        return res.json({
-          message: 'Payment already credited',
-          balance: wallet.balance,
-          base_amount: parsedAmount,
-          bonus_amount: 0,
-          total_credited: 0,
-          is_duplicate: true,
-          unlimited_expires_at: userResult.rows[0]?.unlimited_expires_at ?? null
-        });
-      }
     }
 
     // Calculate extra bonus from recharge pack
@@ -513,7 +509,7 @@ router.post('/wallet/add', authenticate, async (req, res) => {
     }
 
     const paymentDetails = {
-      payment_id: normalizedPaymentId,
+      payment_id,
       payment_method: payment_method || 'razorpay',
       description: paymentDesc,
       currency: 'INR'
@@ -529,11 +525,11 @@ router.post('/wallet/add', authenticate, async (req, res) => {
       // Update unlimited_expires_at to NOW + unlimitedDays
       const updateQuery = `
         UPDATE users 
-        SET unlimited_expires_at = CURRENT_TIMESTAMP + ($2::int * INTERVAL '1 day')
+        SET unlimited_expires_at = CURRENT_TIMESTAMP + INTERVAL '${unlimitedDays} days'
         WHERE user_id = $1
         RETURNING unlimited_expires_at
       `;
-      const updateResult = await pool.query(updateQuery, [req.userId, Math.trunc(unlimitedDays)]);
+      const updateResult = await pool.query(updateQuery, [req.userId]);
       unlimited_expires_at = updateResult.rows[0].unlimited_expires_at;
     }
 

@@ -47,7 +47,6 @@ import {
   processNotifications,
   setNotificationEmitter,
 } from './services/notificationWorker.js';
-import { sendPushFCM } from './utils/fcm.js';
 
 // ============================================
 // MIDDLEWARE
@@ -173,22 +172,6 @@ const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, list
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
 const LISTENER_TO_USER_RING_TIMEOUT_MS = 32000;
-
-const consumeRandomUsageForMatchedUsers = async (userIds = []) => {
-  const validUserIds = userIds.filter(Boolean);
-  if (validUserIds.length === 0) return;
-
-  await pool.query(
-    `UPDATE users
-     SET random_calls_today = CASE
-           WHEN last_random_call_date = CURRENT_DATE THEN COALESCE(random_calls_today, 0) + 1
-           ELSE 1
-         END,
-         last_random_call_date = CURRENT_DATE
-     WHERE user_id = ANY($1::uuid[])`,
-    [validUserIds]
-  );
-};
 
 const clearPendingCall = (callId) => {
   const pending = pendingCalls.get(callId);
@@ -543,12 +526,6 @@ io.on('connection', (socket) => {
       socket.emit('random:matched', { matchedUser: matchedUserInfo });
 
       const matchedSocketId = matchedEntry.socketId;
-      try {
-        await consumeRandomUsageForMatchedUsers([userId, matchedUserId]);
-      } catch (usageError) {
-        console.error('[RANDOM] Failed to consume random usage for matched users:', usageError.message);
-      }
-
       if (matchedSocketId) {
         io.to(matchedSocketId).emit('random:matched', { matchedUser: currentUserInfo });
       }

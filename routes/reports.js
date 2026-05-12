@@ -1,7 +1,7 @@
 import express from 'express';
 const router = express.Router();
 import { pool } from '../db.js';
-import { authenticate, authenticateAdmin } from '../middleware/auth.js';
+import { authenticate } from '../middleware/auth.js';
 
 // POST /api/reports
 // Submit a post-call report against a listener
@@ -40,9 +40,7 @@ router.post('/', authenticate, async (req, res) => {
         // Count total unreviewed reports for this listener in last 30 days
         const countResult = await pool.query(
             `SELECT COUNT(*) as report_count FROM listener_reports
-       WHERE listener_id = $1
-         AND reviewed = FALSE
-         AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 days'`,
+       WHERE listener_id = $1 AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 days'`,
             [listener_id]
         );
         const reportCount = Number(countResult.rows[0].report_count);
@@ -129,7 +127,7 @@ router.post('/', authenticate, async (req, res) => {
 
 // GET /api/reports/listener/:listener_id
 // Get reports for a listener (admin use)
-router.get('/listener/:listener_id', authenticateAdmin, async (req, res) => {
+router.get('/listener/:listener_id', authenticate, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT r.*, u.display_name as reporter_name

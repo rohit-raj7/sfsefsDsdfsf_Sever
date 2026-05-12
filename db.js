@@ -395,7 +395,7 @@ async function ensureSchema() {
       CREATE TABLE IF NOT EXISTS listener_payment_details (
         payment_detail_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         listener_id UUID UNIQUE REFERENCES listeners(listener_id) ON DELETE CASCADE,
-        payment_method VARCHAR(20) CHECK (payment_method IN ('upi', 'bank', 'both')),
+        payment_method VARCHAR(20) CHECK (payment_method IN ('upi', 'bank')),
         mobile_number VARCHAR(15),
         upi_id VARCHAR(255),
         aadhaar_number VARCHAR(12),
@@ -410,37 +410,6 @@ async function ensureSchema() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
-    `);
-
-    await pool.query(`
-      ALTER TABLE listener_payment_details
-      DROP CONSTRAINT IF EXISTS listener_payment_details_payment_method_check;
-
-      ALTER TABLE listener_payment_details
-      ADD CONSTRAINT listener_payment_details_payment_method_check
-      CHECK (payment_method IN ('upi', 'bank', 'both'));
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS listener_withdrawal_requests (
-        request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        listener_id UUID NOT NULL REFERENCES listeners(listener_id) ON DELETE CASCADE,
-        payout_method VARCHAR(20) NOT NULL CHECK (payout_method IN ('upi', 'bank')),
-        upi_id VARCHAR(255),
-        account_number VARCHAR(32),
-        ifsc_code VARCHAR(20),
-        bank_name VARCHAR(120),
-        account_holder_name VARCHAR(120),
-        withdrawal_amount NUMERIC(12,2) NOT NULL CHECK (withdrawal_amount > 0),
-        tds_amount NUMERIC(12,2) NOT NULL CHECK (tds_amount >= 0),
-        transaction_fee NUMERIC(12,2) NOT NULL CHECK (transaction_fee >= 0),
-        final_credit_amount NUMERIC(12,2) NOT NULL CHECK (final_credit_amount >= 0),
-        status VARCHAR(20) NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_requests_listener_created
-      ON listener_withdrawal_requests(listener_id, created_at DESC);
     `);
 
     await pool.query(`
@@ -694,11 +663,6 @@ async function ensureSchema() {
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_minutes_limit INTEGER;
     `;
     await pool.query(alterSql);
-    // Backfill legacy rows where admins.is_active may be NULL.
-    await pool.query(`UPDATE admins SET is_active = TRUE WHERE is_active IS NULL`);
-    // Keep admin activity flag consistent and non-null for auth checks.
-    await pool.query(`ALTER TABLE admins ALTER COLUMN is_active SET DEFAULT TRUE`);
-    await pool.query(`ALTER TABLE admins ALTER COLUMN is_active SET NOT NULL`);
     console.log('✓ Ensured users and listeners table schema');
 
     const createRateConfigSql = `
