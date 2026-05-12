@@ -172,9 +172,9 @@ const busyListeners = new Map(); // Map of listenerUserId -> callId (in-memory b
 const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, listenerSocketId, createdAt } (tracks pre-answer calls for cancel routing)
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
-const disconnectGracePeriods = new Map(); // Map of `${userId}_${callId}` -> { timerId, callId, disconnectedUserId, peerUserId, timerData }
 const LISTENER_TO_USER_RING_TIMEOUT_MS = 32000;
-const RECONNECT_GRACE_MS = 5000; // 5-second grace period for reconnection
+const CALL_RECONNECT_GRACE_MS = 5000;
+const callReconnectGraceTimers = new Map(); // Map of `${callId}:${userId}` -> { timerId, callId, channelName, userId, peerUserIds, startedAt }
 
 const clearPendingCall = (callId) => {
   const pending = pendingCalls.get(callId);
@@ -224,6 +224,12 @@ setInterval(() => {
       console.log(`[SOCKET] Stale activeCallTimer ${callId} removed (elapsed: ${Math.round(elapsed)}s > max: ${maxWithGrace}s)`);
       clearTimeout(timer.timerId);
       activeCallTimers.delete(callId);
+      for (const [key, pending] of callReconnectGraceTimers.entries()) {
+        if (String(pending.callId) === String(callId)) {
+          clearTimeout(pending.timerId);
+          callReconnectGraceTimers.delete(key);
+        }
+      }
       // Trigger billing as safety net
       (async () => {
         try {
@@ -262,6 +268,184 @@ io.on('connection', (socket) => {
   // Listeners may be in listenerSockets but not connectedUsers after reconnect.
   function _resolveSocketId(userId) {
     return connectedUsers.get(userId) || listenerSockets.get(userId);
+  }
+
+  function _reconnectGraceKey(callId, userId) {
+    return `${String(callId)}:${String(userId)}`;
+  }
+
+  function _cancelReconnectGraceByKey(key, { emitRecovered = true } = {}) {
+    const pending = callReconnectGraceTimers.get(key);
+    if (!pending) return null;
+    clearTimeout(pending.timerId);
+    callReconnectGraceTimers.delete(key);
+
+    if (emitRecovered) {
+      const payload = {
+        callId: pending.callId,
+        channelName: pending.channelName,
+        userId: pending.userId,
+        recoveredAt: Date.now(),
+      };
+
+      for (const peerId of pending.peerUserIds || []) {
+        const peerSid = _resolveSocketId(peerId);
+        if (peerSid) {
+          io.to(peerSid).emit('call:peer_reconnected', payload);
+        }
+      }
+
+      const selfSid = _resolveSocketId(pending.userId);
+      if (selfSid) {
+        io.to(selfSid).emit('call:peer_reconnected', payload);
+      }
+    }
+
+    return pending;
+  }
+
+  function _cancelReconnectGraceForCall(callId) {
+    const callIdText = String(callId);
+    for (const [key, pending] of callReconnectGraceTimers.entries()) {
+      if (String(pending.callId) === callIdText) {
+        _cancelReconnectGraceByKey(key, { emitRecovered: false });
+      }
+    }
+  }
+
+  function _scheduleReconnectGrace({
+    callId,
+    channelName,
+    disconnectedUserId,
+    peerUserIds = [],
+  }) {
+    if (!callId || !disconnectedUserId) return;
+    const key = _reconnectGraceKey(callId, disconnectedUserId);
+    if (callReconnectGraceTimers.has(key)) return;
+
+    const peers = [...new Set(peerUserIds.filter(Boolean).map(String))];
+    const payload = {
+      callId,
+      channelName,
+      userId: disconnectedUserId,
+      timeoutMs: CALL_RECONNECT_GRACE_MS,
+      startedAt: Date.now(),
+    };
+
+    for (const peerId of peers) {
+      const peerSid = _resolveSocketId(peerId);
+      if (peerSid) {
+        io.to(peerSid).emit('call:peer_reconnecting', payload);
+      }
+    }
+
+    const timerId = setTimeout(async () => {
+      const stillPending = callReconnectGraceTimers.get(key);
+      if (!stillPending) return;
+      callReconnectGraceTimers.delete(key);
+
+      const endPayload = {
+        callId,
+        channelName,
+        endedBy: disconnectedUserId,
+        reason: 'network_timeout',
+        code: 'PEER_RECONNECT_TIMEOUT',
+      };
+
+      const everyone = new Set([
+        ...peers,
+        String(disconnectedUserId),
+      ]);
+      for (const uid of everyone) {
+        const sid = _resolveSocketId(uid);
+        if (sid) {
+          io.to(sid).emit('call:ended', endPayload);
+        }
+      }
+
+      let endTimerData = null;
+      if (activeCallTimers.has(callId)) {
+        endTimerData = activeCallTimers.get(callId);
+        clearTimeout(endTimerData.timerId);
+        activeCallTimers.delete(callId);
+      }
+
+      // Clear busy status for both sides.
+      _clearBusyForCall(disconnectedUserId, peers[0]);
+      try {
+        const endedCall = await Call.findById(callId);
+        if (endedCall?.caller_id) {
+          io.emit('user_busy_status', {
+            userId: endedCall.caller_id,
+            busy: false,
+            callId,
+            timestamp: Date.now(),
+          });
+        }
+      } catch (err) {
+        console.error(`[SOCKET] reconnect-timeout user busy clear lookup failed for ${callId}:`, err.message);
+      }
+
+      if (channelName && activeChannels.has(channelName)) {
+        activeChannels.delete(channelName);
+      }
+
+      if (callId && endTimerData) {
+        try {
+          const elapsed = Math.max(
+            0,
+            Math.round((Date.now() - endTimerData.startedAt) / 1000),
+          );
+          const billDuration = Math.min(
+            elapsed,
+            endTimerData.maxAllowedSeconds,
+          );
+          if (billDuration > 0) {
+            await billingFinalize({ callId, durationSeconds: billDuration });
+            console.log(`[SOCKET] reconnect-timeout: Safety billing for call ${callId} (${billDuration}s)`);
+          }
+        } catch (e) {
+          console.error(`[SOCKET] reconnect-timeout: Safety billing error for call ${callId}:`, e.message);
+        }
+      }
+    }, CALL_RECONNECT_GRACE_MS);
+
+    callReconnectGraceTimers.set(key, {
+      timerId,
+      callId,
+      channelName,
+      userId: String(disconnectedUserId),
+      peerUserIds: peers,
+      startedAt: Date.now(),
+    });
+  }
+
+  function _restoreReconnectGraceForUser(reconnectedUserId) {
+    if (!reconnectedUserId) return;
+    const reconnectedIdText = String(reconnectedUserId);
+
+    for (const [key, pending] of callReconnectGraceTimers.entries()) {
+      if (String(pending.userId) !== reconnectedIdText) continue;
+
+      if (pending.channelName) {
+        if (!activeChannels.has(pending.channelName)) {
+          activeChannels.set(pending.channelName, new Set());
+        }
+        activeChannels.get(pending.channelName).add(reconnectedIdText);
+      }
+
+      _cancelReconnectGraceByKey(key, { emitRecovered: true });
+      console.log(`[SOCKET] Reconnect recovered within grace: user ${reconnectedIdText}, call ${pending.callId}`);
+    }
+  }
+
+  function _hasPendingReconnectGraceForUser(targetUserId) {
+    if (!targetUserId) return false;
+    const target = String(targetUserId);
+    for (const pending of callReconnectGraceTimers.values()) {
+      if (String(pending.userId) === target) return true;
+    }
+    return false;
   }
 
   function _markUserOffline(userId, reason = 'offline') {
@@ -326,35 +510,7 @@ io.on('connection', (socket) => {
     socket.userAvatar = userAvatar;
     connectedUsers.set(userId, socket.id);
     lastSeenMap.set(userId, Date.now());
-
-    // ── Reconnection detection: cancel grace periods for this user ──
-    for (const [graceKey, grace] of disconnectGracePeriods.entries()) {
-      if (String(grace.disconnectedUserId) === String(userId)) {
-        clearTimeout(grace.timerId);
-        disconnectGracePeriods.delete(graceKey);
-        console.log(`[SOCKET] user:join: Reconnection detected for ${userId}, cancelled grace period for call ${grace.callId}`);
-
-        // Re-add user to active channel
-        if (grace.channelName && activeChannels.has(grace.channelName)) {
-          activeChannels.get(grace.channelName).add(userId);
-        }
-
-        // Notify peer that the disconnected user has reconnected
-        const peerSocketId = _resolveSocketId(grace.peerUserId);
-        if (peerSocketId) {
-          io.to(peerSocketId).emit('call:peer_reconnected', {
-            callId: grace.callId,
-            reconnectedUserId: userId,
-          });
-        }
-        // Also notify the reconnected user
-        socket.emit('call:peer_reconnected', {
-          callId: grace.callId,
-          reconnectedUserId: userId,
-        });
-        console.log(`[SOCKET] user:join: Emitted call:peer_reconnected for call ${grace.callId}`);
-      }
-    }
+    _restoreReconnectGraceForUser(userId);
     
     // Initialize or update user chat state (WhatsApp-style tracking)
     userChatState.set(userId, {
@@ -403,35 +559,7 @@ io.on('connection', (socket) => {
     // Register listener as available for calls
     listenerSockets.set(listenerUserId, socket.id);
     connectedUsers.set(listenerUserId, socket.id); // Also ensure in connectedUsers
-
-    // ── Reconnection detection: cancel grace periods for this listener ──
-    for (const [graceKey, grace] of disconnectGracePeriods.entries()) {
-      if (String(grace.disconnectedUserId) === String(listenerUserId)) {
-        clearTimeout(grace.timerId);
-        disconnectGracePeriods.delete(graceKey);
-        console.log(`[SOCKET] listener:join: Reconnection detected for ${listenerUserId}, cancelled grace period for call ${grace.callId}`);
-
-        // Re-add to active channel
-        if (grace.channelName && activeChannels.has(grace.channelName)) {
-          activeChannels.get(grace.channelName).add(listenerUserId);
-        }
-
-        // Notify peer
-        const peerSocketId = _resolveSocketId(grace.peerUserId);
-        if (peerSocketId) {
-          io.to(peerSocketId).emit('call:peer_reconnected', {
-            callId: grace.callId,
-            reconnectedUserId: listenerUserId,
-          });
-        }
-        // Also notify the reconnected listener
-        socket.emit('call:peer_reconnected', {
-          callId: grace.callId,
-          reconnectedUserId: listenerUserId,
-        });
-        console.log(`[SOCKET] listener:join: Emitted call:peer_reconnected for call ${grace.callId}`);
-      }
-    }
+    _restoreReconnectGraceForUser(listenerUserId);
 
     // CRITICAL FIX: Update last_active_at in DB so the REST API call route
     // can confirm listener is online (it checks last_active_at <= 2 min)
@@ -1145,6 +1273,7 @@ io.on('connection', (socket) => {
             const timerId = setTimeout(async () => {
               console.log(`[SOCKET] Call ${callId}: max duration reached (${maxAllowedSeconds}s), auto-ending`);
               activeCallTimers.delete(callId);
+              _cancelReconnectGraceForCall(callId);
 
               // Notify both parties to disconnect
               channelUsers.forEach(uid => {
@@ -1203,6 +1332,7 @@ io.on('connection', (socket) => {
           } else {
             // Zero balance â€” disconnect immediately
             console.log(`[SOCKET] Call ${callId}: zero allowed duration, disconnecting immediately`);
+            _cancelReconnectGraceForCall(callId);
             channelUsers.forEach(uid => {
               const sid = _resolveSocketId(uid);
               if (sid) {
@@ -1264,6 +1394,10 @@ io.on('connection', (socket) => {
     const endedBy = socket.userId;
     const endReason = reason || 'call_ended';
     console.log(`[SOCKET] call:end: Call ${callId} ended by ${endedBy} (${endReason})`);
+
+    if (callId) {
+      _cancelReconnectGraceForCall(callId);
+    }
     
     // Clear server-side auto-disconnect timer & capture data for safety billing
     let endTimerData = null;
@@ -1686,7 +1820,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 3. DISCONNECTION — with 5-second reconnection grace period for active calls
+  // 3. DISCONNECTION
 
   socket.on('disconnect', () => {
     const userId = socket.userId;
@@ -1694,105 +1828,31 @@ io.on('connection', (socket) => {
 
     console.log(`[SOCKET] Disconnected: ${socket.id} (User: ${userId}, Listener: ${listenerUserId})`);
 
-    // ── ACTIVE CALL GRACE PERIOD ──
-    // Instead of immediately killing active calls, give the disconnected user
-    // 5 seconds to reconnect (WhatsApp-style). Only after the grace period
-    // expires do we trigger billing, notify peer, and clean up.
-    for (const [callId, timerData] of activeCallTimers.entries()) {
-      const isCaller = String(timerData.callerId) === String(userId);
-      const isListener = timerData.listenerUserId && String(timerData.listenerUserId) === String(userId);
-      if (isCaller || isListener) {
-        const peerUserId = isCaller ? timerData.listenerUserId : timerData.callerId;
-        const graceKey = `${userId}_${callId}`;
+    const disconnectedUserId = userId || listenerUserId;
 
-        // Don't start a duplicate grace period
-        if (disconnectGracePeriods.has(graceKey)) {
-          console.log(`[SOCKET] disconnect: Grace period already active for ${graceKey}`);
-          continue;
-        }
+    // Active-call disconnect handling:
+    // keep call alive for a short grace period to allow mobile reconnection.
+    if (disconnectedUserId) {
+      for (const [callId, timerData] of activeCallTimers.entries()) {
+        const isCaller = String(timerData.callerId) === String(disconnectedUserId);
+        const isListener =
+          timerData.listenerUserId &&
+          String(timerData.listenerUserId) === String(disconnectedUserId);
+        if (!isCaller && !isListener) continue;
 
-        console.log(`[SOCKET] disconnect: Starting ${RECONNECT_GRACE_MS}ms grace period for call ${callId} (${isCaller ? 'caller' : 'listener'} ${userId} disconnected)`);
+        const peerUserIds = [
+          isCaller ? timerData.listenerUserId : timerData.callerId,
+        ].filter(Boolean);
 
-        // Notify the still-connected peer that the other side is reconnecting
-        if (peerUserId) {
-          const peerSocketId = _resolveSocketId(peerUserId);
-          if (peerSocketId) {
-            io.to(peerSocketId).emit('call:peer_reconnecting', {
-              callId,
-              disconnectedUserId: userId,
-            });
-            console.log(`[SOCKET] disconnect: Sent call:peer_reconnecting to peer ${peerUserId}`);
-          }
-        }
-
-        // Start grace timer — full cleanup happens only if this expires
-        const graceTimerId = setTimeout(() => {
-          disconnectGracePeriods.delete(graceKey);
-          console.log(`[SOCKET] Grace period expired for call ${callId} (user ${userId} did not reconnect)`);
-
-          // ── Now run the original cleanup that was previously immediate ──
-          // Clear the call's auto-disconnect timer
-          if (activeCallTimers.has(callId)) {
-            const currentTimerData = activeCallTimers.get(callId);
-            clearTimeout(currentTimerData.timerId);
-            activeCallTimers.delete(callId);
-            console.log(`[SOCKET] Grace expired: Cleared auto-disconnect timer for call ${callId}`);
-          }
-
-          // User busy status clear
-          if (timerData.callerId) {
-            io.emit('user_busy_status', {
-              userId: timerData.callerId,
-              busy: false,
-              callId,
-              timestamp: Date.now()
-            });
-          }
-
-          // Listener busy clear
-          _clearBusyForCall(userId, peerUserId);
-
-          // Notify peer that call has ended (grace period expired)
-          if (peerUserId) {
-            const peerSocketId = _resolveSocketId(peerUserId);
-            if (peerSocketId) {
-              io.to(peerSocketId).emit('call:ended', {
-                callId,
-                endedBy: userId,
-                reason: 'peer_disconnected',
-                code: 'RECONNECT_TIMEOUT',
-              });
-            }
-          }
-
-          // Clean up active channel
-          if (timerData.channelName && activeChannels.has(timerData.channelName)) {
-            activeChannels.delete(timerData.channelName);
-          }
-
-          // Safety billing
-          (async () => {
-            try {
-              const elapsed = Math.max(0, Math.round((Date.now() - timerData.startedAt) / 1000));
-              const billDuration = Math.min(elapsed, timerData.maxAllowedSeconds);
-              if (billDuration > 0) {
-                await billingFinalize({ callId, durationSeconds: billDuration });
-                console.log(`[SOCKET] Grace expired: Safety billing for call ${callId} (${billDuration}s)`);
-              }
-            } catch (e) {
-              console.error(`[SOCKET] Grace expired: Safety billing error for call ${callId}:`, e.message);
-            }
-          })();
-        }, RECONNECT_GRACE_MS);
-
-        disconnectGracePeriods.set(graceKey, {
-          timerId: graceTimerId,
+        _scheduleReconnectGrace({
           callId,
-          disconnectedUserId: userId,
-          peerUserId,
-          channelName: timerData.channelName,
-          timerData, // Keep reference for billing calculation on expiry
+          channelName: timerData.channelName || callId,
+          disconnectedUserId,
+          peerUserIds,
         });
+        console.log(
+          `[SOCKET] disconnect: Started reconnect grace for call ${callId} (${isCaller ? 'caller' : 'listener'} disconnected)`,
+        );
       }
     }
 
@@ -1802,12 +1862,11 @@ io.on('connection', (socket) => {
       io.emit('listener_status', { listenerUserId, online: false, timestamp: Date.now() });
       console.log(`[SOCKET] Listener marked offline: ${listenerUserId}`);
       
-      // BUSY: Only clear busy on disconnect if there's NO active grace period for this listener.
-      // If a grace period is running, busy will be cleared when it expires.
-      const hasActiveGrace = [...disconnectGracePeriods.values()].some(
-        g => String(g.disconnectedUserId) === String(listenerUserId)
-      );
-      if (busyListeners.has(listenerUserId) && !hasActiveGrace) {
+      // BUSY: Clear busy on disconnect only when not in reconnect grace.
+      if (
+        busyListeners.has(listenerUserId) &&
+        !_hasPendingReconnectGraceForUser(listenerUserId)
+      ) {
         busyListeners.delete(listenerUserId);
         io.emit('listener_busy_status', { listenerUserId, busy: false });
         console.log(`[SOCKET] Listener ${listenerUserId} busy cleared on disconnect`);
@@ -1817,11 +1876,11 @@ io.on('connection', (socket) => {
 
     // Handle user cleanup and active calls
     if (userId) {
-      // BUSY: Clear busy only if no grace period is active
-      const hasActiveGraceUser = [...disconnectGracePeriods.values()].some(
-        g => String(g.disconnectedUserId) === String(userId)
-      );
-      if (busyListeners.has(userId) && !hasActiveGraceUser) {
+      // BUSY: Clear busy if this userId is a busy listener (covers both listenerUserId and userId)
+      if (
+        busyListeners.has(userId) &&
+        !_hasPendingReconnectGraceForUser(userId)
+      ) {
         busyListeners.delete(userId);
         io.emit('listener_busy_status', { listenerUserId: userId, busy: false });
         console.log(`[SOCKET] User ${userId} busy cleared on disconnect (userId path)`);
@@ -1844,35 +1903,32 @@ io.on('connection', (socket) => {
         }
       }
 
-      // Notify others in active channels — BUT only for channels NOT covered by a grace period
+      // For active channels, remove disconnected participant and notify peers
+      // to show "Reconnecting..." instead of ending immediately.
       for (const [channelName, users] of activeChannels.entries()) {
         if (users.has(userId)) {
-          // Check if any grace period covers this channel
-          const graceCoversChannel = [...disconnectGracePeriods.values()].some(
-            g => String(g.disconnectedUserId) === String(userId) && g.channelName === channelName
-          );
+          const peerUserIds = [...users]
+            .filter((otherUid) => String(otherUid) !== String(userId))
+            .map((uid) => String(uid));
 
-          if (graceCoversChannel) {
-            // Grace period is active — don't notify peer yet, just remove from channel temporarily
-            users.delete(userId);
-            console.log(`[SOCKET] disconnect: Removed ${userId} from channel ${channelName} (grace period active)`);
-          } else {
-            // No grace period — immediate cleanup (pre-connected calls, etc.)
-            users.forEach(otherUid => {
-              if (otherUid !== userId) {
-                const otherSid = _resolveSocketId(otherUid);
-                if (otherSid) {
-                  io.to(otherSid).emit('call:ended', {
-                    callId: channelName,
-                    endedBy: userId,
-                    reason: 'peer_disconnected'
-                  });
-                }
-              }
-            });
-            users.delete(userId);
-            if (users.size === 0) activeChannels.delete(channelName);
+          // Resolve callId from timer map when available.
+          let mappedCallId = channelName;
+          for (const [trackedCallId, timerData] of activeCallTimers.entries()) {
+            if (String(timerData.channelName) === String(channelName)) {
+              mappedCallId = trackedCallId;
+              break;
+            }
           }
+
+          _scheduleReconnectGrace({
+            callId: mappedCallId,
+            channelName,
+            disconnectedUserId: userId,
+            peerUserIds,
+          });
+
+          users.delete(userId);
+          if (users.size === 0) activeChannels.delete(channelName);
         }
       }
 
