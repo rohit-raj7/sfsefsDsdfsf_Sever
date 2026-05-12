@@ -1,7 +1,7 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import axios from 'axios';
-import { randomBytes } from 'crypto';
+import crypto from 'crypto';
 import { OAuth2Client } from 'google-auth-library';
 import Admin from '../models/Admin.js';
 import Listener from '../models/Listener.js';
@@ -24,38 +24,26 @@ import {
 } from '../services/rateSettingsService.js';
 
 const router = express.Router();
+// Support multiple env key styles before falling back to the existing hardcoded value.
 const ADMIN_GOOGLE_CLIENT_ID =
   process.env.admin_google_client_id_override ||
   process.env.ADMIN_GOOGLE_CLIENT_ID ||
-  process.env.admin_google_client_id;
-const ADMIN_SEED_EMAIL = String(process.env.ADMIN_SEED_EMAIL || '').trim().toLowerCase();
-const ADMIN_SEED_PASSWORD = String(process.env.ADMIN_SEED_PASSWORD || '');
-const ADMIN_SEED_FULL_NAME = String(process.env.ADMIN_SEED_FULL_NAME || 'Admin').trim();
+  process.env.admin_google_client_id ||
+  '21566908692-dbjt8f2fvdir69nv559vaod9hkshuidq.apps.googleusercontent.com';
 const googleClient = new OAuth2Client(ADMIN_GOOGLE_CLIENT_ID);
 const allowedAdminEmails = (
-  process.env.ADMIN_ALLOWED_EMAILS || ''
+  process.env.ADMIN_ALLOWED_EMAILS ||
+  process.env.admin_allowed_emails ||
+  ''
 )
   .split(',')
   .map((email) => String(email || '').trim().toLowerCase())
   .filter(Boolean);
+const ADMIN_SEED_EMAIL = String(process.env.ADMIN_SEED_EMAIL || '').trim().toLowerCase();
+const ADMIN_SEED_PASSWORD = String(process.env.ADMIN_SEED_PASSWORD || '');
+const ADMIN_SEED_FULL_NAME = String(process.env.ADMIN_SEED_FULL_NAME || 'Admin').trim();
 
 const isAllowedAdminEmail = (email = '') => allowedAdminEmails.includes(String(email).trim().toLowerCase());
-
-const getAdminGoogleConfigErrors = () => {
-  const errors = [];
-  if (!ADMIN_GOOGLE_CLIENT_ID) {
-    errors.push('ADMIN_GOOGLE_CLIENT_ID');
-  }
-  if (allowedAdminEmails.length === 0) {
-    errors.push('ADMIN_ALLOWED_EMAILS');
-  }
-  return errors;
-};
-
-const adminGoogleConfigErrors = getAdminGoogleConfigErrors();
-if (config.NODE_ENV === 'production' && adminGoogleConfigErrors.length > 0) {
-  throw new Error(`Admin Google login is missing required env: ${adminGoogleConfigErrors.join(', ')}`);
-}
 
 const defaultOfferBannerConfig = {
   offerId: null,
@@ -93,34 +81,12 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    let admin = await Admin.findByEmail(email);
-    const isSeedAdminLogin = ADMIN_SEED_EMAIL && email === ADMIN_SEED_EMAIL;
-
-    // Self-heal missing seed admin account for environments that rely on .env credentials.
-    if (!admin && isSeedAdminLogin && ADMIN_SEED_PASSWORD) {
-      const seedPasswordHash = await Admin.hashPassword(ADMIN_SEED_PASSWORD);
-      admin = await Admin.create({
-        email: ADMIN_SEED_EMAIL,
-        password_hash: seedPasswordHash,
-        full_name: ADMIN_SEED_FULL_NAME
-      });
-    }
-
+    const admin = await Admin.findByEmail(email);
     if (!admin) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    let isPasswordValid = await Admin.comparePassword(password, admin.password_hash);
-
-    // Self-heal seed admin credentials when account password was replaced earlier
-    // (for example via legacy seed scripts or Google-created random password).
-    if (!isPasswordValid && isSeedAdminLogin && ADMIN_SEED_PASSWORD && password === ADMIN_SEED_PASSWORD) {
-      const repairedHash = await Admin.hashPassword(ADMIN_SEED_PASSWORD);
-      await Admin.updatePassword(admin.admin_id, repairedHash, { activate: true });
-      admin = await Admin.findById(admin.admin_id);
-      isPasswordValid = true;
-    }
-
+    const isPasswordValid = await Admin.comparePassword(password, admin.password_hash);
     if (!isPasswordValid) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -155,14 +121,13 @@ router.post('/login', async (req, res) => {
 // Admin Google login
 router.post('/google-login', async (req, res) => {
   try {
-    if (adminGoogleConfigErrors.length > 0) {
-      return res.status(500).json({ error: 'Admin Google login is not configured' });
-    }
-
     const { token } = req.body;
 
     if (!token) {
       return res.status(400).json({ error: 'Token is required' });
+    }
+    if (allowedAdminEmails.length === 0) {
+      return res.status(503).json({ error: 'Admin allow-list is not configured' });
     }
 
     let userInfo;
@@ -209,7 +174,8 @@ router.post('/google-login', async (req, res) => {
     // Find or create admin
     let admin = await Admin.findByEmail(userInfo.email);
     if (!admin) {
-      const hashedPassword = await Admin.hashPassword(randomBytes(48).toString('hex'));
+      // Create admin if not exists. Use a random secret so password login cannot be guessed.
+      const hashedPassword = await Admin.hashPassword(crypto.randomBytes(32).toString('hex'));
       admin = await Admin.create({
         email: userInfo.email,
         password_hash: hashedPassword,
@@ -598,7 +564,7 @@ router.get('/quality-overview', authenticateAdmin, async (req, res) => {
              l.suspension_reason, l.suspended_until, l.average_rating,
              l.total_calls, l.listener_type, l.avg_call_duration_seconds,
              l.hangup_rate, l.is_active, l.verification_status,
-             u.display_name, COALESCE(u.mobile_number, u.phone_number) AS phone
+             u.display_name, u.phone
       FROM listeners l
       JOIN users u ON l.user_id = u.user_id
     `;
@@ -710,7 +676,6 @@ router.put('/listener/update-rates/:listenerId', authenticateAdmin, async (req, 
 // PUT /api/admin/users/:user_id/wallet
 // Manually edit a user's wallet balance (God Mode)
 router.put('/users/:user_id/wallet', authenticateAdmin, async (req, res) => {
-  const client = await pool.connect();
   try {
     const { balance } = req.body;
     const parsedBalance = Number(balance);
@@ -719,58 +684,34 @@ router.put('/users/:user_id/wallet', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Balance must be a non-negative number' });
     }
 
-    await client.query('BEGIN');
-
-    await client.query(
+    // Ensure wallet exists before updating
+    await pool.query(
       `INSERT INTO wallets (user_id, balance) VALUES ($1, 0.0) ON CONFLICT (user_id) DO NOTHING`,
       [req.params.user_id]
     );
 
-    const currentWalletResult = await client.query(
-      `SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE`,
-      [req.params.user_id]
-    );
-    const currentBalance = Number(currentWalletResult.rows[0]?.balance || 0);
-    const delta = Number((parsedBalance - currentBalance).toFixed(2));
-
-    await client.query(
+    await pool.query(
       `UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP WHERE user_id = $2`,
       [parsedBalance, req.params.user_id]
     );
 
-    await client.query(
+    // Also update denormalized field in users
+    await pool.query(
       `UPDATE users SET wallet_balance = $1 WHERE user_id = $2`,
       [parsedBalance, req.params.user_id]
     );
 
-    if (delta !== 0) {
-      const transactionType = delta > 0 ? 'credit' : 'debit';
-      await client.query(
-        `INSERT INTO transactions (user_id, transaction_type, amount, currency, description, status)
-         VALUES ($1, $2, $3, 'INR', $4, 'completed')`,
-        [
-          req.params.user_id,
-          transactionType,
-          Math.abs(delta).toFixed(2),
-          `Admin Manual Balance Adjustment (${currentBalance.toFixed(2)} -> ${parsedBalance.toFixed(2)})`
-        ]
-      );
-    }
+    // Record audit transaction
+    await pool.query(
+      `INSERT INTO transactions (user_id, transaction_type, amount, currency, description, status)
+       VALUES ($1, 'credit', $2, 'INR', 'Admin Manual Balance Adjustment', 'completed')`,
+      [req.params.user_id, parsedBalance]
+    );
 
-    await client.query('COMMIT');
-
-    res.json({
-      message: 'Wallet balance updated successfully',
-      balance: parsedBalance,
-      previousBalance: currentBalance,
-      delta
-    });
+    res.json({ message: 'Wallet balance updated successfully', balance: parsedBalance });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error('Update user wallet error:', error);
     res.status(500).json({ error: 'Failed to update user wallet' });
-  } finally {
-    client.release();
   }
 });
 
@@ -1368,14 +1309,14 @@ router.put('/offer-banner', authenticateAdmin, async (req, res) => {
 // GET /api/admin/chat-charge-config
 router.get('/chat-charge-config', authenticateAdmin, async (req, res) => {
   try {
-    const chatChargeConfig = await ChatChargeConfig.getActive();
+    const config = await ChatChargeConfig.getActive();
     res.json({
       chatChargeConfig: {
-        chargingEnabled: chatChargeConfig.charging_enabled === true,
-        freeMessageLimit: Number(chatChargeConfig.free_message_limit),
-        messageBlockSize: Number(chatChargeConfig.message_block_size),
-        chargePerMessageBlock: Number(chatChargeConfig.charge_per_message_block),
-        updatedAt: chatChargeConfig.updated_at
+        chargingEnabled: config.charging_enabled === true,
+        freeMessageLimit: Number(config.free_message_limit),
+        messageBlockSize: Number(config.message_block_size),
+        chargePerMessageBlock: Number(config.charge_per_message_block),
+        updatedAt: config.updated_at
       }
     });
   } catch (error) {
@@ -1457,7 +1398,7 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
 
     // 3. Live Active Calls
     const activeCallsRes = await pool.query(
-      `SELECT COUNT(*) as active_calls FROM calls WHERE status = 'ongoing'`
+      `SELECT COUNT(*) as active_calls FROM calls WHERE status = 'in-progress'`
     );
 
     // 4. Conversion Rate (Recharged vs Total)
