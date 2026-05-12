@@ -130,7 +130,7 @@ router.post('/', authenticate, async (req, res) => {
         const checkCall = await Call.findById(call.call_id);
         if (
           checkCall &&
-          ['pending', 'ringing', 'initiated'].includes(checkCall.status)
+          ['pending', 'initiated'].includes(checkCall.status)
         ) {
           console.log(`[CALLS] Call ${call.call_id} timed out after 45s. Marking missed.`);
           await Call.updateStatus(call.call_id, 'missed');
@@ -246,7 +246,7 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
         const checkCall = await Call.findById(call.call_id);
         if (
           checkCall &&
-          ['pending', 'ringing', 'initiated'].includes(checkCall.status)
+          ['pending', 'initiated'].includes(checkCall.status)
         ) {
           console.log(`[CALLS] Listener-initiated call ${call.call_id} timed out after 45s.`);
           await Call.updateStatus(call.call_id, 'missed');

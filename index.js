@@ -1036,13 +1036,28 @@ io.on('connection', (socket) => {
           const callData = await markCallStarted(callId);
           if (!callData) {
             console.error(`[SOCKET] Failed to mark call ${callId} as started`);
+            const fallbackConnectedAtMs = Date.now();
             channelUsers.forEach(uid => {
               const sid = _resolveSocketId(uid);
-              if (sid) io.to(sid).emit('call:connected', { callId, channelName, maxAllowedSeconds: 0 });
+              if (sid) io.to(sid).emit('call:connected', {
+                callId,
+                channelName,
+                connectedAtMs: fallbackConnectedAtMs,
+                startedAtMs: fallbackConnectedAtMs,
+                serverNowMs: Date.now(),
+                timestamp: Date.now(),
+                maxAllowedSeconds: 0
+              });
             });
             return;
           }
 
+          const rawConnectedAtMs = callData.started_at
+            ? new Date(callData.started_at).getTime()
+            : Date.now();
+          const connectedAtMs = Number.isFinite(rawConnectedAtMs)
+            ? rawConnectedAtMs
+            : Date.now();
           const normalRate = Number(
             callData.billed_user_rate_per_min || callData.rate_per_minute || 0
           );
@@ -1065,13 +1080,20 @@ io.on('connection', (socket) => {
             timestamp: Date.now()
           });
 
-          // Emit call:connected with max duration to both parties
+          // Emit call:connected with one server-authoritative start timestamp.
+          // Clients render elapsed time from this value, so socket delivery
+          // order and WebRTC event timing cannot skew the two timers.
           channelUsers.forEach(uid => {
             const sid = _resolveSocketId(uid);
             if (sid) {
+              const serverNowMs = Date.now();
               io.to(sid).emit('call:connected', {
                 callId,
                 channelName,
+                connectedAtMs,
+                startedAtMs: connectedAtMs,
+                serverNowMs,
+                timestamp: serverNowMs,
                 maxAllowedSeconds,
                 ratePerMinute: normalRate
               });
@@ -1136,7 +1158,7 @@ io.on('connection', (socket) => {
               callerId: callData.caller_id,
               listenerUserId,
               channelName,
-              startedAt: Date.now(),
+              startedAt: connectedAtMs,
               maxAllowedSeconds
             });
             console.log(`[SOCKET] Call ${callId}: auto-disconnect timer set for ${maxAllowedSeconds + 3}s`);
@@ -1175,9 +1197,18 @@ io.on('connection', (socket) => {
         } catch (err) {
           console.error(`[SOCKET] Error in call:joined handler for call ${callId}:`, err);
           // Still emit call:connected without max duration as fallback
+          const fallbackConnectedAtMs = Date.now();
           channelUsers.forEach(uid => {
             const sid = _resolveSocketId(uid);
-            if (sid) io.to(sid).emit('call:connected', { callId, channelName, maxAllowedSeconds: 0 });
+            if (sid) io.to(sid).emit('call:connected', {
+              callId,
+              channelName,
+              connectedAtMs: fallbackConnectedAtMs,
+              startedAtMs: fallbackConnectedAtMs,
+              serverNowMs: Date.now(),
+              timestamp: Date.now(),
+              maxAllowedSeconds: 0
+            });
           });
         } finally {
           processingCalls.delete(String(callId));

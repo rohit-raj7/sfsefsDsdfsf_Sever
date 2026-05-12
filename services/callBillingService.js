@@ -194,7 +194,7 @@ const markCallStarted = async (callId) => {
     const result = await pool.query(
       `UPDATE calls
        SET status = 'ongoing', started_at = CURRENT_TIMESTAMP
-       WHERE call_id = $1 AND status IN ('pending', 'ringing')
+       WHERE call_id = $1 AND status IN ('pending', 'ringing', 'ongoing')
        RETURNING call_id, started_at, rate_per_minute, billed_user_rate_per_min,
                  offer_applied, offer_flat_price, offer_minutes_limit,
                  caller_id, listener_id`,
