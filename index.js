@@ -256,6 +256,12 @@ io.on('connection', (socket) => {
     }
   }
 
+  // Helper: resolve the best socket ID for a user (checks both maps)
+  // Listeners may be in listenerSockets but not connectedUsers after reconnect.
+  function _resolveSocketId(userId) {
+    return connectedUsers.get(userId) || listenerSockets.get(userId);
+  }
+
   function _markUserOffline(userId, reason = 'offline') {
     if (!userId) return false;
     const currentSocketId = connectedUsers.get(userId);
@@ -1015,7 +1021,7 @@ io.on('connection', (socket) => {
           if (!callData) {
             console.error(`[SOCKET] Failed to mark call ${callId} as started`);
             channelUsers.forEach(uid => {
-              const sid = connectedUsers.get(uid);
+              const sid = _resolveSocketId(uid);
               if (sid) io.to(sid).emit('call:connected', { callId, channelName, maxAllowedSeconds: 0 });
             });
             return;
@@ -1039,7 +1045,7 @@ io.on('connection', (socket) => {
 
           // Emit call:connected with max duration to both parties
           channelUsers.forEach(uid => {
-            const sid = connectedUsers.get(uid);
+            const sid = _resolveSocketId(uid);
             if (sid) {
               io.to(sid).emit('call:connected', {
                 callId,
@@ -1060,7 +1066,7 @@ io.on('connection', (socket) => {
 
               // Notify both parties to disconnect
               channelUsers.forEach(uid => {
-                const sid = connectedUsers.get(uid);
+                const sid = _resolveSocketId(uid);
                 if (sid) {
                   io.to(sid).emit('call:ended', {
                     callId,
@@ -1108,7 +1114,7 @@ io.on('connection', (socket) => {
             // Zero balance â€” disconnect immediately
             console.log(`[SOCKET] Call ${callId}: zero allowed duration, disconnecting immediately`);
             channelUsers.forEach(uid => {
-              const sid = connectedUsers.get(uid);
+              const sid = _resolveSocketId(uid);
               if (sid) {
                 io.to(sid).emit('call:ended', {
                   callId,
@@ -1123,7 +1129,7 @@ io.on('connection', (socket) => {
           console.error(`[SOCKET] Error in call:joined handler for call ${callId}:`, err);
           // Still emit call:connected without max duration as fallback
           channelUsers.forEach(uid => {
-            const sid = connectedUsers.get(uid);
+            const sid = _resolveSocketId(uid);
             if (sid) io.to(sid).emit('call:connected', { callId, channelName, maxAllowedSeconds: 0 });
           });
         } finally {
