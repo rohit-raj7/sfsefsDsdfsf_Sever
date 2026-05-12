@@ -90,8 +90,8 @@ export default {
 
   // Socket.IO configuration
   socketIO: {
-    pingTimeout: 5000,  // Reduced from 60000ms to 5000ms for faster offline detection
-    pingInterval: 2000, // Reduced from 25000ms to 2000ms for more frequent heartbeats
+    pingTimeout: 60000,  // Restored to 60000ms for mobile stability (prevents random call drops)
+    pingInterval: 25000, // Restored to 25000ms
   },
 
   // LiveKit RTC configuration
