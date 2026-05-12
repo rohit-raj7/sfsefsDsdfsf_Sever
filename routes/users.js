@@ -77,6 +77,28 @@ router.get('/', async (req, res) => {
       params.push(isActive == 'true');
     }
 
+    const activeCallExists = `
+      EXISTS (
+        SELECT 1
+        FROM calls c
+        WHERE c.caller_id = users.user_id
+          AND (
+            c.status = 'ongoing'
+            OR (
+              c.status IN ('pending', 'ringing')
+              AND c.created_at >= NOW() - INTERVAL '2 minutes'
+            )
+          )
+      )
+    `;
+
+    const availableForCall = req.query.available_for_call?.toString().trim();
+    if (availableForCall == 'true') {
+      conditions.push(`NOT ${activeCallExists}`);
+    } else if (availableForCall == 'false') {
+      conditions.push(activeCallExists);
+    }
+
     const limitValue = Number.parseInt(req.query.limit?.toString() ?? '100', 10);
     const offsetValue = Number.parseInt(req.query.offset?.toString() ?? '0', 10);
     const limit = Number.isFinite(limitValue)
@@ -107,7 +129,9 @@ router.get('/', async (req, res) => {
           account_type,
           is_verified,
           is_active,
-          created_at
+          created_at,
+          ${activeCallExists} AS is_busy,
+          NOT ${activeCallExists} AS is_available_for_call
         FROM users
         ${whereClause}
         ORDER BY created_at DESC
