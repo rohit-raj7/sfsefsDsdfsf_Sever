@@ -1059,6 +1059,12 @@ io.on('connection', (socket) => {
           );
 
           console.log(`[SOCKET] Call ${callId}: rate=\u20b9${normalRate}/min, balance=\u20b9${balance}, maxAllowed=${maxAllowedSeconds}s`);
+          io.emit('user_busy_status', {
+            userId: callData.caller_id,
+            busy: true,
+            callId,
+            timestamp: Date.now()
+          });
 
           // Emit call:connected with max duration to both parties
           channelUsers.forEach(uid => {
@@ -1103,6 +1109,14 @@ io.on('connection', (socket) => {
               }
 
               // Clear busy status for both parties
+              if (callData.caller_id) {
+                io.emit('user_busy_status', {
+                  userId: callData.caller_id,
+                  busy: false,
+                  callId,
+                  timestamp: Date.now()
+                });
+              }
               channelUsers.forEach(uid => {
                 if (busyListeners.has(uid)) {
                   busyListeners.delete(uid);
@@ -1142,6 +1156,14 @@ io.on('connection', (socket) => {
               }
             });
             // Clear busy for zero-balance disconnect
+            if (callData.caller_id) {
+              io.emit('user_busy_status', {
+                userId: callData.caller_id,
+                busy: false,
+                callId,
+                timestamp: Date.now()
+              });
+            }
             channelUsers.forEach(uid => {
               if (busyListeners.has(uid)) {
                 busyListeners.delete(uid);
@@ -1195,6 +1217,23 @@ io.on('connection', (socket) => {
     
     // BUSY: Clear busy for both parties (whichever is the listener)
     _clearBusyForCall(endedBy, otherUserId);
+    if (callId) {
+      (async () => {
+        try {
+          const endedCall = await Call.findById(callId);
+          if (endedCall?.caller_id) {
+            io.emit('user_busy_status', {
+              userId: endedCall.caller_id,
+              busy: false,
+              callId,
+              timestamp: Date.now()
+            });
+          }
+        } catch (err) {
+          console.error(`[SOCKET] call:end user busy clear lookup failed for ${callId}:`, err.message);
+        }
+      })();
+    }
 
     const notifiedSocketIds = new Set();
     const notifyCallEnded = (targetUserId, extra = {}) => {
@@ -1604,6 +1643,14 @@ io.on('connection', (socket) => {
         clearTimeout(timerData.timerId);
         activeCallTimers.delete(callId);
         console.log(`[SOCKET] disconnect: Cleared timer for call ${callId} (${isCaller ? 'caller' : 'listener'} disconnected)`);
+        if (timerData.callerId) {
+          io.emit('user_busy_status', {
+            userId: timerData.callerId,
+            busy: false,
+            callId,
+            timestamp: Date.now()
+          });
+        }
         // Trigger billing safety net for disconnected calls
         (async () => {
           try {

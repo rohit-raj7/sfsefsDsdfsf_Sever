@@ -92,13 +92,7 @@ router.get('/', async (req, res) => {
         SELECT 1
         FROM calls c
         WHERE c.caller_id = users.user_id
-          AND (
-            c.status = 'ongoing'
-            OR (
-              c.status IN ('pending', 'ringing')
-              AND c.created_at >= NOW() - INTERVAL '2 minutes'
-            )
-          )
+          AND c.status = 'ongoing'
       )
     `;
 
