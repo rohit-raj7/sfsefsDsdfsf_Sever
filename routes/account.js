@@ -9,10 +9,6 @@ router.post('/delete-request', authenticate, async (req, res) => {
   try {
     const { name, email, phone, reason } = req.body || {};
 
-    if (!req.user) {
-      return res.status(401).json({ error: 'User not found or inactive' });
-    }
-
     if (!name || !reason) {
       return res.status(400).json({ error: 'Name and reason are required' });
     }

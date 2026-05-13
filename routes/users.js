@@ -77,36 +77,10 @@ router.get('/', async (req, res) => {
       params.push(isActive == 'true');
     }
 
-    const userIds = req.query.user_ids?.toString()
-      .split(',')
-      .map((id) => id.trim())
-      .filter(Boolean)
-      .slice(0, 500);
-    if (userIds && userIds.length > 0) {
-      conditions.push(`user_id::text = ANY($${index++})`);
-      params.push(userIds);
-    }
-
-    const activeCallExists = `
-      EXISTS (
-        SELECT 1
-        FROM calls c
-        WHERE c.caller_id = users.user_id
-          AND c.status = 'ongoing'
-      )
-    `;
-
-    const availableForCall = req.query.available_for_call?.toString().trim();
-    if (availableForCall == 'true') {
-      conditions.push(`NOT ${activeCallExists}`);
-    } else if (availableForCall == 'false') {
-      conditions.push(activeCallExists);
-    }
-
     const limitValue = Number.parseInt(req.query.limit?.toString() ?? '100', 10);
     const offsetValue = Number.parseInt(req.query.offset?.toString() ?? '0', 10);
     const limit = Number.isFinite(limitValue)
-      ? Math.min(Math.max(limitValue, 1), 500)
+      ? Math.min(Math.max(limitValue, 1), 100)
       : 100;
     const offset = Number.isFinite(offsetValue) ? Math.max(offsetValue, 0) : 0;
 
@@ -133,9 +107,7 @@ router.get('/', async (req, res) => {
           account_type,
           is_verified,
           is_active,
-          created_at,
-          ${activeCallExists} AS is_busy,
-          NOT ${activeCallExists} AS is_available_for_call
+          created_at
         FROM users
         ${whereClause}
         ORDER BY created_at DESC

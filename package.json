@@ -5,7 +5,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node scripts/migrate_subs.js && node scripts/start_pm2.js",
+    "start": "node scripts/migrate_subs.js && pm2-runtime start ecosystem.config.cjs",
     "start:dev": "node scripts/migrate_subs.js && node index.js",
     "stop:pm2": "pm2 stop callto-backend",
     "reload:pm2": "pm2 reload callto-backend",

@@ -16,7 +16,6 @@ try {
   }
 } catch (error) {
   console.error('❌ Failed to initialize Firebase Admin SDK:', error.message);
-  throw error;
 }
 
 // ─── Error Classification ───────────────────────────────────────────

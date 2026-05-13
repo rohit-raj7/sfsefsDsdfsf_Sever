@@ -38,7 +38,6 @@ import reportRoutes from './routes/reports.js';
 import marketingRoutes from './routes/marketing.js';
 import User from './models/User.js';
 import Listener from './models/Listener.js'; // Import for verification checks
-import { sendPushFCM } from './utils/fcm.js'; // Added missing FCM import
 import Call from './models/Call.js';
 import { markCallStarted, calculateMaxCallDuration, finalizeCallBilling as billingFinalize } from './services/callBillingService.js';
 import { Chat, Message } from './models/Chat.js';
@@ -73,7 +72,7 @@ if (config.NODE_ENV === 'development') {
   app.use(morgan('combined'));
 }
 
-// Rate limiting â€” general (generous for mobile retries & socket reconnects)
+// Rate limiting Ã¢â‚¬â€ general (generous for mobile retries & socket reconnects)
 const limiter = rateLimit({
   windowMs: config.rateLimit.windowMs,
   max: config.rateLimit.max,
@@ -169,6 +168,7 @@ const activeChannels = new Map(); // Map of channelName -> Set of userIds in cha
 const lastSeenMap = new Map(); // Map of userId -> timestamp
 const presenceTimeouts = new Map(); // Map of userId -> timeoutId
 const busyListeners = new Map(); // Map of listenerUserId -> callId (in-memory busy tracking)
+app.set('busyListeners', busyListeners);
 const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, listenerSocketId, createdAt } (tracks pre-answer calls for cancel routing)
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
@@ -183,7 +183,7 @@ const clearPendingCall = (callId) => {
   return pending;
 };
 
-// â”€â”€ Random User-to-User Match Pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Ã¢â€â‚¬Ã¢â€â‚¬ Random User-to-User Match Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // When "Match with Verified Expert" toggle is OFF, users join this pool.
 // The server instantly pairs two waiting users and emits `random:matched` to both.
 const randomUserPool = new Map(); // Map of userId -> { socketId, displayName, avatarUrl, gender, joinedAt }
@@ -198,6 +198,7 @@ setInterval(() => {
     }
   }
 }, 60000);
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 
 // Stale pendingCalls cleanup: remove entries older than 60 seconds
@@ -254,12 +255,6 @@ io.on('connection', (socket) => {
         Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusyByUserId DB error:', e.message));
       }
     }
-  }
-
-  // Helper: resolve the best socket ID for a user (checks both maps)
-  // Listeners may be in listenerSockets but not connectedUsers after reconnect.
-  function _resolveSocketId(userId) {
-    return connectedUsers.get(userId) || listenerSockets.get(userId);
   }
 
   function _markUserOffline(userId, reason = 'offline') {
@@ -349,6 +344,7 @@ io.on('connection', (socket) => {
     const onlineUsers = Array.from(connectedUsers.keys());
     socket.emit('listeners:initial_status', onlineListeners);
     socket.emit('users:initial_status', onlineUsers);
+    socket.emit('listeners:initial_busy', Array.from(busyListeners.keys()));
   });
 
   // Listener specific join (for availability tracking)
@@ -377,7 +373,7 @@ io.on('connection', (socket) => {
     // can confirm listener is online (it checks last_active_at <= 2 min)
     try {
       await Listener.updateLastActiveByUserId(listenerUserId);
-      console.log(`[SOCKET] listener:join: âœ“ Updated last_active_at for ${listenerUserId}`);
+      console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Updated last_active_at for ${listenerUserId}`);
     } catch (err) {
       console.error(`[SOCKET] listener:join: Failed to update last_active_at:`, err.message);
     }
@@ -397,7 +393,8 @@ io.on('connection', (socket) => {
     
     io.emit('listener_status', { listenerUserId, online: true, timestamp: Date.now() });
     socket.emit('users:initial_status', Array.from(connectedUsers.keys()));
-    console.log(`[SOCKET] listener:join: âœ“ Listener ${listenerUserId} is now ONLINE (socket: ${socket.id})`);
+    socket.emit('listeners:initial_busy', Array.from(busyListeners.keys()));
+    console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Listener ${listenerUserId} is now ONLINE (socket: ${socket.id})`);
     console.log(`[SOCKET] listener:join: Total online listeners: ${listenerSockets.size}`);
   });
 
@@ -407,11 +404,11 @@ io.on('connection', (socket) => {
     const { listenerUserId } = data || {};
     if (listenerUserId) {
       _markListenerOffline(listenerUserId, 'manual');
-      console.log(`[SOCKET] listener:offline: âœ“ Listener ${listenerUserId} manually went OFFLINE`);
+      console.log(`[SOCKET] listener:offline: Ã¢Å“â€œ Listener ${listenerUserId} manually went OFFLINE`);
     }
   });
 
-  // â”€â”€ RANDOM USER-TO-USER MATCH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Ã¢â€â‚¬Ã¢â€â‚¬ RANDOM USER-TO-USER MATCH Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
   socket.on('user:offline', (data) => {
     const { userId } = data || {};
     _markUserOffline(userId, 'manual');
@@ -419,7 +416,7 @@ io.on('connection', (socket) => {
 
   // Toggle OFF: User wants a free random match with another regular user.
   // Server maintains an in-memory pool. When 2 users are waiting, they are paired.
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
   // User joins the free random match pool
   socket.on('random:join_pool', async (data) => {
@@ -536,9 +533,9 @@ io.on('connection', (socket) => {
         io.to(matchedSocketId).emit('random:matched', { matchedUser: currentUserInfo });
       }
 
-      console.log(`[RANDOM] âœ“ Matched: ${userId} <-> ${matchedUserId}`);
+      console.log(`[RANDOM] Ã¢Å“â€œ Matched: ${userId} <-> ${matchedUserId}`);
     } else {
-      // No match found â€” add to pool and set a 30s timeout
+      // No match found Ã¢â‚¬â€ add to pool and set a 30s timeout
       const timeoutId = setTimeout(() => {
         if (randomUserPool.has(userId)) {
           randomUserPool.delete(userId);
@@ -606,7 +603,7 @@ io.on('connection', (socket) => {
       console.log(`[RANDOM] Removed disconnected user ${userId} from random pool`);
     }
   });
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
   // 2. CALL HANDLING
 
@@ -634,14 +631,14 @@ io.on('connection', (socket) => {
     if (!listenerSocketId) {
       // Listener is offline for calls when the Online button is off or the app
       // is backgrounded/closed, even if FCM is available.
-      console.log(`[SOCKET] call:initiate: âœ— Listener ${listenerId} offline for calls`);
+      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} offline for calls`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'listener_offline' });
       return;
     }
 
     // BUSY CHECK: If listener is already in an active call, notify caller
     if (busyListeners.has(listenerId)) {
-      console.log(`[SOCKET] call:initiate: âœ— Listener ${listenerId} is BUSY (active call: ${busyListeners.get(listenerId)})`);
+      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} is BUSY (active call: ${busyListeners.get(listenerId)})`);
       socket.emit('call:busy', {
         callId: callData.callId,
         listenerId,
@@ -667,9 +664,9 @@ io.on('connection', (socket) => {
     if (listenerSocketId) {
       io.to(listenerSocketId).emit('incoming-call', callData);
     }
-    console.log(`[SOCKET] call:initiate: âœ“ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
+    console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
 
-    // THEN verify in background â€” if not approved, cancel the call
+    // THEN verify in background Ã¢â‚¬â€ if not approved, cancel the call
     try {
       const listener = await Listener.findByUserId(listenerId);
       if (listener) {
@@ -695,7 +692,7 @@ io.on('connection', (socket) => {
       }
     } catch (err) {
       console.error(`[SOCKET] call:initiate verification check failed:`, err);
-      // Don't fail the call for a verification check error â€” call was already forwarded
+      // Don't fail the call for a verification check error Ã¢â‚¬â€ call was already forwarded
     }
 
     const listenerFcmToken = listenerUser?.fcm_token ? String(listenerUser.fcm_token).trim() : '';
@@ -737,9 +734,9 @@ io.on('connection', (socket) => {
         }
         if (pushResult?.success) {
         }
-        console.log(`[SOCKET] call:initiate: âœ“ FCM Push sent successfully to listener ${listenerId}`);
+        console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ FCM Push sent successfully to listener ${listenerId}`);
       } catch (fcmErr) {
-        console.error(`[SOCKET] call:initiate: âœ— FCM Push failed:`, fcmErr.message);
+        console.error(`[SOCKET] call:initiate: Ã¢Å“â€” FCM Push failed:`, fcmErr.message);
       }
     }
   });
@@ -789,7 +786,7 @@ io.on('connection', (socket) => {
     }
 
     if (!targetSocketId) {
-      console.log(`[SOCKET] listener_call:initiate: âœ— User ${targetUserId} offline for calls`);
+      console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€” User ${targetUserId} offline for calls`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'user_offline' });
       return;
     }
@@ -856,7 +853,7 @@ io.on('connection', (socket) => {
     if (targetSocketId) {
       io.to(targetSocketId).emit('incoming-call', callData);
     }
-    console.log(`[SOCKET] listener_call:initiate: âœ“ Forwarded to user ${targetUserId} (socket: ${targetSocketId})`);
+    console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€œ Forwarded to user ${targetUserId} (socket: ${targetSocketId})`);
 
     const targetFcmToken = targetUser?.fcm_token ? String(targetUser.fcm_token).trim() : '';
     if (targetUser && targetFcmToken) {
@@ -903,9 +900,9 @@ io.on('connection', (socket) => {
         }
         if (pushResult?.success) {
         }
-        console.log(`[SOCKET] listener_call:initiate: âœ“ FCM Push sent successfully to user ${targetUserId}`);
+        console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€œ FCM Push sent successfully to user ${targetUserId}`);
       } catch (fcmErr) {
-        console.error(`[SOCKET] listener_call:initiate: âœ— FCM Push failed:`, fcmErr.message);
+        console.error(`[SOCKET] listener_call:initiate: Ã¢Å“â€” FCM Push failed:`, fcmErr.message);
       }
     }
   });
@@ -930,14 +927,18 @@ io.on('connection', (socket) => {
       }
     }
 
-    // BUSY: Mark the actual listener as busy in memory / DB.
-    if (listenerUserId) {
-      busyListeners.set(listenerUserId, callId);
+    // BUSY: Mark BOTH parties as busy in memory.
+    [listenerUserId, callerId].forEach(uid => {
+      if (!uid) return;
+      busyListeners.set(uid, callId);
       io.emit('listener_busy_status', {
-        listenerUserId,
+        listenerUserId: uid,
         busy: true,
       });
-      console.log(`[SOCKET] call:accept: Listener ${listenerUserId} marked BUSY`);
+      console.log(`[SOCKET] call:accept: User/Listener ${uid} marked BUSY`);
+    });
+
+    if (listenerUserId) {
       Listener.findByUserId(listenerUserId)
         .then((listener) => {
           if (listener) {
@@ -951,12 +952,14 @@ io.on('connection', (socket) => {
         );
     }
 
-    const callerSocketId = _resolveSocketId(callerId);
+    const serverTimestamp = Date.now();
+    const callerSocketId = connectedUsers.get(callerId);
     if (callerSocketId) {
       io.to(callerSocketId).emit('call:accepted', {
         callId,
         listenerId: listenerUserId || socket.userId,
         acceptedBy: socket.userId,
+        serverTime: serverTimestamp,
       });
     } else {
       _clearBusyForCall(listenerUserId || socket.userId, callerId);
@@ -965,22 +968,6 @@ io.on('connection', (socket) => {
         endedBy: callerId,
         reason: 'caller_unavailable',
       });
-    }
-
-    // Watchdog: if call:joined never fires (LiveKit fail, app crash, etc.),
-    // the busy flag stays forever. Auto-clear after 45s if no active timer set.
-    if (listenerUserId && callId) {
-      setTimeout(() => {
-        if (busyListeners.has(listenerUserId) &&
-            busyListeners.get(listenerUserId) === callId &&
-            !activeCallTimers.has(callId)) {
-          busyListeners.delete(listenerUserId);
-          io.emit('listener_busy_status', { listenerUserId, busy: false });
-          Listener.clearBusyByUserId(listenerUserId).catch(e =>
-            console.error('[SOCKET] clearBusy watchdog error:', e.message));
-          console.log(`[SOCKET] Watchdog: cleared stale busy for listener ${listenerUserId} (call ${callId} never connected)`);
-        }
-      }, 45000);
     }
   });
 
@@ -992,7 +979,7 @@ io.on('connection', (socket) => {
     const pending = clearPendingCall(callId);
     const listenerUserId = pending?.listenerUserId || socket.userId;
 
-    const callerSocketId = _resolveSocketId(callerId);
+    const callerSocketId = connectedUsers.get(callerId);
     if (callerSocketId) {
       io.to(callerSocketId).emit('call:rejected', {
         callId,
@@ -1035,29 +1022,15 @@ io.on('connection', (socket) => {
         try {
           const callData = await markCallStarted(callId);
           if (!callData) {
+            const serverStartTimeMs = Date.now();
             console.error(`[SOCKET] Failed to mark call ${callId} as started`);
-            const fallbackConnectedAtMs = Date.now();
             channelUsers.forEach(uid => {
-              const sid = _resolveSocketId(uid);
-              if (sid) io.to(sid).emit('call:connected', {
-                callId,
-                channelName,
-                connectedAtMs: fallbackConnectedAtMs,
-                startedAtMs: fallbackConnectedAtMs,
-                serverNowMs: Date.now(),
-                timestamp: Date.now(),
-                maxAllowedSeconds: 0
-              });
+              const sid = connectedUsers.get(uid);
+              if (sid) io.to(sid).emit('call:connected', { callId, channelName, maxAllowedSeconds: 0, serverStartTimeMs });
             });
             return;
           }
 
-          const rawConnectedAtMs = callData.started_at
-            ? new Date(callData.started_at).getTime()
-            : Date.now();
-          const connectedAtMs = Number.isFinite(rawConnectedAtMs)
-            ? rawConnectedAtMs
-            : Date.now();
           const normalRate = Number(
             callData.billed_user_rate_per_min || callData.rate_per_minute || 0
           );
@@ -1073,28 +1046,18 @@ io.on('connection', (socket) => {
           );
 
           console.log(`[SOCKET] Call ${callId}: rate=\u20b9${normalRate}/min, balance=\u20b9${balance}, maxAllowed=${maxAllowedSeconds}s`);
-          io.emit('user_busy_status', {
-            userId: callData.caller_id,
-            busy: true,
-            callId,
-            timestamp: Date.now()
-          });
 
-          // Emit call:connected with one server-authoritative start timestamp.
-          // Clients render elapsed time from this value, so socket delivery
-          // order and WebRTC event timing cannot skew the two timers.
+          const serverStartTimeMs = Date.now();
+
+          // Emit call:connected with max duration to both parties
           channelUsers.forEach(uid => {
-            const sid = _resolveSocketId(uid);
+            const sid = connectedUsers.get(uid);
             if (sid) {
-              const serverNowMs = Date.now();
               io.to(sid).emit('call:connected', {
                 callId,
                 channelName,
-                connectedAtMs,
-                startedAtMs: connectedAtMs,
-                serverNowMs,
-                timestamp: serverNowMs,
                 maxAllowedSeconds,
+                serverStartTimeMs,
                 ratePerMinute: normalRate
               });
             }
@@ -1110,7 +1073,7 @@ io.on('connection', (socket) => {
 
               // Notify both parties to disconnect
               channelUsers.forEach(uid => {
-                const sid = _resolveSocketId(uid);
+                const sid = connectedUsers.get(uid);
                 if (sid) {
                   io.to(sid).emit('call:ended', {
                     callId,
@@ -1130,14 +1093,6 @@ io.on('connection', (socket) => {
               }
 
               // Clear busy status for both parties
-              if (callData.caller_id) {
-                io.emit('user_busy_status', {
-                  userId: callData.caller_id,
-                  busy: false,
-                  callId,
-                  timestamp: Date.now()
-                });
-              }
               channelUsers.forEach(uid => {
                 if (busyListeners.has(uid)) {
                   busyListeners.delete(uid);
@@ -1158,15 +1113,15 @@ io.on('connection', (socket) => {
               callerId: callData.caller_id,
               listenerUserId,
               channelName,
-              startedAt: connectedAtMs,
+              startedAt: Date.now(),
               maxAllowedSeconds
             });
             console.log(`[SOCKET] Call ${callId}: auto-disconnect timer set for ${maxAllowedSeconds + 3}s`);
           } else {
-            // Zero balance â€” disconnect immediately
+            // Zero balance Ã¢â‚¬â€ disconnect immediately
             console.log(`[SOCKET] Call ${callId}: zero allowed duration, disconnecting immediately`);
             channelUsers.forEach(uid => {
-              const sid = _resolveSocketId(uid);
+              const sid = connectedUsers.get(uid);
               if (sid) {
                 io.to(sid).emit('call:ended', {
                   callId,
@@ -1176,54 +1131,17 @@ io.on('connection', (socket) => {
                 });
               }
             });
-            // Clear busy for zero-balance disconnect
-            if (callData.caller_id) {
-              io.emit('user_busy_status', {
-                userId: callData.caller_id,
-                busy: false,
-                callId,
-                timestamp: Date.now()
-              });
-            }
-            channelUsers.forEach(uid => {
-              if (busyListeners.has(uid)) {
-                busyListeners.delete(uid);
-                io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
-                Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusy zero-balance error:', e.message));
-              }
-            });
-            activeChannels.delete(channelName);
           }
         } catch (err) {
           console.error(`[SOCKET] Error in call:joined handler for call ${callId}:`, err);
+          const serverStartTimeMs = Date.now();
           // Still emit call:connected without max duration as fallback
-          const fallbackConnectedAtMs = Date.now();
           channelUsers.forEach(uid => {
-            const sid = _resolveSocketId(uid);
-            if (sid) io.to(sid).emit('call:connected', {
-              callId,
-              channelName,
-              connectedAtMs: fallbackConnectedAtMs,
-              startedAtMs: fallbackConnectedAtMs,
-              serverNowMs: Date.now(),
-              timestamp: Date.now(),
-              maxAllowedSeconds: 0
-            });
+            const sid = connectedUsers.get(uid);
+            if (sid) io.to(sid).emit('call:connected', { callId, channelName, maxAllowedSeconds: 0, serverStartTimeMs });
           });
         } finally {
           processingCalls.delete(String(callId));
-          // Safety: if no activeCallTimer was set (error/zero-balance), clear busy
-          // so listeners don't get stuck as permanently busy.
-          if (!activeCallTimers.has(callId)) {
-            channelUsers.forEach(uid => {
-              if (busyListeners.has(uid) && busyListeners.get(uid) === callId) {
-                busyListeners.delete(uid);
-                io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
-                Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusy safety error:', e.message));
-                console.log(`[SOCKET] Safety: cleared stale busy for ${uid} (call ${callId})`);
-              }
-            });
-          }
         }
       })();
     }
@@ -1247,23 +1165,6 @@ io.on('connection', (socket) => {
     
     // BUSY: Clear busy for both parties (whichever is the listener)
     _clearBusyForCall(endedBy, otherUserId);
-    if (callId) {
-      (async () => {
-        try {
-          const endedCall = await Call.findById(callId);
-          if (endedCall?.caller_id) {
-            io.emit('user_busy_status', {
-              userId: endedCall.caller_id,
-              busy: false,
-              callId,
-              timestamp: Date.now()
-            });
-          }
-        } catch (err) {
-          console.error(`[SOCKET] call:end user busy clear lookup failed for ${callId}:`, err.message);
-        }
-      })();
-    }
 
     const notifiedSocketIds = new Set();
     const notifyCallEnded = (targetUserId, extra = {}) => {
@@ -1283,7 +1184,7 @@ io.on('connection', (socket) => {
     // 1. Try direct otherUserId path (for connected calls)
     notifyCallEnded(otherUserId);
     
-    // 2. Check pendingCalls â€” caller cancelled BEFORE listener answered
+    // 2. Check pendingCalls Ã¢â‚¬â€ caller cancelled BEFORE listener answered
     const pending = pendingCalls.get(callId);
     if (pending) {
       clearPendingCall(callId);
@@ -1484,7 +1385,7 @@ io.on('connection', (socket) => {
       const otherUserId = chat.user1_id === socket.userId ? chat.user2_id : chat.user1_id;
 
       // CHAT CHARGING: Check if user should be charged for this message
-      // Uses GLOBAL per-user counters (not per-chat) â€” survives chat clear/delete
+      // Uses GLOBAL per-user counters (not per-chat) Ã¢â‚¬â€ survives chat clear/delete
       try {
         const chargeResult = await ChatChargeConfig.checkAndCharge(socket.userId);
         if (!chargeResult.allowed) {
@@ -1499,7 +1400,7 @@ io.on('connection', (socket) => {
           return;
         }
         if (chargeResult.charged) {
-          console.log(`[SOCKET] Charged user ${socket.userId} â‚¹${chargeResult.chargeAmount} for chat message`);
+          console.log(`[SOCKET] Charged user ${socket.userId} Ã¢â€šÂ¹${chargeResult.chargeAmount} for chat message`);
         }
       } catch (chargeError) {
         console.error('[SOCKET] Chat charge check error:', chargeError);
@@ -1673,14 +1574,6 @@ io.on('connection', (socket) => {
         clearTimeout(timerData.timerId);
         activeCallTimers.delete(callId);
         console.log(`[SOCKET] disconnect: Cleared timer for call ${callId} (${isCaller ? 'caller' : 'listener'} disconnected)`);
-        if (timerData.callerId) {
-          io.emit('user_busy_status', {
-            userId: timerData.callerId,
-            busy: false,
-            callId,
-            timestamp: Date.now()
-          });
-        }
         // Trigger billing safety net for disconnected calls
         (async () => {
           try {
@@ -1743,7 +1636,7 @@ io.on('connection', (socket) => {
         if (users.has(userId)) {
           users.forEach(otherUid => {
             if (otherUid !== userId) {
-              const otherSid = _resolveSocketId(otherUid);
+              const otherSid = connectedUsers.get(otherUid);
               if (otherSid) {
                 io.to(otherSid).emit('call:ended', {
                   callId: channelName,
@@ -1814,18 +1707,18 @@ const PORT = config.PORT;
 
 async function startServer() {
   try {
-    // Test database connection â€” retry up to 10 times (30s apart) so the
+    // Test database connection Ã¢â‚¬â€ retry up to 10 times (30s apart) so the
     // container doesn't crash-loop while waiting for Postgres to be ready.
-    console.log('ðŸ”— Connecting to PostgreSQL...');
+    console.log('Ã°Å¸â€â€” Connecting to PostgreSQL...');
     let connected = false;
     for (let attempt = 1; attempt <= 10; attempt++) {
       connected = await testConnection();
       if (connected) break;
-      console.error(`âŒ DB connection attempt ${attempt}/10 failed. Retrying in 30s...`);
+      console.error(`Ã¢ÂÅ’ DB connection attempt ${attempt}/10 failed. Retrying in 30s...`);
       await new Promise(r => setTimeout(r, 30000));
     }
     if (!connected) {
-      console.error('âŒ Could not connect to database after 10 attempts. Exiting...');
+      console.error('Ã¢ÂÅ’ Could not connect to database after 10 attempts. Exiting...');
       process.exit(1);
     }
 
@@ -1833,7 +1726,7 @@ async function startServer() {
     try {
       await ensureSchema();
     } catch (err) {
-      console.error('âŒ Failed to ensure database schema:', err.message);
+      console.error('Ã¢ÂÅ’ Failed to ensure database schema:', err.message);
       process.exit(1);
     }
 
@@ -1845,10 +1738,10 @@ async function startServer() {
         `UPDATE listeners SET is_busy = FALSE WHERE is_busy = TRUE RETURNING listener_id`
       );
       if (cleared.rowCount > 0) {
-        console.log(`ðŸ§¹ Cleared ${cleared.rowCount} stale busy flag(s) on startup:`, cleared.rows.map(r => r.listener_id));
+        console.log(`Ã°Å¸Â§Â¹ Cleared ${cleared.rowCount} stale busy flag(s) on startup:`, cleared.rows.map(r => r.listener_id));
       }
     } catch (err) {
-      console.error('âš ï¸  Failed to clear stale busy flags:', err.message);
+      console.error('Ã¢Å¡Â Ã¯Â¸Â  Failed to clear stale busy flags:', err.message);
     }
 
     const listenWithFallback = (initialPort, attempts = 8) =>
@@ -1877,11 +1770,11 @@ async function startServer() {
 
     const boundPort = await listenWithFallback(PORT, 8);
     console.log('\n' + '='.repeat(50));
-    console.log(`ðŸš€ Dost Talk Backend Server`);
-    console.log(`ðŸ“¡ Environment: ${config.NODE_ENV}`);
-    console.log(`ðŸŒ Server running on port ${boundPort}`);
-    console.log(`ðŸ”Œ Socket.IO ready for connections`);
-    console.log(`ðŸ“Š API endpoints available at http://localhost:${boundPort}/api`);
+    console.log(`Ã°Å¸Å¡â‚¬ Dost Talk Backend Server`);
+    console.log(`Ã°Å¸â€œÂ¡ Environment: ${config.NODE_ENV}`);
+    console.log(`Ã°Å¸Å’Â Server running on port ${boundPort}`);
+    console.log(`Ã°Å¸â€Å’ Socket.IO ready for connections`);
+    console.log(`Ã°Å¸â€œÅ  API endpoints available at http://localhost:${boundPort}/api`);
     console.log('='.repeat(50) + '\n');
 
     // Notify PM2 that the process is ready to receive traffic (for cluster mode)
@@ -1904,7 +1797,7 @@ async function startServer() {
       });
     }, NOTIFICATION_QUEUE_POLL_MS);
   } catch (error) {
-    console.error('âŒ Failed to start server:', error);
+    console.error('Ã¢ÂÅ’ Failed to start server:', error);
     process.exit(1);
   }
 }
@@ -1914,17 +1807,17 @@ startServer();
 
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('\nðŸ›‘ SIGTERM signal received: closing server gracefully');
+  console.log('\nÃ°Å¸â€ºâ€˜ SIGTERM signal received: closing server gracefully');
   server.close(() => {
-    console.log('âœ“ Server closed');
+    console.log('Ã¢Å“â€œ Server closed');
     process.exit(0);
   });
 });
 
 process.on('SIGINT', () => {
-  console.log('\nðŸ›‘ SIGINT signal received: closing server gracefully');
+  console.log('\nÃ°Å¸â€ºâ€˜ SIGINT signal received: closing server gracefully');
   server.close(() => {
-    console.log('âœ“ Server closed');
+    console.log('Ã¢Å“â€œ Server closed');
     process.exit(0);
   });
 });
@@ -2308,11 +2201,11 @@ export { app, server, io };
 // async function startServer() {
 //   try {
 //     // Test database connection
-//     console.log('ðŸ”— Connecting to AWS RDS PostgreSQL...');
+//     console.log('Ã°Å¸â€â€” Connecting to AWS RDS PostgreSQL...');
 //     const connected = await testConnection();
     
 //     if (!connected) {
-//       console.error('âŒ Failed to connect to database. Exiting...');
+//       console.error('Ã¢ÂÅ’ Failed to connect to database. Exiting...');
 //       process.exit(1);
 //     }
 
@@ -2320,22 +2213,22 @@ export { app, server, io };
 //     try {
 //       await ensureSchema();
 //     } catch (err) {
-//       console.error('âŒ Failed to ensure database schema:', err.message);
+//       console.error('Ã¢ÂÅ’ Failed to ensure database schema:', err.message);
 //       process.exit(1);
 //     }
 
 //     // Start server
 //     server.listen(PORT, () => {
 //       console.log('\n' + '='.repeat(50));
-//       console.log(`ðŸš€ Dost Talk Backend Server`);
-//       console.log(`ðŸ“¡ Environment: ${config.NODE_ENV}`);
-//       console.log(`ðŸŒ Server running on port ${PORT}`);
-//       console.log(`ðŸ”Œ Socket.IO ready for connections`);
-//       console.log(`ðŸ“Š API endpoints available at http://localhost:${PORT}/api`);
+//       console.log(`Ã°Å¸Å¡â‚¬ Dost Talk Backend Server`);
+//       console.log(`Ã°Å¸â€œÂ¡ Environment: ${config.NODE_ENV}`);
+//       console.log(`Ã°Å¸Å’Â Server running on port ${PORT}`);
+//       console.log(`Ã°Å¸â€Å’ Socket.IO ready for connections`);
+//       console.log(`Ã°Å¸â€œÅ  API endpoints available at http://localhost:${PORT}/api`);
 //       console.log('='.repeat(50) + '\n');
 //     });
 //   } catch (error) {
-//     console.error('âŒ Failed to start server:', error);
+//     console.error('Ã¢ÂÅ’ Failed to start server:', error);
 //     process.exit(1);
 //   }
 // }
@@ -2345,17 +2238,17 @@ export { app, server, io };
 
 // // Handle graceful shutdown
 // process.on('SIGTERM', () => {
-//   console.log('\nðŸ›‘ SIGTERM signal received: closing server gracefully');
+//   console.log('\nÃ°Å¸â€ºâ€˜ SIGTERM signal received: closing server gracefully');
 //   server.close(() => {
-//     console.log('âœ“ Server closed');
+//     console.log('Ã¢Å“â€œ Server closed');
 //     process.exit(0);
 //   });
 // });
 
 // process.on('SIGINT', () => {
-//   console.log('\nðŸ›‘ SIGINT signal received: closing server gracefully');
+//   console.log('\nÃ°Å¸â€ºâ€˜ SIGINT signal received: closing server gracefully');
 //   server.close(() => {
-//     console.log('âœ“ Server closed');
+//     console.log('Ã¢Å“â€œ Server closed');
 //     process.exit(0);
 //   });
 // });
@@ -2719,11 +2612,11 @@ export { app, server, io };
 // async function startServer() {
 //   try {
 //     // Test database connection
-//     console.log('ðŸ”— Connecting to AWS RDS PostgreSQL...');
+//     console.log('Ã°Å¸â€â€” Connecting to AWS RDS PostgreSQL...');
 //     const connected = await testConnection();
     
 //     if (!connected) {
-//       console.error('âŒ Failed to connect to database. Exiting...');
+//       console.error('Ã¢ÂÅ’ Failed to connect to database. Exiting...');
 //       process.exit(1);
 //     }
 
@@ -2731,22 +2624,22 @@ export { app, server, io };
 //     try {
 //       await ensureSchema();
 //     } catch (err) {
-//       console.error('âŒ Failed to ensure database schema:', err.message);
+//       console.error('Ã¢ÂÅ’ Failed to ensure database schema:', err.message);
 //       process.exit(1);
 //     }
 
 //     // Start server
 //     server.listen(PORT, () => {
 //       console.log('\n' + '='.repeat(50));
-//       console.log(`ðŸš€ Dost Talk Backend Server`);
-//       console.log(`ðŸ“¡ Environment: ${config.NODE_ENV}`);
-//       console.log(`ðŸŒ Server running on port ${PORT}`);
-//       console.log(`ðŸ”Œ Socket.IO ready for connections`);
-//       console.log(`ðŸ“Š API endpoints available at http://localhost:${PORT}/api`);
+//       console.log(`Ã°Å¸Å¡â‚¬ Dost Talk Backend Server`);
+//       console.log(`Ã°Å¸â€œÂ¡ Environment: ${config.NODE_ENV}`);
+//       console.log(`Ã°Å¸Å’Â Server running on port ${PORT}`);
+//       console.log(`Ã°Å¸â€Å’ Socket.IO ready for connections`);
+//       console.log(`Ã°Å¸â€œÅ  API endpoints available at http://localhost:${PORT}/api`);
 //       console.log('='.repeat(50) + '\n');
 //     });
 //   } catch (error) {
-//     console.error('âŒ Failed to start server:', error);
+//     console.error('Ã¢ÂÅ’ Failed to start server:', error);
 //     process.exit(1);
 //   }
 // }
@@ -2756,19 +2649,21 @@ export { app, server, io };
 
 // // Handle graceful shutdown
 // process.on('SIGTERM', () => {
-//   console.log('\nðŸ›‘ SIGTERM signal received: closing server gracefully');
+//   console.log('\nÃ°Å¸â€ºâ€˜ SIGTERM signal received: closing server gracefully');
 //   server.close(() => {
-//     console.log('âœ“ Server closed');
+//     console.log('Ã¢Å“â€œ Server closed');
 //     process.exit(0);
 //   });
 // });
 
 // process.on('SIGINT', () => {
-//   console.log('\nðŸ›‘ SIGINT signal received: closing server gracefully');
+//   console.log('\nÃ°Å¸â€ºâ€˜ SIGINT signal received: closing server gracefully');
 //   server.close(() => {
-//     console.log('âœ“ Server closed');
+//     console.log('Ã¢Å“â€œ Server closed');
 //     process.exit(0);
 //   });
 // });
 
 // export { app, server, io };
+
+

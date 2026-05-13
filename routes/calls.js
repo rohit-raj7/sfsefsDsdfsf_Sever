@@ -68,7 +68,8 @@ router.post('/', authenticate, async (req, res) => {
     }
 
     // BUSY CHECK: Block calls to listeners already in an active call
-    if (listener.is_busy) {
+    const busyMap = req.app.get('busyListeners');
+    if (listener.is_busy || (busyMap && busyMap.has(listener.user_id))) {
       console.log(`[CALLS] Experts ${listener.listener_id} is BUSY â€” rejecting call`);
       return res.status(409).json({
         error: 'Experts is busy',
@@ -130,10 +131,10 @@ router.post('/', authenticate, async (req, res) => {
         const checkCall = await Call.findById(call.call_id);
         if (
           checkCall &&
-          ['pending', 'initiated'].includes(checkCall.status)
+          ['pending', 'ringing', 'initiated'].includes(checkCall.status)
         ) {
-          console.log(`[CALLS] Call ${call.call_id} timed out after 45s. Marking missed.`);
-          await Call.updateStatus(call.call_id, 'missed');
+          console.log(`[CALLS] Call ${call.call_id} timed out after 45s. Forcing fail.`);
+          await Call.updateStatus(call.call_id, 'failed');
           try { await Listener.clearBusy(listener_id); } catch (e) { }
         }
       } catch (err) {
@@ -182,7 +183,8 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
     }
 
     // BUSY CHECK: Block if listener is already busy
-    if (listener.is_busy) {
+    const reqBusyMap = req.app.get('busyListeners');
+    if (listener.is_busy || (reqBusyMap && reqBusyMap.has(req.userId))) {
       return res.status(409).json({
         error: 'You are busy',
         status: 'busy',
@@ -190,13 +192,20 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
       });
     }
 
-    // BUSY CHECK: Block only when the user is actually connected to another call.
-    // Pending/ringing calls are not treated as "busy" for listener-side discovery.
-    const activeUserCalls = await pool.query(
-      `SELECT call_id FROM calls WHERE caller_id = $1 AND status = 'ongoing' LIMIT 1`,
-      [target_user_id]
-    );
-    if (activeUserCalls.rows.length > 0) {
+    // BUSY CHECK: Block if user is already in an active call
+    const busyMap = req.app.get('busyListeners');
+    if (busyMap && busyMap.has(target_user_id)) {
+      return res.status(409).json({
+        error: 'User is busy',
+        status: 'busy',
+        details: 'The user is currently on another call.'
+      });
+    }
+
+    // Only consider pending/ringing calls to prevent blocking on zombie ongoing calls.
+    // Real ongoing calls are correctly blocked by the busyMap check above.
+    const ringingUserCalls = activeUserCalls?.filter(c => c.status === 'pending' || c.status === 'ringing') || [];
+    if (ringingUserCalls.length > 0) {
       return res.status(409).json({
         error: 'User is busy',
         status: 'busy',
@@ -246,10 +255,10 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
         const checkCall = await Call.findById(call.call_id);
         if (
           checkCall &&
-          ['pending', 'initiated'].includes(checkCall.status)
+          ['pending', 'ringing', 'initiated'].includes(checkCall.status)
         ) {
           console.log(`[CALLS] Listener-initiated call ${call.call_id} timed out after 45s.`);
-          await Call.updateStatus(call.call_id, 'missed');
+          await Call.updateStatus(call.call_id, 'failed');
         }
       } catch (err) {
         console.error('[CALLS] Auto-timeout error:', err);
@@ -548,8 +557,8 @@ router.post('/admin/zombie-sweep', authenticateAdmin, async (req, res) => {
 
     const sweptIds = [];
     for (const z of zombies.rows) {
-      // Mark call as cancelled (it never naturally ended)
-      await Call.updateStatus(z.call_id, 'cancelled');
+      // Mark call as failed (it never naturally ended)
+      await Call.updateStatus(z.call_id, 'failed');
 
       // CRITICAL: Unbrick the listener by forcefully clearing is_busy
       try {
@@ -666,7 +675,8 @@ router.post('/random', authenticate, async (req, res) => {
     }
 
     // BUSY CHECK: getRandomAvailable already filters busy, but guard against race condition
-    if (listener.is_busy) {
+    const busyMap = req.app.get('busyListeners');
+    if (listener.is_busy || (busyMap && busyMap.has(listener.user_id))) {
       console.log(`[CALLS] Random listener ${listener.listener_id} is BUSY â€” rejecting`);
       return res.status(409).json({
         error: 'Listener is busy',

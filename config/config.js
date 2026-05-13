@@ -1,26 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-const rawCorsOrigin = process.env.CORS_ORIGIN ;
-const corsOrigins = rawCorsOrigin
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-const hasWildcardOrigin = corsOrigins.includes('*');
-const corsOrigin = hasWildcardOrigin
-  ? '*'
-  : (origin, callback) => {
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      if (corsOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      return callback(new Error('Not allowed by CORS'));
-    };
-
 export default {
   // Server configuration
   PORT: process.env.PORT || 3002,
@@ -64,7 +44,9 @@ export default {
 
   // CORS configuration
   cors: {
-    origin: corsOrigin,
+    origin: process.env.CORS_ORIGIN 
+      ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
+      : '*',
     credentials: true
   },
 
@@ -90,8 +72,8 @@ export default {
 
   // Socket.IO configuration
   socketIO: {
-    pingTimeout: 60000,  // Restored to 60000ms for mobile stability (prevents random call drops)
-    pingInterval: 25000, // Restored to 25000ms
+    pingTimeout: 5000,  // Reduced from 60000ms to 5000ms for faster offline detection
+    pingInterval: 2000, // Reduced from 25000ms to 2000ms for more frequent heartbeats
   },
 
   // LiveKit RTC configuration
