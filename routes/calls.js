@@ -193,8 +193,7 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
     }
 
     // BUSY CHECK: Block if user is already in an active call
-    const busyMap = req.app.get('busyListeners');
-    if (busyMap && busyMap.has(target_user_id)) {
+    if (reqBusyMap && reqBusyMap.has(target_user_id)) {
       return res.status(409).json({
         error: 'User is busy',
         status: 'busy',
@@ -204,6 +203,7 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
 
     // Only consider pending/ringing calls to prevent blocking on zombie ongoing calls.
     // Real ongoing calls are correctly blocked by the busyMap check above.
+    const activeUserCalls = await Call.getActiveCalls(target_user_id);
     const ringingUserCalls = activeUserCalls?.filter(c => c.status === 'pending' || c.status === 'ringing') || [];
     if (ringingUserCalls.length > 0) {
       return res.status(409).json({
