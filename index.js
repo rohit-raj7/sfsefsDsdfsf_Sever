@@ -17,6 +17,7 @@ const io = new Server(server, {
   pingTimeout: config.socketIO.pingTimeout,
   pingInterval: config.socketIO.pingInterval
 });
+app.set('io', io);
 setNotificationEmitter(io);
 
 // Import routes

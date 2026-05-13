@@ -353,6 +353,18 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
 
       // BUSY: Clear busy when call completes
       try { await Listener.clearBusy(call.listener_id); } catch (e) { console.error('[CALLS] clearBusy error:', e.message); }
+      
+      // Clear user and listener busy status from memory and notify
+      const busyMap = req.app.get('busyListeners');
+      const io = req.app.get('io');
+      [call.caller_id, call.listener_id].forEach(uid => {
+        if (uid && busyMap && busyMap.has(uid)) {
+          busyMap.delete(uid);
+          if (io) {
+            io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+          }
+        }
+      });
 
       const updatedCall = await Call.findById(req.params.call_id);
       return res.json({
@@ -377,6 +389,24 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
       try { await Listener.setBusy(call.listener_id); } catch (e) { console.error('[CALLS] setBusy error:', e.message); }
     } else if (['rejected', 'missed', 'cancelled'].includes(status)) {
       try { await Listener.clearBusy(call.listener_id); } catch (e) { console.error('[CALLS] clearBusy error:', e.message); }
+      
+      // Clear user and listener busy status from memory and notify
+      const busyMap = req.app.get('busyListeners');
+      const io = req.app.get('io');
+      let listenerUserId = null;
+      try {
+        const listenerObj = await Listener.findById(call.listener_id);
+        listenerUserId = listenerObj?.user_id;
+      } catch(e) {}
+
+      [call.caller_id, listenerUserId].forEach(uid => {
+        if (uid && busyMap && busyMap.has(uid)) {
+          busyMap.delete(uid);
+          if (io) {
+            io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+          }
+        }
+      });
     }
 
     const updatedCall = await Call.updateStatus(req.params.call_id, status);
@@ -431,6 +461,24 @@ router.post('/end', authenticate, async (req, res) => {
 
     // BUSY: Clear busy when call ends
     try { await Listener.clearBusy(call.listener_id); } catch (e) { console.error('[CALLS] clearBusy error:', e.message); }
+
+    // Clear user and listener busy status from memory and notify
+    const busyMap = req.app.get('busyListeners');
+    const io = req.app.get('io');
+    let listenerUserId = null;
+    try {
+      const listenerObj = await Listener.findById(call.listener_id);
+      listenerUserId = listenerObj?.user_id;
+    } catch(e) {}
+
+    [call.caller_id, listenerUserId].forEach(uid => {
+      if (uid && busyMap && busyMap.has(uid)) {
+        busyMap.delete(uid);
+        if (io) {
+          io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+        }
+      }
+    });
 
     res.json({
       message: 'Call ended',
