@@ -34,6 +34,7 @@ app.use(helmet());
 
 // CORS
 app.use(cors(config.cors));
+app.options('*', cors(config.cors));
 
 // Body parsing
 app.use(express.json({ limit: '10mb' }));

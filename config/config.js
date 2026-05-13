@@ -1,6 +1,42 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+const defaultCorsOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+  'http://127.0.0.1:5175',
+  'https://dosttalk-api.appdost.com',
+];
+
+const envCorsOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const allowedCorsOrigins = Array.from(
+  new Set([...defaultCorsOrigins, ...envCorsOrigins]),
+);
+
+const localhostPattern = /^https?:\/\/(localhost|127\.0\.0\.1):\d+$/i;
+
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+  if (allowedCorsOrigins.includes(origin)) return true;
+  if (localhostPattern.test(origin)) return true;
+  return false;
+}
+
+function corsOriginHandler(origin, callback) {
+  if (isOriginAllowed(origin)) {
+    callback(null, true);
+    return;
+  }
+  callback(new Error(`CORS blocked for origin: ${origin}`));
+}
+
 export default {
   // Server configuration
   PORT: process.env.PORT || 3002,
@@ -44,10 +80,11 @@ export default {
 
   // CORS configuration
   cors: {
-    origin: process.env.CORS_ORIGIN 
-      ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
-      : '*',
-    credentials: true
+    origin: corsOriginHandler,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    optionsSuccessStatus: 204,
   },
 
   // Rate limiting — general API (generous for mobile apps with retries / sockets)
