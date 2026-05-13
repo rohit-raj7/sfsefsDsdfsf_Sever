@@ -331,18 +331,6 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const currentStatus = String(call.status || '').toLowerCase();
-    const terminalStatuses = ['completed', 'missed', 'rejected', 'cancelled'];
-    const isTerminal = terminalStatuses.includes(currentStatus);
-    const isReopeningCall = ['pending', 'ringing', 'ongoing'].includes(status);
-
-    // Prevent stale clients from reopening a cancelled/ended call.
-    if (isTerminal && isReopeningCall) {
-      return res.status(409).json({
-        error: `Cannot transition call from ${currentStatus} to ${status}`,
-      });
-    }
-
     if (status === 'completed') {
       const resolvedDurationSeconds = resolveDurationSeconds(call, duration_seconds);
       const billing = await finalizeCallBilling({

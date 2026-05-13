@@ -171,11 +171,9 @@ const presenceTimeouts = new Map(); // Map of userId -> timeoutId
 const busyListeners = new Map(); // Map of listenerUserId -> callId (in-memory busy tracking)
 app.set('busyListeners', busyListeners);
 const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, listenerSocketId, createdAt } (tracks pre-answer calls for cancel routing)
-const recentlyCancelledCalls = new Map(); // Map of callId -> cancelledAt (guards late call:accept race)
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
 const LISTENER_TO_USER_RING_TIMEOUT_MS = 32000;
-const RECENT_CANCEL_TTL_MS = 45000;
 
 const clearPendingCall = (callId) => {
   const pending = pendingCalls.get(callId);
@@ -184,22 +182,6 @@ const clearPendingCall = (callId) => {
   }
   pendingCalls.delete(callId);
   return pending;
-};
-
-const markCallRecentlyCancelled = (callId) => {
-  if (!callId) return;
-  recentlyCancelledCalls.set(String(callId), Date.now());
-};
-
-const wasCallRecentlyCancelled = (callId) => {
-  if (!callId) return false;
-  const cancelledAt = recentlyCancelledCalls.get(String(callId));
-  if (!cancelledAt) return false;
-  if (Date.now() - cancelledAt > RECENT_CANCEL_TTL_MS) {
-    recentlyCancelledCalls.delete(String(callId));
-    return false;
-  }
-  return true;
 };
 
 // Ã¢â€â‚¬Ã¢â€â‚¬ Random User-to-User Match Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -227,16 +209,6 @@ setInterval(() => {
     if (now - pending.createdAt > 60000) {
       console.log(`[SOCKET] Stale pendingCall ${callId} removed (age: ${Math.round((now - pending.createdAt) / 1000)}s)`);
       clearPendingCall(callId);
-    }
-  }
-}, 30000);
-
-// Clean up stale recently-cancelled call guards.
-setInterval(() => {
-  const now = Date.now();
-  for (const [callId, cancelledAt] of recentlyCancelledCalls.entries()) {
-    if (now - cancelledAt > RECENT_CANCEL_TTL_MS) {
-      recentlyCancelledCalls.delete(callId);
     }
   }
 }, 30000);
@@ -938,39 +910,17 @@ io.on('connection', (socket) => {
 
   // Accept call for either direction: user -> listener or listener -> user.
   socket.on('call:accept', async (data) => {
-    const { callId, callerId } = data || {};
+    const { callId, callerId } = data;
     console.log(`[SOCKET] call:accept: Call ${callId} accepted by ${socket.userId}`);
-
-    if (!callId) {
-      socket.emit('call:ended', {
-        callId: null,
-        endedBy: socket.userId,
-        reason: 'invalid_call',
-        code: 'INVALID_CALL_ID',
-      });
-      return;
-    }
-
-    // Race guard: caller cancelled moments earlier, but callee tapped accept.
-    if (wasCallRecentlyCancelled(callId)) {
-      socket.emit('call:ended', {
-        callId,
-        endedBy: callerId || socket.userId,
-        reason: 'caller_cancelled',
-        code: 'CALL_CANCELLED',
-      });
-      return;
-    }
 
     const pending = clearPendingCall(callId);
 
     let listenerUserId = pending?.listenerUserId || null;
-    let callRecord = null;
     if (!listenerUserId && callId) {
       try {
-        callRecord = await Call.findById(callId);
-        if (callRecord?.listener_id) {
-          const listener = await Listener.findById(callRecord.listener_id);
+        const call = await Call.findById(callId);
+        if (call?.listener_id) {
+          const listener = await Listener.findById(call.listener_id);
           listenerUserId = listener?.user_id || null;
         }
       } catch (err) {
@@ -978,74 +928,8 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (!callRecord) {
-      try {
-        callRecord = await Call.findById(callId);
-      } catch (_) {}
-    }
-
-    // No pending record + non-ringing status means this accept is stale.
-    if (!pending) {
-      const status = String(callRecord?.status || '').toLowerCase();
-      const isAcceptableStatus = ['pending', 'ringing', 'initiated'].includes(
-        status,
-      );
-      if (!isAcceptableStatus) {
-        socket.emit('call:ended', {
-          callId,
-          endedBy: callerId || socket.userId,
-          reason: 'caller_cancelled',
-          code: 'CALL_NOT_ACCEPTABLE',
-        });
-        return;
-      }
-    }
-
-    const resolvedCallerId =
-      pending?.initiatorUserId || callRecord?.caller_id || callerId;
-    if (!resolvedCallerId) {
-      socket.emit('call:ended', {
-        callId,
-        endedBy: socket.userId,
-        reason: 'invalid_call',
-        code: 'MISSING_CALLER',
-      });
-      return;
-    }
-
-    const callerSocketId =
-      connectedUsers.get(resolvedCallerId) ||
-      listenerSockets.get(resolvedCallerId);
-    if (!callerSocketId) {
-      markCallRecentlyCancelled(callId);
-      try {
-        const checkCall = callRecord || (await Call.findById(callId));
-        if (
-          checkCall &&
-          ['pending', 'ringing', 'initiated'].includes(
-            String(checkCall.status || '').toLowerCase(),
-          )
-        ) {
-          await Call.updateStatus(callId, 'cancelled');
-        }
-      } catch (err) {
-        console.error(
-          `[SOCKET] call:accept cancel status update failed for ${callId}:`,
-          err.message,
-        );
-      }
-
-      socket.emit('call:ended', {
-        callId,
-        endedBy: resolvedCallerId,
-        reason: 'caller_unavailable',
-        code: 'CALLER_UNAVAILABLE',
-      });
-      return;
-    }
-
     // BUSY: Mark BOTH parties as busy in memory.
-    [listenerUserId, resolvedCallerId].forEach(uid => {
+    [listenerUserId, callerId].forEach(uid => {
       if (!uid) return;
       busyListeners.set(uid, callId);
       io.emit('listener_busy_status', {
@@ -1070,12 +954,22 @@ io.on('connection', (socket) => {
     }
 
     const serverTimestamp = Date.now();
-    io.to(callerSocketId).emit('call:accepted', {
-      callId,
-      listenerId: listenerUserId || socket.userId,
-      acceptedBy: socket.userId,
-      serverTime: serverTimestamp,
-    });
+    const callerSocketId = connectedUsers.get(callerId);
+    if (callerSocketId) {
+      io.to(callerSocketId).emit('call:accepted', {
+        callId,
+        listenerId: listenerUserId || socket.userId,
+        acceptedBy: socket.userId,
+        serverTime: serverTimestamp,
+      });
+    } else {
+      _clearBusyForCall(listenerUserId || socket.userId, callerId);
+      socket.emit('call:ended', {
+        callId,
+        endedBy: callerId,
+        reason: 'caller_unavailable',
+      });
+    }
   });
 
   // Reject call: Listener -> User
@@ -1295,29 +1189,9 @@ io.on('connection', (socket) => {
     const pending = pendingCalls.get(callId);
     if (pending) {
       clearPendingCall(callId);
-      markCallRecentlyCancelled(callId);
       notifyCallEnded(pending.calleeUserId, {
         reason: endReason || 'caller_cancelled',
       });
-      // Persist cancellation immediately so late accept/status updates are blocked.
-      (async () => {
-        try {
-          const checkCall = await Call.findById(callId);
-          if (
-            checkCall &&
-            ['pending', 'ringing', 'initiated'].includes(
-              String(checkCall.status || '').toLowerCase(),
-            )
-          ) {
-            await Call.updateStatus(callId, 'cancelled');
-          }
-        } catch (err) {
-          console.error(
-            `[SOCKET] call:end pending cancel status update failed for ${callId}:`,
-            err.message,
-          );
-        }
-      })();
       console.log(
         `[SOCKET] call:end: Cancelled pending call ${callId}, notified callee ${pending.calleeUserId}`,
       );
@@ -1755,25 +1629,6 @@ io.on('connection', (socket) => {
             });
           }
           clearPendingCall(callId);
-          markCallRecentlyCancelled(callId);
-          (async () => {
-            try {
-              const checkCall = await Call.findById(callId);
-              if (
-                checkCall &&
-                ['pending', 'ringing', 'initiated'].includes(
-                  String(checkCall.status || '').toLowerCase(),
-                )
-              ) {
-                await Call.updateStatus(callId, 'cancelled');
-              }
-            } catch (err) {
-              console.error(
-                `[SOCKET] disconnect pending cancel status update failed for ${callId}:`,
-                err.message,
-              );
-            }
-          })();
         }
       }
 
