@@ -3,8 +3,8 @@ import { pool } from '../db.js';
 import NotificationOutbox from '../models/NotificationOutbox.js';
 import { authenticate, authenticateAdmin } from '../middleware/auth.js';
 import {
-  processNotifications,
   scheduleOutboxProcessing,
+  triggerNotificationProcessing,
   unscheduleOutboxProcessing,
 } from '../services/notificationWorker.js';
 
@@ -91,20 +91,13 @@ router.post('/outbox', authenticateAdmin, async (req, res) => {
     });
     let outbox = created;
     if (shouldProcessImmediately(created.schedule_at)) {
-      await processNotifications();
-      const latest = await pool.query(
-        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error
-         FROM notification_outbox
-         WHERE id = $1`,
-        [created.id]
-      );
-      outbox = latest.rows[0] ?? created;
+      triggerNotificationProcessing('admin-create');
     } else {
       scheduleOutboxProcessing(created);
     }
     res.json({
       message: shouldProcessImmediately(created.schedule_at)
-        ? 'Notification sent'
+        ? 'Notification queued for delivery'
         : 'Notification scheduled',
       outbox
     });
@@ -136,6 +129,7 @@ router.put('/outbox/:id', authenticateAdmin, async (req, res) => {
     updates.push(`status = $${idx++}`);
     params.push('PENDING');
     updates.push(`delivered_at = NULL`);
+    updates.push(`processing_started_at = NULL`);
     if (title !== undefined) {
       updates.push(`title = $${idx++}`);
       params.push(title);
@@ -188,20 +182,13 @@ router.put('/outbox/:id', authenticateAdmin, async (req, res) => {
     const r = await pool.query(q, params);
     let outbox = r.rows[0];
     if (outbox && shouldProcessImmediately(outbox.schedule_at)) {
-      await processNotifications();
-      const latest = await pool.query(
-        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error
-         FROM notification_outbox
-         WHERE id = $1`,
-        [outbox.id]
-      );
-      outbox = latest.rows[0] ?? outbox;
+      triggerNotificationProcessing('admin-update');
     } else if (outbox) {
       scheduleOutboxProcessing(outbox);
     }
     res.json({
       message: outbox && shouldProcessImmediately(outbox.schedule_at)
-        ? 'Notification updated and sent'
+        ? 'Notification updated and queued for delivery'
         : 'Notification updated',
       outbox
     });

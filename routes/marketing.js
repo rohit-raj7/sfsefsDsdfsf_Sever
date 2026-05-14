@@ -2,7 +2,7 @@ import express from 'express';
 import { pool } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
 import NotificationOutbox from '../models/NotificationOutbox.js';
-import { processNotifications } from '../services/notificationWorker.js';
+import { triggerNotificationProcessing } from '../services/notificationWorker.js';
 
 const router = express.Router();
 
@@ -71,10 +71,10 @@ router.post('/send-notification', authenticateAdmin, async (req, res) => {
             created_by: req.adminId
         });
 
-        await processNotifications();
+        triggerNotificationProcessing('marketing');
 
         res.json({
-            message: 'Marketing notification sent successfully.',
+            message: 'Marketing notification queued for delivery.',
             eligible_users: targetUserIds.length,
             successCount: targetUserIds.length,
             outbox

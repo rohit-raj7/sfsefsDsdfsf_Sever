@@ -554,12 +554,16 @@ async function ensureSchema() {
         created_by UUID NOT NULL REFERENCES admins(admin_id),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         delivered_at TIMESTAMP NULL,
+        processing_started_at TIMESTAMP NULL,
         retry_count INTEGER DEFAULT 0,
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_schedule ON notification_outbox(schedule_at);
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_status ON notification_outbox(status);
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_target_role ON notification_outbox(target_role);
+      CREATE INDEX IF NOT EXISTS idx_notification_outbox_ready
+        ON notification_outbox(status, schedule_at, created_at)
+        WHERE status = 'PENDING';
     `;
     await pool.query(createOutboxSql);
 
@@ -577,12 +581,22 @@ async function ensureSchema() {
       );
       CREATE INDEX IF NOT EXISTS idx_notification_deliveries_status ON notification_deliveries(status);
       CREATE INDEX IF NOT EXISTS idx_notification_deliveries_user ON notification_deliveries(user_id);
+      CREATE INDEX IF NOT EXISTS idx_notification_deliveries_outbox ON notification_deliveries(outbox_id);
     `;
     await pool.query(createDeliveriesSql);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_active_account_type
+        ON users(account_type, is_active);
+      CREATE INDEX IF NOT EXISTS idx_users_fcm_token_not_null
+        ON users(fcm_token)
+        WHERE fcm_token IS NOT NULL AND BTRIM(fcm_token) <> '';
+    `);
 
     // Add repeat_interval column if missing
     const alterOutboxSql = `
       ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS repeat_interval VARCHAR(20) DEFAULT NULL;
+      ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMP NULL;
     `;
     await pool.query(alterOutboxSql);
 
@@ -592,6 +606,7 @@ async function ensureSchema() {
     const alterNotificationsSql = `
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS source_outbox_id UUID;
       CREATE INDEX IF NOT EXISTS idx_notifications_source_outbox ON notifications(source_outbox_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_source_outbox_user ON notifications(source_outbox_id, user_id);
     `;
     await pool.query(alterNotificationsSql);
 
