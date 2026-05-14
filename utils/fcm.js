@@ -1,16 +1,25 @@
 import admin from 'firebase-admin';
-import { readFileSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 // ─── Firebase Admin Init ────────────────────────────────────────────
 try {
   if (!admin.apps.length) {
-    const serviceAccountPath = resolve(__dirname, '../config/firebase-service-account.json');
-    const serviceAccount = JSON.parse(readFileSync(serviceAccountPath, 'utf8'));
+    const projectId = String(process.env.FIREBASE_PROJECT_ID || '').trim();
+    const clientEmail = String(process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+    const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || '')
+      .replace(/\\n/g, '\n')
+      .trim();
+
+    if (!projectId || !clientEmail || !privateKey) {
+      throw new Error(
+        'Missing Firebase env vars. Required: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY',
+      );
+    }
+
+    const serviceAccount = {
+      projectId,
+      clientEmail,
+      privateKey,
+    };
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     console.log('✅ Firebase Admin SDK initialized successfully.');
   }
