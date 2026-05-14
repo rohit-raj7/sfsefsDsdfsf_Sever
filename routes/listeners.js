@@ -1350,6 +1350,73 @@ router.get('/me/withdrawals/summary', authenticate, async (req, res) => {
   }
 });
 
+// GET /api/listeners/me/withdrawals
+router.get('/me/withdrawals', authenticate, async (req, res) => {
+  try {
+    const listener = await Listener.findByUserId(req.userId);
+    if (!listener) {
+      return res.status(404).json({ error: 'Listener profile not found' });
+    }
+
+    await ensureWithdrawalRequestsTable();
+
+    const parsedLimit = Number.parseInt(String(req.query.limit || '100'), 10);
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.min(Math.max(parsedLimit, 1), 500)
+      : 100;
+
+    const historyResult = await pool.query(
+      `SELECT
+         request_id,
+         listener_id,
+         payout_method,
+         upi_id,
+         account_number,
+         ifsc_code,
+         bank_name,
+         account_holder_name,
+         withdrawal_amount,
+         tds_amount,
+         transaction_fee,
+         final_credit_amount,
+         status,
+         created_at,
+         updated_at
+       FROM listener_withdrawal_requests
+       WHERE listener_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [listener.listener_id, limit]
+    );
+
+    const withdrawals = historyResult.rows.map((row) => ({
+      request_id: row.request_id,
+      listener_id: row.listener_id,
+      payout_method: row.payout_method,
+      upi_id: row.upi_id,
+      account_number: row.account_number,
+      ifsc_code: row.ifsc_code,
+      bank_name: row.bank_name,
+      account_holder_name: row.account_holder_name,
+      withdrawal_amount: Number(row.withdrawal_amount || 0),
+      tds_amount: Number(row.tds_amount || 0),
+      transaction_fee: Number(row.transaction_fee || 0),
+      final_credit_amount: Number(row.final_credit_amount || 0),
+      status: row.status,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }));
+
+    return res.json({
+      listenerId: listener.listener_id,
+      withdrawals,
+    });
+  } catch (error) {
+    console.error('Get withdrawal history error:', error);
+    return res.status(500).json({ error: 'Failed to fetch withdrawal history' });
+  }
+});
+
 // POST /api/listeners/me/withdrawals
 router.post('/me/withdrawals', authenticate, async (req, res) => {
   const client = await pool.connect();
