@@ -298,10 +298,20 @@ async function processOutboxItem(outbox) {
   let sentCount = 0;
   let failedCount = 0;
   const failureReasonCounts = new Map();
+  let socketFallbackCount = 0;
+  const socketFallbackReasonCounts = new Map();
 
   const trackFailure = (reason) => {
     const normalized = String(reason || 'Unknown delivery error').trim() || 'Unknown delivery error';
     failureReasonCounts.set(normalized, (failureReasonCounts.get(normalized) || 0) + 1);
+  };
+
+  const trackSocketFallback = (reason) => {
+    const normalized = String(reason || 'Unknown socket fallback').trim() || 'Unknown socket fallback';
+    socketFallbackReasonCounts.set(
+      normalized,
+      (socketFallbackReasonCounts.get(normalized) || 0) + 1,
+    );
   };
 
   // Process FCM results
@@ -320,6 +330,8 @@ async function processOutboxItem(outbox) {
         deliveryUpdates.statuses.push('SENT');
         deliveryUpdates.errors.push(`FCM failed, delivered via socket: ${result.error}`);
         sentCount++;
+        socketFallbackCount++;
+        trackSocketFallback(result.error);
       } else {
         deliveryUpdates.userIds.push(result.userId);
         deliveryUpdates.statuses.push('FAILED');
@@ -341,6 +353,8 @@ async function processOutboxItem(outbox) {
       deliveryUpdates.statuses.push('SENT');
       deliveryUpdates.errors.push('FCM token missing, delivered via active socket session');
       sentCount++;
+      socketFallbackCount++;
+      trackSocketFallback('No registered FCM token');
     } else {
       deliveryUpdates.userIds.push(user.user_id);
       deliveryUpdates.statuses.push('FAILED');
@@ -384,6 +398,11 @@ async function processOutboxItem(outbox) {
     .slice(0, 3)
     .map(([reason, count]) => `${reason} (${count})`)
     .join(', ');
+  const summarizedSocketFallbacks = Array.from(socketFallbackReasonCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([reason, count]) => `${reason} (${count})`)
+    .join(', ');
 
   const allFailedMissingToken =
     failedCount === totalRecipients &&
@@ -404,6 +423,10 @@ async function processOutboxItem(outbox) {
           ? summarizedFailures
             ? `Delivery failed for ${failedCount}/${totalRecipients} recipients: ${summarizedFailures}`
             : `Delivery failed for ${failedCount}/${totalRecipients} recipients`
+          : socketFallbackCount > 0
+            ? summarizedSocketFallbacks
+              ? `FCM was unavailable for ${socketFallbackCount}/${totalRecipients} recipient(s), but the message reached active app sessions via socket only: ${summarizedSocketFallbacks}. Closed-app delivery will keep failing until FCM credentials and device tokens are fixed.`
+              : `FCM was unavailable for ${socketFallbackCount}/${totalRecipients} recipient(s), but the message reached active app sessions via socket only. Closed-app delivery will keep failing until FCM credentials and device tokens are fixed.`
           : null;
 
   const retryCount = Number(outbox.retry_count || 0);

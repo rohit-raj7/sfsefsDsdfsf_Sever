@@ -12,6 +12,7 @@
     "logs:pm2": "pm2 logs callto-backend",
     "dev": "nodemon index.js",
     "db:setup": "node scripts/setupDatabase.js",
+    "fcm:cleanup-invalid": "node scripts/cleanupInvalidFcmTokens.js",
     "build": "echo No build step required"
   },
   "keywords": [

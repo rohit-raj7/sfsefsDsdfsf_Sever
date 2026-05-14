@@ -1,7 +1,15 @@
-import admin from 'firebase-admin';
+import { readFileSync } from 'fs';
 import dotenv from 'dotenv';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
+import {
+  applicationDefault,
+  cert,
+  getApp,
+  getApps,
+  initializeApp,
+} from 'firebase-admin/app';
+import { getMessaging } from 'firebase-admin/messaging';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -10,35 +18,136 @@ dotenv.config({ path: resolve(__dirname, '../.env') });
 const MAX_FCM_BATCH_SIZE = 500;
 const DEFAULT_BATCH_TIMEOUT_MS = 30000;
 let firebaseInitError = null;
+let firebaseApp = null;
+
+function normalizePrivateKey(value) {
+  return String(value || '')
+    .replace(/\\n/g, '\n')
+    .trim();
+}
+
+function readJsonFile(filePath) {
+  return JSON.parse(readFileSync(filePath, 'utf8'));
+}
+
+function resolveCredentialFilePath() {
+  const configuredPath = String(
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+      process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+      '',
+  ).trim();
+
+  if (!configuredPath) {
+    return null;
+  }
+
+  const candidatePaths = [
+    configuredPath,
+    resolve(process.cwd(), configuredPath),
+    resolve(__dirname, '..', configuredPath),
+  ];
+
+  for (const candidate of candidatePaths) {
+    try {
+      readFileSync(candidate, 'utf8');
+      return candidate;
+    } catch {
+      // Try next candidate path.
+    }
+  }
+
+  throw new Error(
+    `Firebase service account file not found: ${configuredPath}`,
+  );
+}
+
+function resolveServiceAccountFromEnv() {
+  const inlineJson = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+  if (inlineJson) {
+    const parsed = JSON.parse(inlineJson);
+    return {
+      projectId: String(parsed.project_id || parsed.projectId || '').trim(),
+      clientEmail: String(parsed.client_email || parsed.clientEmail || '').trim(),
+      privateKey: normalizePrivateKey(parsed.private_key || parsed.privateKey),
+    };
+  }
+
+  const credentialFilePath = resolveCredentialFilePath();
+  if (credentialFilePath) {
+    const parsed = readJsonFile(credentialFilePath);
+    return {
+      projectId: String(parsed.project_id || parsed.projectId || '').trim(),
+      clientEmail: String(parsed.client_email || parsed.clientEmail || '').trim(),
+      privateKey: normalizePrivateKey(parsed.private_key || parsed.privateKey),
+    };
+  }
+
+  const projectId = String(process.env.FIREBASE_PROJECT_ID || '').trim();
+  const clientEmail = String(process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+  const privateKey = normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY);
+
+  if (projectId && clientEmail && privateKey) {
+    return { projectId, clientEmail, privateKey };
+  }
+
+  return null;
+}
 
 function initializeFirebaseAdmin() {
-  if (admin.apps.length) {
-    return admin.app();
+  if (firebaseApp) {
+    return firebaseApp;
+  }
+
+  if (getApps().length) {
+    firebaseApp = getApp();
+    firebaseInitError = null;
+    return firebaseApp;
   }
 
   try {
-    const projectId = String(process.env.FIREBASE_PROJECT_ID || '').trim();
-    const clientEmail = String(process.env.FIREBASE_CLIENT_EMAIL || '').trim();
-    const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || '')
-      .replace(/\\n/g, '\n')
-      .trim();
+    const serviceAccount = resolveServiceAccountFromEnv();
+    const fallbackProjectId = String(process.env.FIREBASE_PROJECT_ID || '').trim();
 
-    if (!projectId || !clientEmail || !privateKey) {
-      throw new Error(
-        'Missing Firebase env vars. Required: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY',
+    if (serviceAccount) {
+      const { projectId, clientEmail, privateKey } = serviceAccount;
+      if (!projectId || !clientEmail || !privateKey) {
+        throw new Error(
+          'Firebase service account is incomplete. Required fields: project_id, client_email, private_key',
+        );
+      }
+
+      firebaseApp = initializeApp({
+        credential: cert({
+          projectId,
+          clientEmail,
+          privateKey,
+        }),
+        projectId,
+      });
+      firebaseInitError = null;
+      console.log(
+        `[FCM] Firebase Admin SDK initialized project=${projectId} email=${clientEmail}`,
       );
+      return firebaseApp;
     }
 
-    const app = admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId,
-        clientEmail,
-        privateKey,
-      }),
-    });
-    firebaseInitError = null;
-    console.log(`[FCM] Firebase Admin SDK initialized project=${projectId} email=${clientEmail}`);
-    return app;
+    if (String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim()) {
+      firebaseApp = initializeApp({
+        credential: applicationDefault(),
+        ...(fallbackProjectId ? { projectId: fallbackProjectId } : {}),
+      });
+      firebaseInitError = null;
+      console.log(
+        `[FCM] Firebase Admin SDK initialized via application default credentials${
+          fallbackProjectId ? ` project=${fallbackProjectId}` : ''
+        }`,
+      );
+      return firebaseApp;
+    }
+
+    throw new Error(
+      'Missing Firebase credentials. Configure one of: FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_SERVICE_ACCOUNT_PATH, GOOGLE_APPLICATION_CREDENTIALS, or FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY.',
+    );
   } catch (error) {
     firebaseInitError = error;
     console.error('[FCM] Failed to initialize Firebase Admin SDK:', error.message);
@@ -47,10 +156,10 @@ function initializeFirebaseAdmin() {
 }
 
 function getFirebaseMessaging() {
-  if (firebaseInitError && !admin.apps.length) {
+  if (firebaseInitError && !getApps().length) {
     throw firebaseInitError;
   }
-  return admin.messaging(initializeFirebaseAdmin());
+  return getMessaging(initializeFirebaseAdmin());
 }
 
 try {

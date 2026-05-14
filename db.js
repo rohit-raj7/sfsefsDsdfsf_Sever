@@ -29,9 +29,17 @@ pgTypes.setTypeParser(1114, function parseTimestampAsUTC(val) {
 
 // Configure the PostgreSQL connection pool
 // Increased limits and timeouts to handle connection instability and high traffic
+const databasePublicUrl = String(process.env.DATABASE_PUBLIC_URL || '').trim();
+const usesPublicConnectionString = Boolean(databasePublicUrl);
+const railwayPublicProxyPattern = /(railway|rlwy\.net|proxy)/i;
+const shouldUseImplicitSsl =
+  usesPublicConnectionString &&
+  railwayPublicProxyPattern.test(databasePublicUrl) &&
+  process.env.DB_REQUIRE_SSL !== 'false';
+
 const poolConfig = {
-  ...(process.env.DATABASE_PUBLIC_URL
-    ? { connectionString: process.env.DATABASE_PUBLIC_URL }
+  ...(usesPublicConnectionString
+    ? { connectionString: databasePublicUrl }
     : {
         host: process.env.DB_HOST,
         port: process.env.DB_PORT || 5432,
@@ -39,14 +47,20 @@ const poolConfig = {
         password: process.env.DB_PASSWORD,
         database: process.env.DB_NAME
       }),
-  max: 20, // Increased from 5 to 20
+  max: Number(process.env.DB_POOL_MAX || (usesPublicConnectionString ? 5 : 20)),
   idleTimeoutMillis: 30000, // Increased from 10s to 30s
   connectionTimeoutMillis: 30000, // Increased from 10s to 30s
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 };
 
 // Only enforce SSL if explicitly told to via environment variables 
 // (Self-hosted Postgres containers usually don't support SSL out of the box)
 if (process.env.DB_REQUIRE_SSL === 'true') {
+  poolConfig.ssl = {
+    rejectUnauthorized: false
+  };
+} else if (shouldUseImplicitSsl) {
   poolConfig.ssl = {
     rejectUnauthorized: false
   };
@@ -63,7 +77,12 @@ pool.on('error', (err, client) => {
 // always stores UTC values. This prevents timezone ambiguity with
 // TIMESTAMP WITHOUT TIMEZONE columns regardless of server location.
 pool.on('connect', (client) => {
-  client.query("SET timezone = 'UTC'");
+  client.on('error', (err) => {
+    console.error('Database client error:', err.message);
+  });
+  client.query("SET timezone = 'UTC'").catch((err) => {
+    console.error('Failed to set database session timezone:', err.message);
+  });
 });
 
 // Test the database connection
