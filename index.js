@@ -45,8 +45,8 @@ import { Chat, Message } from './models/Chat.js';
 import ChatChargeConfig from './models/ChatChargeConfig.js';
 import {
   bootstrapScheduledNotifications,
+  processNotifications,
   setNotificationEmitter,
-  triggerNotificationProcessing,
 } from './services/notificationWorker.js';
 
 // ============================================
@@ -1786,13 +1786,17 @@ async function startServer() {
 
     setNotificationEmitter(io);
 
-    triggerNotificationProcessing('startup');
+    processNotifications().catch((err) => {
+      console.error('processNotifications startup error:', err.message);
+    });
     bootstrapScheduledNotifications().catch((err) => {
       console.error('bootstrapScheduledNotifications startup error:', err.message);
     });
 
     setInterval(() => {
-      triggerNotificationProcessing('poll');
+      processNotifications().catch((err) => {
+        console.error('processNotifications fatal error:', err.message);
+      });
     }, NOTIFICATION_QUEUE_POLL_MS);
   } catch (error) {
     console.error('Ã¢ÂÅ’ Failed to start server:', error);

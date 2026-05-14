@@ -29,17 +29,9 @@ pgTypes.setTypeParser(1114, function parseTimestampAsUTC(val) {
 
 // Configure the PostgreSQL connection pool
 // Increased limits and timeouts to handle connection instability and high traffic
-const databasePublicUrl = String(process.env.DATABASE_PUBLIC_URL || '').trim();
-const usesPublicConnectionString = Boolean(databasePublicUrl);
-const railwayPublicProxyPattern = /(railway|rlwy\.net|proxy)/i;
-const shouldUseImplicitSsl =
-  usesPublicConnectionString &&
-  railwayPublicProxyPattern.test(databasePublicUrl) &&
-  process.env.DB_REQUIRE_SSL !== 'false';
-
 const poolConfig = {
-  ...(usesPublicConnectionString
-    ? { connectionString: databasePublicUrl }
+  ...(process.env.DATABASE_PUBLIC_URL
+    ? { connectionString: process.env.DATABASE_PUBLIC_URL }
     : {
         host: process.env.DB_HOST,
         port: process.env.DB_PORT || 5432,
@@ -47,20 +39,14 @@ const poolConfig = {
         password: process.env.DB_PASSWORD,
         database: process.env.DB_NAME
       }),
-  max: Number(process.env.DB_POOL_MAX || (usesPublicConnectionString ? 5 : 20)),
+  max: 20, // Increased from 5 to 20
   idleTimeoutMillis: 30000, // Increased from 10s to 30s
   connectionTimeoutMillis: 30000, // Increased from 10s to 30s
-  keepAlive: true,
-  keepAliveInitialDelayMillis: 10000,
 };
 
 // Only enforce SSL if explicitly told to via environment variables 
 // (Self-hosted Postgres containers usually don't support SSL out of the box)
 if (process.env.DB_REQUIRE_SSL === 'true') {
-  poolConfig.ssl = {
-    rejectUnauthorized: false
-  };
-} else if (shouldUseImplicitSsl) {
   poolConfig.ssl = {
     rejectUnauthorized: false
   };
@@ -77,12 +63,7 @@ pool.on('error', (err, client) => {
 // always stores UTC values. This prevents timezone ambiguity with
 // TIMESTAMP WITHOUT TIMEZONE columns regardless of server location.
 pool.on('connect', (client) => {
-  client.on('error', (err) => {
-    console.error('Database client error:', err.message);
-  });
-  client.query("SET timezone = 'UTC'").catch((err) => {
-    console.error('Failed to set database session timezone:', err.message);
-  });
+  client.query("SET timezone = 'UTC'");
 });
 
 // Test the database connection
@@ -573,16 +554,12 @@ async function ensureSchema() {
         created_by UUID NOT NULL REFERENCES admins(admin_id),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         delivered_at TIMESTAMP NULL,
-        processing_started_at TIMESTAMP NULL,
         retry_count INTEGER DEFAULT 0,
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_schedule ON notification_outbox(schedule_at);
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_status ON notification_outbox(status);
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_target_role ON notification_outbox(target_role);
-      CREATE INDEX IF NOT EXISTS idx_notification_outbox_ready
-        ON notification_outbox(status, schedule_at, created_at)
-        WHERE status = 'PENDING';
     `;
     await pool.query(createOutboxSql);
 
@@ -600,22 +577,12 @@ async function ensureSchema() {
       );
       CREATE INDEX IF NOT EXISTS idx_notification_deliveries_status ON notification_deliveries(status);
       CREATE INDEX IF NOT EXISTS idx_notification_deliveries_user ON notification_deliveries(user_id);
-      CREATE INDEX IF NOT EXISTS idx_notification_deliveries_outbox ON notification_deliveries(outbox_id);
     `;
     await pool.query(createDeliveriesSql);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_users_active_account_type
-        ON users(account_type, is_active);
-      CREATE INDEX IF NOT EXISTS idx_users_fcm_token_not_null
-        ON users(fcm_token)
-        WHERE fcm_token IS NOT NULL AND BTRIM(fcm_token) <> '';
-    `);
 
     // Add repeat_interval column if missing
     const alterOutboxSql = `
       ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS repeat_interval VARCHAR(20) DEFAULT NULL;
-      ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMP NULL;
     `;
     await pool.query(alterOutboxSql);
 
@@ -625,7 +592,6 @@ async function ensureSchema() {
     const alterNotificationsSql = `
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS source_outbox_id UUID;
       CREATE INDEX IF NOT EXISTS idx_notifications_source_outbox ON notifications(source_outbox_id);
-      CREATE INDEX IF NOT EXISTS idx_notifications_source_outbox_user ON notifications(source_outbox_id, user_id);
     `;
     await pool.query(alterNotificationsSql);
 

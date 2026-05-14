@@ -440,9 +440,6 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbox_status_schedule ON notification_outbox(status, schedule_at);
-CREATE INDEX IF NOT EXISTS idx_notification_outbox_ready
-ON notification_outbox(status, schedule_at, created_at)
-WHERE status = 'PENDING';
 
 -- ============================================
 -- NOTIFICATION DELIVERIES TABLE
@@ -458,11 +455,6 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deliveries_outbox ON notification_deliveries(outbox_id);
-CREATE INDEX IF NOT EXISTS idx_deliveries_user ON notification_deliveries(user_id);
-CREATE INDEX IF NOT EXISTS idx_users_active_account_type ON users(account_type, is_active);
-CREATE INDEX IF NOT EXISTS idx_users_fcm_token_not_null
-ON users(fcm_token)
-WHERE fcm_token IS NOT NULL AND BTRIM(fcm_token) <> '';
 
 -- ============================================
 -- NOTIFICATIONS TABLE

@@ -1,6 +1,6 @@
 import { pool } from '../db.js';
 import User from '../models/User.js';
-import { sendBatchFCM } from '../utils/fcm.js';
+import { isInvalidFcmError, sendBatchFCM } from '../utils/fcm.js';
 
 // ─── Socket Emitter ─────────────────────────────────────────────────
 let notificationEmitter = null;
@@ -20,36 +20,6 @@ function getConnectedRoomSize(roomName) {
 // ─── Scheduling ─────────────────────────────────────────────────────
 const scheduledOutboxTimers = new Map();
 const MAX_TIMER_MS = 2147483647;
-const MAX_OUTBOX_RETRIES = Number(process.env.NOTIFICATION_MAX_RETRIES || 3);
-const RETRY_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000];
-let processingLoopPromise = null;
-let processingRequested = false;
-
-export function triggerNotificationProcessing(reason = 'manual') {
-  processingRequested = true;
-  if (processingLoopPromise) {
-    return processingLoopPromise;
-  }
-
-  processingLoopPromise = new Promise((resolve) => {
-    setImmediate(async () => {
-      try {
-        let processedCount = 0;
-        do {
-          processingRequested = false;
-          processedCount = await processNotifications();
-        } while (processingRequested || processedCount > 0);
-      } catch (error) {
-        console.error(`[NotificationWorker] Processing loop failed (${reason}):`, error.message);
-      } finally {
-        processingLoopPromise = null;
-        resolve();
-      }
-    });
-  });
-
-  return processingLoopPromise;
-}
 
 function clearScheduledTimer(outboxId) {
   const existing = scheduledOutboxTimers.get(outboxId);
@@ -86,7 +56,9 @@ export function scheduleOutboxProcessing(outbox) {
   if (!scheduleTime) {
     const timer = setTimeout(() => {
       scheduledOutboxTimers.delete(outbox.id);
-      triggerNotificationProcessing('immediate-timer');
+      processNotifications().catch((e) => {
+        console.error('[NotificationWorker] Immediate processing error:', e.message);
+      });
     }, 0);
     scheduledOutboxTimers.set(outbox.id, timer);
     return true;
@@ -100,7 +72,9 @@ export function scheduleOutboxProcessing(outbox) {
       scheduleOutboxProcessing(outbox);
       return;
     }
-    triggerNotificationProcessing('scheduled-timer');
+    processNotifications().catch((e) => {
+      console.error('[NotificationWorker] Scheduled processing error:', e.message);
+    });
   }, nextDelay);
   scheduledOutboxTimers.set(outbox.id, timer);
   return true;
@@ -110,13 +84,8 @@ export async function bootstrapScheduledNotifications(limit = 500) {
   try {
     // Reset any PROCESSING items that got stuck (e.g. server crash mid-send)
     const reset = await pool.query(
-      `UPDATE notification_outbox
-       SET status = 'PENDING', processing_started_at = NULL
+      `UPDATE notification_outbox SET status = 'PENDING'
        WHERE status = 'PROCESSING'
-         AND (
-           processing_started_at IS NULL
-           OR processing_started_at < CURRENT_TIMESTAMP - INTERVAL '10 minutes'
-         )
        RETURNING id`,
     );
     if (reset.rowCount > 0) {
@@ -154,8 +123,7 @@ export async function processNotifications() {
     inTransaction = true;
     const ready = await client.query(`
       UPDATE notification_outbox
-      SET status = 'PROCESSING',
-          processing_started_at = CURRENT_TIMESTAMP
+      SET status = 'PROCESSING'
       WHERE id IN (
         SELECT id FROM notification_outbox
         WHERE status = 'PENDING'
@@ -180,10 +148,12 @@ export async function processNotifications() {
         await processOutboxItem(outbox);
       } catch (error) {
         console.error(`[NotificationWorker] Failed outbox=${outbox.id}:`, error.message);
-        await markOutboxProcessingError(outbox, error);
+        await pool.query(
+          `UPDATE notification_outbox SET status = 'FAILED', last_error = $2 WHERE id = $1`,
+          [outbox.id, `Processing error: ${error.message}`],
+        );
       }
     }
-    return outboxItems.length;
   } catch (error) {
     console.error('[NotificationWorker] Error processing outbox:', error.message);
     if (client) {
@@ -192,38 +162,6 @@ export async function processNotifications() {
       }
       client.release();
     }
-    return 0;
-  }
-}
-
-function retryDelayMs(retryCount) {
-  return RETRY_BACKOFF_MS[Math.min(retryCount, RETRY_BACKOFF_MS.length - 1)];
-}
-
-function retryAtFor(retryCount) {
-  return new Date(Date.now() + retryDelayMs(retryCount));
-}
-
-async function markOutboxProcessingError(outbox, error) {
-  const retryCount = Number(outbox.retry_count || 0);
-  const canRetry = retryCount < MAX_OUTBOX_RETRIES;
-  const nextRetryAt = canRetry ? retryAtFor(retryCount) : null;
-  const message = `Processing error: ${error.message}`;
-
-  const result = await pool.query(
-    `UPDATE notification_outbox
-     SET status = $2,
-         schedule_at = CASE WHEN $2 = 'PENDING' THEN $3 ELSE schedule_at END,
-         processing_started_at = NULL,
-         retry_count = retry_count + 1,
-         last_error = $4
-     WHERE id = $1
-     RETURNING id, schedule_at, status`,
-    [outbox.id, canRetry ? 'PENDING' : 'FAILED', nextRetryAt, message],
-  );
-
-  if (canRetry && result.rows[0]) {
-    scheduleOutboxProcessing(result.rows[0]);
   }
 }
 
@@ -239,9 +177,7 @@ async function processOutboxItem(outbox) {
   if (totalRecipients === 0) {
     await pool.query(
       `UPDATE notification_outbox
-       SET status = 'FAILED',
-           processing_started_at = NULL,
-           last_error = $2
+       SET status = 'FAILED', last_error = $2
        WHERE id = $1`,
       [outbox.id, 'No active target users found for this notification'],
     );
@@ -298,20 +234,10 @@ async function processOutboxItem(outbox) {
   let sentCount = 0;
   let failedCount = 0;
   const failureReasonCounts = new Map();
-  let socketFallbackCount = 0;
-  const socketFallbackReasonCounts = new Map();
 
   const trackFailure = (reason) => {
     const normalized = String(reason || 'Unknown delivery error').trim() || 'Unknown delivery error';
     failureReasonCounts.set(normalized, (failureReasonCounts.get(normalized) || 0) + 1);
-  };
-
-  const trackSocketFallback = (reason) => {
-    const normalized = String(reason || 'Unknown socket fallback').trim() || 'Unknown socket fallback';
-    socketFallbackReasonCounts.set(
-      normalized,
-      (socketFallbackReasonCounts.get(normalized) || 0) + 1,
-    );
   };
 
   // Process FCM results
@@ -330,8 +256,6 @@ async function processOutboxItem(outbox) {
         deliveryUpdates.statuses.push('SENT');
         deliveryUpdates.errors.push(`FCM failed, delivered via socket: ${result.error}`);
         sentCount++;
-        socketFallbackCount++;
-        trackSocketFallback(result.error);
       } else {
         deliveryUpdates.userIds.push(result.userId);
         deliveryUpdates.statuses.push('FAILED');
@@ -353,8 +277,6 @@ async function processOutboxItem(outbox) {
       deliveryUpdates.statuses.push('SENT');
       deliveryUpdates.errors.push('FCM token missing, delivered via active socket session');
       sentCount++;
-      socketFallbackCount++;
-      trackSocketFallback('No registered FCM token');
     } else {
       deliveryUpdates.userIds.push(user.user_id);
       deliveryUpdates.statuses.push('FAILED');
@@ -398,21 +320,11 @@ async function processOutboxItem(outbox) {
     .slice(0, 3)
     .map(([reason, count]) => `${reason} (${count})`)
     .join(', ');
-  const summarizedSocketFallbacks = Array.from(socketFallbackReasonCounts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([reason, count]) => `${reason} (${count})`)
-    .join(', ');
 
   const allFailedMissingToken =
     failedCount === totalRecipients &&
     failureReasonCounts.size === 1 &&
     failureReasonCounts.has('No registered FCM token');
-  const terminalFailureCount = usersMissingTokens.length + invalidTokenUsers.length;
-  const allFailuresTerminal =
-    sentCount === 0 &&
-    failedCount === totalRecipients &&
-    terminalFailureCount >= totalRecipients;
 
   const outboxLastError =
     totalRecipients === 0
@@ -423,54 +335,11 @@ async function processOutboxItem(outbox) {
           ? summarizedFailures
             ? `Delivery failed for ${failedCount}/${totalRecipients} recipients: ${summarizedFailures}`
             : `Delivery failed for ${failedCount}/${totalRecipients} recipients`
-          : socketFallbackCount > 0
-            ? summarizedSocketFallbacks
-              ? `FCM was unavailable for ${socketFallbackCount}/${totalRecipients} recipient(s), but the message reached active app sessions via socket only: ${summarizedSocketFallbacks}. Closed-app delivery will keep failing until FCM credentials and device tokens are fixed.`
-              : `FCM was unavailable for ${socketFallbackCount}/${totalRecipients} recipient(s), but the message reached active app sessions via socket only. Closed-app delivery will keep failing until FCM credentials and device tokens are fixed.`
           : null;
-
-  const retryCount = Number(outbox.retry_count || 0);
-  const shouldRetry =
-    sentCount === 0 &&
-    failedCount > 0 &&
-    !allFailuresTerminal &&
-    retryCount < MAX_OUTBOX_RETRIES;
-
-  if (shouldRetry) {
-    const nextRetryAt = retryAtFor(retryCount);
-    const retryResult = await pool.query(
-      `UPDATE notification_outbox
-       SET status = 'PENDING',
-           schedule_at = $2,
-           delivered_at = NULL,
-           processing_started_at = NULL,
-           retry_count = retry_count + 1,
-           last_error = $3,
-           delivered_count = 0
-       WHERE id = $1
-       RETURNING id, schedule_at, status`,
-      [
-        outbox.id,
-        nextRetryAt,
-        `${outboxLastError || 'Delivery failed'}; retry scheduled at ${nextRetryAt.toISOString()}`,
-      ],
-    );
-    scheduleOutboxProcessing(retryResult.rows[0]);
-    console.warn(
-      `[NotificationWorker] outbox=${outbox.id} retry=${retryCount + 1}/${MAX_OUTBOX_RETRIES} ` +
-      `scheduled_at=${nextRetryAt.toISOString()} failed=${failedCount}/${totalRecipients}`,
-    );
-    return;
-  }
 
   await pool.query(
     `UPDATE notification_outbox
-     SET status = $2,
-         delivered_at = $3,
-         processing_started_at = NULL,
-         retry_count = retry_count + 1,
-         last_error = $4,
-         delivered_count = $5
+     SET status = $2, delivered_at = $3, retry_count = retry_count + 1, last_error = $4, delivered_count = $5
      WHERE id = $1`,
     [outbox.id, outboxStatus, deliveredAt, outboxLastError, sentCount],
   );
@@ -539,35 +408,10 @@ async function fetchRecipients(outbox) {
 // ─── DB Helper: Batch Insert Notifications ──────────────────────────
 async function batchInsertNotifications(outbox, userIds) {
   const result = await pool.query(
-    `WITH target(uid) AS (
-       SELECT unnest($1::uuid[])
-     ),
-     inserted AS (
-       INSERT INTO notifications (user_id, title, message, notification_type, is_read, data, source_outbox_id)
-       SELECT target.uid, $2, $3, 'system', FALSE, $4::jsonb, $5
-       FROM target
-       WHERE NOT EXISTS (
-         SELECT 1
-         FROM notifications n
-         WHERE n.user_id = target.uid
-           AND n.source_outbox_id = $5
-       )
-       RETURNING notification_id, user_id, created_at
-     ),
-     existing AS (
-       SELECT DISTINCT ON (n.user_id) n.notification_id, n.user_id, n.created_at
-       FROM notifications n
-       JOIN target ON target.uid = n.user_id
-       WHERE n.source_outbox_id = $5
-       ORDER BY n.user_id, n.created_at ASC
-     )
-     SELECT notification_id, user_id, created_at FROM inserted
-     UNION ALL
-     SELECT notification_id, user_id, created_at
-     FROM existing
-     WHERE NOT EXISTS (
-       SELECT 1 FROM inserted WHERE inserted.user_id = existing.user_id
-     )`,
+    `INSERT INTO notifications (user_id, title, message, notification_type, is_read, data, source_outbox_id)
+     SELECT uid, $2, $3, 'system', FALSE, $4::jsonb, $5
+     FROM unnest($1::uuid[]) AS uid
+     RETURNING notification_id, user_id, created_at`,
     [
       userIds,
       outbox.title,
