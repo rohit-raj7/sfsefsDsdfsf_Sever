@@ -1,16 +1,56 @@
 import admin from 'firebase-admin';
-import { readFileSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+dotenv.config();
+
+function parseJsonSafe(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON (must be valid JSON)');
+  }
+}
+
+function loadFirebaseServiceAccountFromEnv() {
+  const jsonFromEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  if (jsonFromEnv) return parseJsonSafe(jsonFromEnv);
+
+  const base64FromEnv = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64?.trim();
+  if (base64FromEnv) {
+    const decoded = Buffer.from(base64FromEnv, 'base64').toString('utf8');
+    return parseJsonSafe(decoded);
+  }
+
+  const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
+  const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY;
+  const privateKey = privateKeyRaw ? privateKeyRaw.replace(/\\n/g, '\n').trim() : '';
+
+  if (projectId && clientEmail && privateKey) {
+    return {
+      type: 'service_account',
+      project_id: projectId,
+      private_key: privateKey,
+      client_email: clientEmail,
+      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID?.trim(),
+      client_id: process.env.FIREBASE_CLIENT_ID?.trim(),
+      auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+      token_uri: 'https://oauth2.googleapis.com/token',
+      auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+      client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL?.trim(),
+      universe_domain: 'googleapis.com',
+    };
+  }
+
+  throw new Error(
+    'Firebase credentials missing. Set FIREBASE_SERVICE_ACCOUNT_JSON (preferred) or FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY.',
+  );
+}
 
 // ─── Firebase Admin Init ────────────────────────────────────────────
 try {
   if (!admin.apps.length) {
-    const serviceAccountPath = resolve(__dirname, '../config/firebase-service-account.json');
-    const serviceAccount = JSON.parse(readFileSync(serviceAccountPath, 'utf8'));
+    const serviceAccount = loadFirebaseServiceAccountFromEnv();
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     console.log('✅ Firebase Admin SDK initialized successfully.');
   }
