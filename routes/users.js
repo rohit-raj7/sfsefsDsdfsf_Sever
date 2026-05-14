@@ -97,6 +97,10 @@ router.get('/', async (req, res) => {
       `
         SELECT
           user_id,
+          email,
+          auth_provider,
+          phone_number,
+          mobile_number,
           full_name,
           display_name,
           gender,
