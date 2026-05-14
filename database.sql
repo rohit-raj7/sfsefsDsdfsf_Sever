@@ -305,6 +305,9 @@ CREATE TABLE IF NOT EXISTS ratings (
 -- Index for listener ratings
 CREATE INDEX idx_ratings_listener ON ratings(listener_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ratings_call_id ON ratings(call_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ratings_user_listener_unique
+ON ratings(user_id, listener_id)
+WHERE user_id IS NOT NULL AND listener_id IS NOT NULL;
 
 -- ============================================
 -- APP RATINGS & FEEDBACK TABLE

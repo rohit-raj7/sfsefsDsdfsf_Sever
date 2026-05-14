@@ -39,6 +39,19 @@ class Rating {
     }
   }
 
+  // Check if a user has already rated a listener
+  static async hasUserRatedListener(user_id, listener_id) {
+    const query = `
+      SELECT rating_id
+      FROM ratings
+      WHERE user_id = $1
+        AND listener_id = $2
+      LIMIT 1
+    `;
+    const result = await pool.query(query, [user_id, listener_id]);
+    return result.rows.length > 0;
+  }
+
   // Get ratings for a listener
   static async getListenerRatings(listener_id, limit = 20, offset = 0) {
     const query = `

@@ -670,10 +670,25 @@ router.post('/:call_id/rating', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Can only rate completed calls' });
     }
 
-    // Check if already rated
-    const alreadyRated = await Rating.isCallRated(req.params.call_id);
-    if (alreadyRated) {
-      return res.status(400).json({ error: 'Call already rated' });
+    // Check if already rated for this call
+    const callAlreadyRated = await Rating.isCallRated(req.params.call_id);
+    if (callAlreadyRated) {
+      return res.status(409).json({
+        error: 'Call already rated',
+        code: 'CALL_ALREADY_RATED',
+      });
+    }
+
+    // Enforce one rating per user + listener across all calls.
+    const listenerAlreadyRated = await Rating.hasUserRatedListener(
+      req.userId,
+      call.listener_id,
+    );
+    if (listenerAlreadyRated) {
+      return res.status(409).json({
+        error: 'You have already rated this listener',
+        code: 'LISTENER_ALREADY_RATED',
+      });
     }
 
     // Create rating
@@ -694,6 +709,20 @@ router.post('/:call_id/rating', authenticate, async (req, res) => {
       rating: ratingRecord
     });
   } catch (error) {
+    if (error?.code === '23505') {
+      if (error.constraint === 'idx_ratings_call_id') {
+        return res.status(409).json({
+          error: 'Call already rated',
+          code: 'CALL_ALREADY_RATED',
+        });
+      }
+      if (error.constraint === 'idx_ratings_user_listener_unique') {
+        return res.status(409).json({
+          error: 'You have already rated this listener',
+          code: 'LISTENER_ALREADY_RATED',
+        });
+      }
+    }
     console.error('Create rating error:', error);
     res.status(500).json({ error: 'Failed to submit rating' });
   }
