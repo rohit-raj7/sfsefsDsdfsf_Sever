@@ -1304,11 +1304,15 @@ router.get('/me/withdrawal-meta', authenticate, async (req, res) => {
 
     const transactionFee = await getWithdrawalTransactionFee();
     const availableBalance = await getListenerWithdrawableBalance(listener);
+    const payoutRatePerMinute = Number(listener.listener_payout_per_min ?? 0);
 
     return res.json({
       listenerId: listener.listener_id,
       availableBalance,
       transactionFee,
+      payoutRatePerMinute: Number.isFinite(payoutRatePerMinute)
+        ? payoutRatePerMinute
+        : 0,
       payoutMethods,
     });
   } catch (error) {
