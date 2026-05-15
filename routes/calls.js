@@ -8,7 +8,7 @@ import User from '../models/User.js';
 import { authenticate, authenticateAdmin } from '../middleware/auth.js';
 import config from '../config/config.js';
 import { finalizeCallBilling } from '../services/callBillingService.js';
-import { getRateConfig, pool } from '../db.js';
+import { pool } from '../db.js';
 import { resolveRateForListener } from '../services/rateSettingsService.js';
 
 const resolveDurationSeconds = (call, durationSeconds) => {
@@ -88,23 +88,9 @@ router.post('/', authenticate, async (req, res) => {
       return res.status(500).json({ error: 'Experts payout rate is invalid' });
     }
 
-    // Check if user is eligible for first-time offer
-    const caller = await User.findById(req.userId);
-    const rateConfig = await getRateConfig();
-    const isOfferEligible = caller && caller.is_first_time_user && !caller.offer_used
-      && rateConfig.first_time_offer_enabled
-      && rateConfig.offer_minutes_limit > 0
-      && Number(rateConfig.offer_flat_price) > 0;
-
-    const offerFlatPrice = isOfferEligible ? Number(rateConfig.offer_flat_price) : null;
-    const offerMinutesLimit = isOfferEligible ? Number(rateConfig.offer_minutes_limit) : null;
-    const effectiveRate = isOfferEligible
-      ? Number(rateConfig.offer_flat_price) / rateConfig.offer_minutes_limit
-      : userRate;
-
     const wallet = await User.getWallet(req.userId);
     const availableBalance = parseFloat(wallet.balance || 0);
-    const minBalanceToStart = isOfferEligible ? offerFlatPrice : effectiveRate;
+    const minBalanceToStart = userRate;
     if (availableBalance < minBalanceToStart) {
       return res.status(402).json({
         error: 'Low balance',
@@ -117,12 +103,12 @@ router.post('/', authenticate, async (req, res) => {
       caller_id: req.userId,
       listener_id,
       call_type: call_type || 'audio',
-      rate_per_minute: effectiveRate,
+      rate_per_minute: userRate,
       billed_user_rate_per_min: userRate,
       billed_payout_rate_per_min: payoutRate,
-      offer_applied: isOfferEligible,
-      offer_flat_price: offerFlatPrice,
-      offer_minutes_limit: offerMinutesLimit,
+      offer_applied: false,
+      offer_flat_price: null,
+      offer_minutes_limit: null,
     });
 
     // AUTO-DISCONNECT: If call is not answered within 45 seconds, automatically fail it
@@ -224,29 +210,17 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
       return res.status(500).json({ error: 'Experts payout rate is invalid' });
     }
 
-    const rateConfig = await getRateConfig();
-    const isOfferEligible = targetUser && targetUser.is_first_time_user && !targetUser.offer_used
-      && rateConfig.first_time_offer_enabled
-      && rateConfig.offer_minutes_limit > 0
-      && Number(rateConfig.offer_flat_price) > 0;
-
-    const offerFlatPrice = isOfferEligible ? Number(rateConfig.offer_flat_price) : null;
-    const offerMinutesLimit = isOfferEligible ? Number(rateConfig.offer_minutes_limit) : null;
-    const effectiveRate = isOfferEligible
-      ? Number(rateConfig.offer_flat_price) / rateConfig.offer_minutes_limit
-      : userRate;
-
     // Create call — caller_id is target_user_id (User pays), listener_id is listener
     const call = await Call.create({
       caller_id: target_user_id,
       listener_id: listener.listener_id,
       call_type: call_type || 'audio',
-      rate_per_minute: effectiveRate,
+      rate_per_minute: userRate,
       billed_user_rate_per_min: userRate,
       billed_payout_rate_per_min: payoutRate,
-      offer_applied: isOfferEligible,
-      offer_flat_price: offerFlatPrice,
-      offer_minutes_limit: offerMinutesLimit,
+      offer_applied: false,
+      offer_flat_price: null,
+      offer_minutes_limit: null,
     });
 
     // AUTO-DISCONNECT
@@ -772,23 +746,9 @@ router.post('/random', authenticate, async (req, res) => {
       return res.status(500).json({ error: 'Listener payout rate is invalid' });
     }
 
-    // Check if user is eligible for first-time offer
-    const caller = await User.findById(req.userId);
-    const rateConfig = await getRateConfig();
-    const isOfferEligible = caller && caller.is_first_time_user && !caller.offer_used
-      && rateConfig.first_time_offer_enabled
-      && rateConfig.offer_minutes_limit > 0
-      && Number(rateConfig.offer_flat_price) > 0;
-
-    const offerFlatPrice = isOfferEligible ? Number(rateConfig.offer_flat_price) : null;
-    const offerMinutesLimit = isOfferEligible ? Number(rateConfig.offer_minutes_limit) : null;
-    const effectiveRate = isOfferEligible
-      ? Number(rateConfig.offer_flat_price) / rateConfig.offer_minutes_limit
-      : userRate;
-
     const wallet = await User.getWallet(req.userId);
     const availableBalance = parseFloat(wallet.balance || 0);
-    const minBalanceToStart = isOfferEligible ? offerFlatPrice : effectiveRate;
+    const minBalanceToStart = userRate;
     if (availableBalance < minBalanceToStart) {
       return res.status(402).json({
         error: 'Insufficient balance',
@@ -801,12 +761,12 @@ router.post('/random', authenticate, async (req, res) => {
       caller_id: req.userId,
       listener_id: listener.listener_id,
       call_type: call_type || 'audio',
-      rate_per_minute: effectiveRate,
+      rate_per_minute: userRate,
       billed_user_rate_per_min: userRate,
       billed_payout_rate_per_min: payoutRate,
-      offer_applied: isOfferEligible,
-      offer_flat_price: offerFlatPrice,
-      offer_minutes_limit: offerMinutesLimit,
+      offer_applied: false,
+      offer_flat_price: null,
+      offer_minutes_limit: null,
     });
 
     res.status(201).json({

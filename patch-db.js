@@ -19,6 +19,8 @@ async function patch() {
           created_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL,
           retry_count INT DEFAULT 0,
           last_error TEXT,
+          delivered_at TIMESTAMP,
+          delivered_count INT DEFAULT 0,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -36,8 +38,41 @@ async function patch() {
           status VARCHAR(20) DEFAULT 'PENDING',
           delivered_at TIMESTAMP,
           error_message TEXT,
+          last_error TEXT,
+          retry_count INT DEFAULT 0,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+          notification_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
+          title VARCHAR(255) NOT NULL,
+          message TEXT NOT NULL,
+          notification_type VARCHAR(50),
+          is_read BOOLEAN DEFAULT FALSE,
+          data JSONB,
+          source_outbox_id UUID REFERENCES notification_outbox(id) ON DELETE SET NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
+      ALTER TABLE notification_outbox
+        ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS delivered_count INT DEFAULT 0;
+    `);
+
+    await pool.query(`
+      ALTER TABLE notification_deliveries
+        ADD COLUMN IF NOT EXISTS last_error TEXT,
+        ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;
+    `);
+
+    await pool.query(`
+      ALTER TABLE notifications
+        ADD COLUMN IF NOT EXISTS source_outbox_id UUID REFERENCES notification_outbox(id) ON DELETE SET NULL;
     `);
 
     await pool.query(`

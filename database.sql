@@ -435,6 +435,8 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     created_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL,
     retry_count INT DEFAULT 0,
     last_error TEXT,
+    delivered_at TIMESTAMP,
+    delivered_count INT DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -448,9 +450,11 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     outbox_id UUID REFERENCES notification_outbox(id) ON DELETE CASCADE,
     user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
-    status VARCHAR(20) DEFAULT 'PENDING', -- 'DELIVERED', 'FAILED'
+    status VARCHAR(20) DEFAULT 'PENDING', -- 'SENT', 'FAILED'
     delivered_at TIMESTAMP,
     error_message TEXT,
+    last_error TEXT,
+    retry_count INT DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -467,6 +471,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     notification_type VARCHAR(50),
     is_read BOOLEAN DEFAULT FALSE,
     data JSONB, -- Additional data in JSON format
+    source_outbox_id UUID REFERENCES notification_outbox(id) ON DELETE SET NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

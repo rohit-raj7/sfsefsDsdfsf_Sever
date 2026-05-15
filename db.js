@@ -90,26 +90,6 @@ async function testConnection(retries = 3) {
   }
 }
 
-async function getRateConfig() {
-  const result = await pool.query(
-    `SELECT config_id, normal_per_minute_rate, first_time_offer_enabled, offer_minutes_limit, offer_flat_price, updated_at
-     FROM rate_config
-     ORDER BY updated_at DESC
-     LIMIT 1`
-  );
-
-  if (result.rows.length === 0) {
-    const insertResult = await pool.query(
-      `INSERT INTO rate_config (normal_per_minute_rate, first_time_offer_enabled, offer_minutes_limit, offer_flat_price)
-       VALUES (4.00, FALSE, 5, 5.00)
-       RETURNING config_id, normal_per_minute_rate, first_time_offer_enabled, offer_minutes_limit, offer_flat_price, updated_at`
-    );
-    return insertResult.rows[0];
-  }
-
-  return result.rows[0];
-}
-
 // Ensure required columns exist on startup (non-destructive)
 async function ensureSchema() {
   try {
@@ -938,7 +918,7 @@ async function closePool() {
 }
 
 export { pool, testConnection, executeQuery, closePool };
-export { ensureSchema, getRateConfig };
+export { ensureSchema };
 
 
 

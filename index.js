@@ -7,7 +7,7 @@ import morgan from 'morgan';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import config from './config/config.js';
-import { testConnection, ensureSchema, pool, getRateConfig } from './db.js';
+import { testConnection, ensureSchema, pool } from './db.js';
 // Initialize Express app
 const app = express();
 app.set('trust proxy', 1); // Trust first proxy (required for Coolify/Nginx rate limiting)
@@ -124,20 +124,6 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-app.get('/api/config/call-rates', async (req, res) => {
-  try {
-    const rateConfig = await getRateConfig();
-    res.json({
-      normalPerMinuteRate: Number(rateConfig.normal_per_minute_rate),
-      firstTimeOfferEnabled: rateConfig.first_time_offer_enabled === true,
-      offerMinutesLimit: rateConfig.offer_minutes_limit,
-      offerFlatPrice: rateConfig.offer_flat_price
-    });
-  } catch (error) {
-    console.error('Get call rates error:', error);
-    res.status(500).json({ error: 'Failed to fetch call rates' });
-  }
-});
 
 // Mount API routes
 app.use('/api/auth', authRoutes);
