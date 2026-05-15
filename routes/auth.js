@@ -5,7 +5,7 @@ import { OAuth2Client } from 'google-auth-library';
 
 import User from '../models/User.js';
 import Listener from '../models/Listener.js';
-import { pool, getRateConfig } from '../db.js';
+import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -194,7 +194,6 @@ router.post('/social-login', async (req, res) => {
 
     // ===================== CREATE USER =====================
     if (!user) {
-      const rateConfig = await getRateConfig();
       const isFirstTimeUser = true; // All new users are first-time users
       user = await User.create({
         phone_number: null,
@@ -208,9 +207,7 @@ router.post('/social-login', async (req, res) => {
         fcm_token: normalizedFcmToken,
         account_type: 'user',
         is_first_time_user: isFirstTimeUser,
-        offer_used: false,
-        offer_minutes_limit: rateConfig?.offer_minutes_limit,
-        offer_flat_price: rateConfig?.offer_flat_price
+        offer_used: false
       });
       if (normalizedFcmToken) {
         await User.updateFcmToken(user.user_id, normalizedFcmToken);
@@ -379,7 +376,6 @@ router.post('/verify-otp', async (req, res) => {
 
     // ===================== CREATE USER =====================
     if (!user) {
-      const rateConfig = await getRateConfig();
       const isFirstTimeUser = true;
       user = await User.create({
         phone_number: phone_number,
@@ -387,9 +383,7 @@ router.post('/verify-otp', async (req, res) => {
         fcm_token: normalizedFcmToken,
         account_type: 'user',
         is_first_time_user: isFirstTimeUser,
-        offer_used: false,
-        offer_minutes_limit: rateConfig?.offer_minutes_limit,
-        offer_flat_price: rateConfig?.offer_flat_price
+        offer_used: false
       });
       if (normalizedFcmToken) {
         await User.updateFcmToken(user.user_id, normalizedFcmToken);
