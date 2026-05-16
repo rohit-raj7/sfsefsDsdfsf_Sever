@@ -961,6 +961,15 @@ io.on('connection', (socket) => {
         listenerUserId: uid,
         busy: true,
       });
+      
+      // Proactively remove from random pool to prevent zombie matching
+      if (randomUserPool.has(uid)) {
+        const entry = randomUserPool.get(uid);
+        if (entry.timeoutId) clearTimeout(entry.timeoutId);
+        randomUserPool.delete(uid);
+        console.log(`[RANDOM] User ${uid} removed from random pool due to active call`);
+      }
+      
       console.log(`[SOCKET] call:accept: User/Listener ${uid} marked BUSY`);
     });
 

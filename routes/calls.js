@@ -78,6 +78,16 @@ router.post('/', authenticate, async (req, res) => {
       });
     }
 
+    // CALLER BUSY CHECK: Block calls if the caller is already in an active call
+    if (busyMap && busyMap.has(req.userId)) {
+      console.log(`[CALLS] Caller ${req.userId} is BUSY â€” rejecting call`);
+      return res.status(409).json({
+        error: 'You are busy',
+        status: 'busy',
+        details: 'You are currently on another call. Please try again.'
+      });
+    }
+
     const resolvedRates = await resolveRateForListener(listener.listener_id);
     const userRate = Number(resolvedRates?.userRate || 0);
     const payoutRate = Number(resolvedRates?.payoutRate || 0);
@@ -733,6 +743,16 @@ router.post('/random', authenticate, async (req, res) => {
         error: 'Listener is busy',
         status: 'busy',
         details: 'Selected listener is currently on another call. Please try again.'
+      });
+    }
+
+    // CALLER BUSY CHECK: Block calls if the caller is already in an active call
+    if (busyMap && busyMap.has(req.userId)) {
+      console.log(`[CALLS] Caller ${req.userId} is BUSY â€” rejecting random call`);
+      return res.status(409).json({
+        error: 'You are busy',
+        status: 'busy',
+        details: 'You are currently on another call. Please try again.'
       });
     }
 
