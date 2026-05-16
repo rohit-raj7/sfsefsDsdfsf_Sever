@@ -155,8 +155,8 @@ const listenerSockets = new Map(); // Map of listenerUserId -> socketId
 const activeChannels = new Map(); // Map of channelName -> Set of userIds in channel
 const lastSeenMap = new Map(); // Map of userId -> timestamp
 const presenceTimeouts = new Map(); // Map of userId -> timeoutId
-const busyListeners = new Map(); // Map of listenerUserId -> callId (in-memory busy tracking)
-app.set('busyListeners', busyListeners);
+const busyUsers = new Map(); // Map of listenerUserId -> callId (in-memory busy tracking)
+app.set('busyUsers', busyUsers);
 const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, listenerSocketId, createdAt } (tracks pre-answer calls for cancel routing)
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
@@ -232,52 +232,14 @@ const userChatState = new Map(); // Map of userId -> { activelyViewingChatId, ap
 io.on('connection', (socket) => {
   console.log(`[SOCKET] Connected: ${socket.id}`);
 
-  function _busyValueMatches(uid, expectedCallId) {
-    if (!uid || !busyListeners.has(uid)) return false;
-    if (!expectedCallId) return true;
-    return String(busyListeners.get(uid)) === String(expectedCallId);
-  }
-
-  function _isBusyForAnotherCall(uid, callId) {
-    if (!uid || !busyListeners.has(uid)) return false;
-    return callId ? String(busyListeners.get(uid)) !== String(callId) : true;
-  }
-
-  function _emitBusy(uid, busy) {
-    if (!uid) return;
-    io.emit('listener_busy_status', { listenerUserId: uid, busy });
-  }
-
-  function _markBusyForCall(callId, ...userIds) {
-    if (!callId) return;
-    for (const uid of userIds) {
-      if (!uid) continue;
-      busyListeners.set(uid, callId);
-      _emitBusy(uid, true);
-      randomUserPool.delete(uid);
-      console.log(`[SOCKET] User ${uid} marked BUSY for call ${callId}`);
-    }
-  }
-
-  // Helper: clear only the busy reservation for this call. This avoids
-  // a late timeout/end event freeing a newer call reservation for the same user.
-  function _clearBusyForCall(userId1, userId2, expectedCallId = null) {
+  // Helper: Clear busy status for a user (checks both parties)
+  function _clearBusyForCall(userId1, userId2) {
     for (const uid of [userId1, userId2]) {
-      if (uid && _busyValueMatches(uid, expectedCallId)) {
-        busyListeners.delete(uid);
-        _emitBusy(uid, false);
-        console.log(`[SOCKET] _clearBusyForCall: User ${uid} marked NOT BUSY`);
-        Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusyByUserId DB error:', e.message));
-      }
-    }
-  }
-
-  function _clearBusyForTrackedCall(callId) {
-    if (!callId) return;
-    for (const [uid, busyCallId] of Array.from(busyListeners.entries())) {
-      if (String(busyCallId) === String(callId)) {
-        busyListeners.delete(uid);
-        _emitBusy(uid, false);
+      if (uid && busyUsers.has(uid)) {
+        busyUsers.delete(uid);
+        io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+        console.log(`[SOCKET] _clearBusyForCall: Listener ${uid} marked NOT BUSY`);
+        // Also clear in DB (fire-and-forget)
         Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusyByUserId DB error:', e.message));
       }
     }
@@ -370,7 +332,7 @@ io.on('connection', (socket) => {
     const onlineUsers = Array.from(connectedUsers.keys());
     socket.emit('listeners:initial_status', onlineListeners);
     socket.emit('users:initial_status', onlineUsers);
-    socket.emit('listeners:initial_busy', Array.from(busyListeners.keys()));
+    socket.emit('listeners:initial_busy', Array.from(busyUsers.keys()));
   });
 
   // Listener specific join (for availability tracking)
@@ -419,7 +381,7 @@ io.on('connection', (socket) => {
     
     io.emit('listener_status', { listenerUserId, online: true, timestamp: Date.now() });
     socket.emit('users:initial_status', Array.from(connectedUsers.keys()));
-    socket.emit('listeners:initial_busy', Array.from(busyListeners.keys()));
+    socket.emit('listeners:initial_busy', Array.from(busyUsers.keys()));
     console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Listener ${listenerUserId} is now ONLINE (socket: ${socket.id})`);
     console.log(`[SOCKET] listener:join: Total online listeners: ${listenerSockets.size}`);
   });
@@ -449,12 +411,11 @@ io.on('connection', (socket) => {
     const { userId, displayName, avatarUrl, gender, preferredGender } = data || {};
     if (!userId) return;
 
-    // BUSY CHECK: Reject users already on an active call
-    if (busyListeners.has(userId)) {
-      console.log(`[RANDOM] User ${userId} is BUSY — rejecting pool join`);
+    if (busyUsers.has(userId)) {
+      console.log(`[SOCKET] random:join_pool: ❌ User ${userId} is BUSY`);
       socket.emit('random:join_rejected', {
         reason: 'user_busy',
-        message: 'You are already on a call. Please try after your current call ends.',
+        message: 'You are currently on another call.',
       });
       return;
     }
@@ -526,8 +487,10 @@ io.on('connection', (socket) => {
     if (preferredGender && preferredGender !== 'Any') {
       for (const [waitingUserId, entry] of randomUserPool.entries()) {
         if (waitingUserId === userId) continue;
-        // BUSY CHECK: Skip users who became busy after joining the pool
-        if (busyListeners.has(waitingUserId)) continue;
+        if (busyUsers.has(waitingUserId)) {
+          randomUserPool.delete(waitingUserId);
+          continue;
+        }
         const genderMatch = entry.gender === preferredGender;
         const theirPrefMatch = !entry.preferredGender || entry.preferredGender === 'Any' || entry.preferredGender === gender;
         if (genderMatch && theirPrefMatch) {
@@ -541,8 +504,10 @@ io.on('connection', (socket) => {
     if (!matchedUserId) {
       for (const [waitingUserId, entry] of randomUserPool.entries()) {
         if (waitingUserId === userId) continue;
-        // BUSY CHECK: Skip users who became busy after joining the pool
-        if (busyListeners.has(waitingUserId)) continue;
+        if (busyUsers.has(waitingUserId)) {
+          randomUserPool.delete(waitingUserId);
+          continue;
+        }
         // Only accept if their preference also allows any or matches current user
         const theirPrefOk = !entry.preferredGender || entry.preferredGender === 'Any' || entry.preferredGender === gender;
         if (theirPrefOk) {
@@ -555,15 +520,6 @@ io.on('connection', (socket) => {
     if (matchedUserId) {
       // Found a match! Pair both users.
       const matchedEntry = randomUserPool.get(matchedUserId);
-      if (busyListeners.has(userId) || busyListeners.has(matchedUserId)) {
-        if (matchedEntry?.timeoutId) clearTimeout(matchedEntry.timeoutId);
-        randomUserPool.delete(matchedUserId);
-        socket.emit('random:busy', {
-          reason: 'matched_user_busy',
-          message: 'All listeners are busy right now. Please try again.',
-        });
-        return;
-      }
       if (matchedEntry.timeoutId) clearTimeout(matchedEntry.timeoutId);
       randomUserPool.delete(matchedUserId);
 
@@ -592,8 +548,8 @@ io.on('connection', (socket) => {
           socket.emit('random:no_match', {
             preferredGender: preferredGender || 'Any',
             message: preferredGender && preferredGender !== 'Any'
-              ? `All ${preferredGender.toLowerCase()} users are busy right now. Please try again.`
-              : 'All listeners are busy right now. Please try again.',
+              ? `All ${preferredGender.toLowerCase()} users are busy right now`
+              : 'No users available right now',
           });
           console.log(`[RANDOM] Timeout: no match for user ${userId} (prefer: ${preferredGender})`);
         }
@@ -625,44 +581,11 @@ io.on('connection', (socket) => {
   // Relaying random match calls (free user-to-user) without billing
   socket.on('random:call_invite', (data) => {
     const { targetUserId, channelName, callerName, callerAvatar } = data || {};
-    const callerUserId = socket.userId;
-    if (!targetUserId || !callerUserId || !channelName) return;
-    if (_isBusyForAnotherCall(callerUserId, channelName)) {
-      socket.emit('random:busy', {
-        channelName,
-        reason: 'caller_busy',
-        message: 'You are already on a call.',
-      });
-      return;
-    }
-    if (_isBusyForAnotherCall(targetUserId, channelName)) {
-      socket.emit('random:busy', {
-        channelName,
-        targetUserId,
-        reason: 'target_busy',
-        message: 'This person is currently on another call.',
-      });
-      return;
-    }
+    if (!targetUserId) return;
     const targetSocketId = connectedUsers.get(targetUserId) || listenerSockets.get(targetUserId);
     if (targetSocketId) {
-      _markBusyForCall(channelName, callerUserId, targetUserId);
-      pendingCalls.set(channelName, {
-        initiatorUserId: callerUserId,
-        calleeUserId: targetUserId,
-        calleeSocketId: targetSocketId,
-        createdAt: Date.now(),
-      });
       io.to(targetSocketId).emit('random:call_invite', { channelName, callerName, callerAvatar });
-      socket.emit('random:call_invite_sent', { channelName, targetUserId });
       console.log(`[RANDOM] Call invite from ${socket.userId} to ${targetUserId}`);
-    } else {
-      socket.emit('random:busy', {
-        channelName,
-        targetUserId,
-        reason: 'target_unavailable',
-        message: 'This person is currently unavailable.',
-      });
     }
   });
 
@@ -691,167 +614,141 @@ io.on('connection', (socket) => {
 
 
   // Initiate call: User -> Listener
+  // CRITICAL: This checks if listener is online by looking for their explicit
+  // foreground listener availability socket. connectedUsers is not enough:
+  // the listener must have the Online button enabled and the app foregrounded.
   socket.on('call:initiate', async (data) => {
     const { listenerId, ...callData } = data || {};
-    const callId = callData.callId;
-    const callerUserId = callData.callerId || socket.userId;
-    const listenerSocketId = listenerSockets.get(listenerId);
-
-    const failBusy = (reason, message) => {
-      socket.emit('call:busy', { callId, listenerId, reason, message });
-      if (callId) Call.updateStatus(callId, 'cancelled').catch(() => {});
-    };
-    const failUnavailable = (reason, message) => {
-      socket.emit('call:unavailable', { callId, listenerId, reason, message });
-      if (callId) Call.updateStatus(callId, 'cancelled').catch(() => {});
-    };
-
-    if (!callId || !callerUserId || !listenerId) {
-      socket.emit('call:failed', {
-        callId,
-        reason: 'invalid_call_request',
-        message: 'Unable to start call. Please try again.',
-      });
-      return;
-    }
-    if (_isBusyForAnotherCall(callerUserId, callId)) {
-      failBusy('caller_busy', 'You are already on another call.');
-      return;
-    }
-    if (_isBusyForAnotherCall(listenerId, callId)) {
-      failBusy('listener_busy', 'This person is currently on another call.');
-      return;
-    }
-    if (!listenerSocketId) {
-      failUnavailable('listener_offline', 'This person is currently unavailable.');
+    
+    // CALLER BUSY CHECK
+    if (socket.userId && busyUsers.has(socket.userId)) {
+      console.log(`[SOCKET] call:initiate: ❌ Caller ${socket.userId} is already BUSY`);
+      socket.emit('call:failed', { callId: callData.callId, reason: 'caller_busy', message: 'You are already in a call' });
       return;
     }
 
-    let listener = null;
+    let listenerSocketId = listenerSockets.get(listenerId);
+    
+    console.log(`[SOCKET] call:initiate: Looking for listener ${listenerId}`);
+    console.log(`[SOCKET] call:initiate: Found socketId: ${listenerSocketId || 'NONE'}`);
+    
+    // Fetch listener user to check for FCM token
     let listenerUser = null;
     try {
-      [listener, listenerUser] = await Promise.all([
-        Listener.findByUserId(listenerId),
-        User.findByIdForRealtime(listenerId),
-      ]);
+      listenerUser = await User.findByIdForRealtime(listenerId);
+    } catch(e) {
+      console.error('[SOCKET] Error fetching listener user for FCM:', e);
+    }
+
+    if (!listenerSocketId) {
+      // Listener is offline for calls when the Online button is off or the app
+      // is backgrounded/closed, even if FCM is available.
+      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} offline for calls`);
+      socket.emit('call:failed', { callId: callData.callId, reason: 'listener_offline' });
+      return;
+    }
+
+    // BUSY CHECK: If listener is already in an active call, notify caller
+    if (busyUsers.has(listenerId)) {
+      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} is BUSY (active call: ${busyUsers.get(listenerId)})`);
+      socket.emit('call:busy', {
+        callId: callData.callId,
+        listenerId,
+        reason: 'listener_busy',
+        message: 'Listener is busy on another call'
+      });
+      return;
+    }
+
+    // Track this pending call so we can route cancel events to listener
+    if (callData.callId) {
+      pendingCalls.set(callData.callId, {
+        initiatorUserId: socket.userId,
+        calleeUserId: listenerId,
+        listenerUserId: listenerId,
+        calleeSocketId: listenerSocketId,
+        createdAt: Date.now(),
+      });
+      console.log(`[SOCKET] call:initiate: Tracking pending call ${callData.callId}`);
+    }
+
+    // Forward incoming-call to listener IMMEDIATELY (don't block on DB)
+    if (listenerSocketId) {
+      io.to(listenerSocketId).emit('incoming-call', callData);
+    }
+    console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
+
+    // THEN verify in background Ã¢â‚¬â€ if not approved, cancel the call
+    try {
+      const listener = await Listener.findByUserId(listenerId);
+      if (listener) {
+        const verificationStatus = listener.verification_status || 'approved';
+        if (verificationStatus !== 'approved') {
+          console.log(`[SOCKET] call:initiate blocked: Listener ${listenerId} not approved (status: ${verificationStatus})`);
+          // Notify caller that call failed
+          socket.emit('call:failed', { 
+            callId: callData.callId, 
+            reason: 'listener_not_approved',
+            message: 'Listener not approved yet'
+          });
+          // Also cancel the incoming call on the listener side
+          if (listenerSocketId) {
+            io.to(listenerSocketId).emit('call:ended', {
+              callId: callData.callId,
+              reason: 'cancelled',
+              code: 'VERIFICATION_FAILED'
+            });
+          }
+          return;
+        }
+      }
     } catch (err) {
-      console.error('[SOCKET] call:initiate availability lookup failed:', err.message);
-      socket.emit('call:failed', {
-        callId,
-        reason: 'availability_check_failed',
-        message: 'Unable to start call. Please try again.',
-      });
-      return;
+      console.error(`[SOCKET] call:initiate verification check failed:`, err);
+      // Don't fail the call for a verification check error Ã¢â‚¬â€ call was already forwarded
     }
 
-    if (!listener || listener.is_available === false || listener.is_online === false) {
-      failUnavailable('listener_unavailable', 'This person is currently unavailable.');
-      return;
-    }
-    if ((listener.verification_status || 'approved') !== 'approved') {
-      socket.emit('call:failed', {
-        callId,
-        reason: 'listener_not_approved',
-        message: 'This listener is not available for calls at the moment.',
-      });
-      return;
-    }
-    if ((listener.is_busy === true && !_busyValueMatches(listenerId, callId)) ||
-        _isBusyForAnotherCall(listenerId, callId)) {
-      failBusy('listener_busy', 'This person is currently on another call.');
-      return;
-    }
-    if (_isBusyForAnotherCall(callerUserId, callId)) {
-      failBusy('caller_busy', 'You are already on another call.');
-      return;
-    }
-
-    _markBusyForCall(callId, callerUserId, listenerId);
-    Listener.setBusy(listener.listener_id).catch((e) =>
-      console.error('[SOCKET] setBusy DB error:', e.message),
-    );
-
-    const pendingTimeoutId = setTimeout(async () => {
-      const pending = clearPendingCall(callId);
-      if (!pending) return;
-      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId, callId);
-      const initiatorSocketId =
-        connectedUsers.get(pending.initiatorUserId) ||
-        listenerSockets.get(pending.initiatorUserId);
-      if (initiatorSocketId) {
-        io.to(initiatorSocketId).emit('call:ended', {
-          callId,
-          endedBy: pending.calleeUserId,
-          reason: 'no_answer',
-          code: 'NO_ANSWER',
-        });
-      }
-      if (pending.calleeSocketId) {
-        io.to(pending.calleeSocketId).emit('call:ended', {
-          callId,
-          endedBy: pending.initiatorUserId,
-          reason: 'ring_timeout',
-          code: 'NO_ANSWER',
-        });
-      }
+    const listenerFcmToken = listenerUser?.fcm_token ? String(listenerUser.fcm_token).trim() : '';
+    if (listenerUser && listenerFcmToken) {
       try {
-        const checkCall = await Call.findById(callId);
-        if (checkCall && ['pending', 'ringing', 'initiated'].includes(checkCall.status)) {
-          await Call.updateStatus(callId, 'missed');
-        }
-      } catch (err) {
-        console.error(`[SOCKET] call:initiate no-answer update failed for ${callId}:`, err.message);
-      }
-    }, LISTENER_TO_USER_RING_TIMEOUT_MS);
-
-    pendingCalls.set(callId, {
-      initiatorUserId: callerUserId,
-      calleeUserId: listenerId,
-      listenerUserId: listenerId,
-      calleeSocketId: listenerSocketId,
-      createdAt: Date.now(),
-      timeoutId: pendingTimeoutId,
-    });
-
-    io.to(listenerSocketId).emit('incoming-call', {
-      ...callData,
-      callerId: callerUserId,
-      listenerId: callData.listenerId || listener.listener_id,
-      listener_id: callData.listener_id || listener.listener_id,
-    });
-
-    const listenerFcmToken = listenerUser?.fcm_token
-      ? String(listenerUser.fcm_token).trim()
-      : '';
-    if (listenerFcmToken) {
-      try {
-        const callerUser = await User.findByIdForRealtime(callerUserId);
-        const callerName = callerUser
-          ? (callerUser.display_name || callerUser.full_name)
-          : 'User';
+        console.log(`[SOCKET] call:initiate: Sending FCM Push to listener ${listenerId} (token: ${listenerFcmToken.substring(0, 15)}...)`);
+        
+        // Fetch caller details for notification
+        const callerUser = await User.findByIdForRealtime(socket.userId);
+        const callerName = callerUser ? (callerUser.display_name || callerUser.full_name) : 'User';
         const callerAvatar = callerUser ? callerUser.avatar_url : '';
+
+        // The data payload explicitly matches what Flutter needs to trigger the incoming call UI
+        const pushData = {
+          type: 'incoming_call',
+          callId: String(callData.callId || ''),
+          callerId: String(socket.userId || ''),
+          callerName: String(callerName || 'Someone'),
+          callerAvatar: String(callerAvatar || ''),
+          channelName: String(callData.channelName || ''),
+          callType: String(callData.callType || 'audio'),
+          ratePerMinute: String(callData.ratePerMinute || '0')
+        };
+
+        // For CallKeep / background handling, data payload is the most important part
         const pushResult = await sendPushFCM(
-          listenerFcmToken,
-          'Incoming Call',
-          `${callerName} is calling you`,
-          {
-            type: 'incoming_call',
-            callId: String(callId),
-            callerId: String(callerUserId),
-            callerName: String(callerName || 'Someone'),
-            callerAvatar: String(callerAvatar || ''),
-            listenerId: String(listener.listener_id || ''),
-            listener_id: String(listener.listener_id || ''),
-            channelName: String(callData.channelName || callId),
-            callType: String(callData.callType || 'audio'),
-            ratePerMinute: String(callData.ratePerMinute || '0'),
-          },
+          listenerFcmToken, 
+          'Incoming Call', 
+          `${callerName} is calling you`, 
+          pushData
         );
-        if (!pushResult?.success && pushResult?.isInvalidToken) {
-          await User.clearFcmToken(listenerId, listenerFcmToken);
+        if (!pushResult?.success) {
+          console.error(
+            `[SOCKET] call:initiate: FCM Push failed for listener ${listenerId}: ${pushResult?.error || 'Unknown FCM error'}`,
+          );
+          if (pushResult?.isInvalidToken) {
+            await User.clearFcmToken(listenerId, listenerFcmToken);
+          }
         }
+        if (pushResult?.success) {
+        }
+        console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ FCM Push sent successfully to listener ${listenerId}`);
       } catch (fcmErr) {
-        console.error('[SOCKET] call:initiate FCM failed:', fcmErr.message);
+        console.error(`[SOCKET] call:initiate: Ã¢Å“â€” FCM Push failed:`, fcmErr.message);
       }
     }
   });
@@ -859,182 +756,179 @@ io.on('connection', (socket) => {
   // Initiate call: Listener -> User
   socket.on('listener_call:initiate', async (data) => {
     const { targetUserId, ...callData } = data || {};
-    const callId = callData.callId;
-    const listenerUserId = socket.listenerUserId || socket.userId || callData.callerId;
+    const listenerUserId = socket.listenerUserId || socket.userId;
 
-    const failBusy = (reason, message) => {
-      socket.emit('call:busy', { callId, targetUserId, reason, message });
-      if (callId) Call.updateStatus(callId, 'cancelled').catch(() => {});
-    };
-    const failUnavailable = (reason, message) => {
-      socket.emit('call:unavailable', { callId, targetUserId, reason, message });
-      if (callId) Call.updateStatus(callId, 'cancelled').catch(() => {});
-    };
-
-    if (!callId || !listenerUserId || !targetUserId) {
-      socket.emit('call:failed', {
-        callId,
-        reason: 'invalid_call_request',
-        message: 'Unable to start call. Please try again.',
-      });
-      return;
-    }
-    if (_isBusyForAnotherCall(listenerUserId, callId)) {
-      failBusy('caller_busy', 'You are already on another call.');
-      return;
-    }
-    if (_isBusyForAnotherCall(targetUserId, callId)) {
-      failBusy('user_busy', 'This person is currently on another call.');
+    // CALLER BUSY CHECK
+    if (listenerUserId && busyUsers.has(listenerUserId)) {
+      console.log(`[SOCKET] listener_call:initiate: ❌ Caller ${listenerUserId} is already BUSY`);
+      socket.emit('call:failed', { callId: callData.callId, reason: 'caller_busy', message: 'You are already in a call' });
       return;
     }
 
-    const targetSocketId = connectedUsers.get(targetUserId);
-    if (!targetSocketId) {
-      failUnavailable('user_offline', 'This person is currently unavailable.');
+    // TARGET BUSY CHECK
+    if (targetUserId && busyUsers.has(targetUserId)) {
+      console.log(`[SOCKET] listener_call:initiate: ❌ Target user ${targetUserId} is BUSY`);
+      socket.emit('call:busy', { callId: callData.callId, reason: 'user_busy', message: 'User is busy on another call' });
       return;
     }
 
-    let listenerObj = null;
-    let targetUser = null;
+    // Always trust backend-created call snapshot rates over client payload.
+    // This keeps user charge / listener payout aligned with admin rule settings.
     let resolvedRatePerMinute = Number(callData.ratePerMinute || 0);
     let resolvedListenerDbId = callData.listenerId || callData.listener_id || null;
-    try {
-      const [persistedCall, resolvedListener, resolvedTargetUser] = await Promise.all([
-        Call.findById(callId),
-        Listener.findByUserId(listenerUserId),
-        User.findByIdForRealtime(targetUserId),
-      ]);
-      listenerObj = resolvedListener;
-      targetUser = resolvedTargetUser;
-      if (persistedCall) {
-        const persistedRate = Number(
-          persistedCall.billed_user_rate_per_min || persistedCall.rate_per_minute || 0,
-        );
-        if (Number.isFinite(persistedRate) && persistedRate > 0) {
-          resolvedRatePerMinute = persistedRate;
+    if (callData.callId) {
+      try {
+        const persistedCall = await Call.findById(callData.callId);
+        if (persistedCall) {
+          const persistedRate = Number(
+            persistedCall.billed_user_rate_per_min || persistedCall.rate_per_minute || 0
+          );
+          if (Number.isFinite(persistedRate) && persistedRate > 0) {
+            resolvedRatePerMinute = persistedRate;
+          }
+          resolvedListenerDbId = resolvedListenerDbId || persistedCall.listener_id || null;
         }
-        resolvedListenerDbId = resolvedListenerDbId || persistedCall.listener_id || null;
+      } catch (rateErr) {
+        console.error('[SOCKET] listener_call:initiate rate resolve error:', rateErr.message);
       }
-    } catch (err) {
-      console.error('[SOCKET] listener_call:initiate lookup failed:', err.message);
-      socket.emit('call:failed', {
-        callId,
-        reason: 'availability_check_failed',
-        message: 'Unable to start call. Please try again.',
-      });
-      return;
     }
-
-    if (!listenerObj ||
-        listenerObj.is_available === false ||
-        (listenerObj.verification_status || 'approved') !== 'approved') {
-      socket.emit('call:failed', {
-        callId,
-        reason: 'listener_not_approved',
-        message: 'Your profile is not available for outgoing calls yet.',
-      });
-      return;
-    }
-    if ((listenerObj.is_busy === true && !_busyValueMatches(listenerUserId, callId)) ||
-        _isBusyForAnotherCall(listenerUserId, callId)) {
-      failBusy('caller_busy', 'You are already on another call.');
-      return;
-    }
-    if (_isBusyForAnotherCall(targetUserId, callId)) {
-      failBusy('user_busy', 'This person is currently on another call.');
-      return;
-    }
-
     callData.ratePerMinute = resolvedRatePerMinute;
     if (resolvedListenerDbId) {
       callData.listenerId = resolvedListenerDbId;
       callData.listener_id = resolvedListenerDbId;
     }
-
-    _markBusyForCall(callId, listenerUserId, targetUserId);
-    if (resolvedListenerDbId) {
-      Listener.setBusy(resolvedListenerDbId).catch((e) =>
-        console.error('[SOCKET] setBusy DB error:', e.message),
-      );
+    
+    let targetSocketId = connectedUsers.get(targetUserId);
+    
+    console.log(`[SOCKET] listener_call:initiate: Looking for target user ${targetUserId}`);
+    console.log(`[SOCKET] listener_call:initiate: Found socketId: ${targetSocketId || 'NONE'}`);
+    
+    // Fetch target user to check for FCM token
+    let targetUser = null;
+    try {
+      targetUser = await User.findByIdForRealtime(targetUserId);
+    } catch(e) {
+      console.error('[SOCKET] Error fetching target user for FCM:', e);
     }
 
-    const pendingTimeoutId = setTimeout(async () => {
-      const pending = clearPendingCall(callId);
-      if (!pending) return;
-      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId, callId);
-      const initiatorSocketId =
-        connectedUsers.get(pending.initiatorUserId) ||
-        listenerSockets.get(pending.initiatorUserId);
-      if (initiatorSocketId) {
-        io.to(initiatorSocketId).emit('call:ended', {
-          callId,
-          endedBy: pending.calleeUserId,
-          reason: 'no_answer',
-          code: 'NO_ANSWER',
-        });
-      }
-      if (pending.calleeSocketId) {
-        io.to(pending.calleeSocketId).emit('call:ended', {
-          callId,
-          endedBy: pending.initiatorUserId,
-          reason: 'ring_timeout',
-          code: 'NO_ANSWER',
-        });
-      }
-      try {
-        const checkCall = await Call.findById(callId);
-        if (checkCall && ['pending', 'ringing', 'initiated'].includes(checkCall.status)) {
-          await Call.updateStatus(callId, 'missed');
-        }
-      } catch (err) {
-        console.error(`[SOCKET] listener_call:initiate no-answer update failed for ${callId}:`, err.message);
-      }
-    }, LISTENER_TO_USER_RING_TIMEOUT_MS);
+    if (!targetSocketId) {
+      console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€” User ${targetUserId} offline for calls`);
+      socket.emit('call:failed', { callId: callData.callId, reason: 'user_offline' });
+      return;
+    }
 
-    pendingCalls.set(callId, {
-      initiatorUserId: listenerUserId,
-      calleeUserId: targetUserId,
-      listenerUserId,
-      calleeSocketId: targetSocketId,
-      createdAt: Date.now(),
-      timeoutId: pendingTimeoutId,
-    });
+    // Track this pending call so we can route cancel events
+    if (callData.callId) {
+      const pendingTimeoutId = setTimeout(async () => {
+        const pending = clearPendingCall(callData.callId);
+        if (!pending) return;
 
-    io.to(targetSocketId).emit('incoming-call', {
-      ...callData,
-      callerId: listenerUserId,
-      channelName: callData.channelName || callId,
-    });
-
-    const targetFcmToken = targetUser?.fcm_token
-      ? String(targetUser.fcm_token).trim()
-      : '';
-    if (targetFcmToken) {
-      try {
-        const listenerName = listenerObj?.professional_name || 'Experts';
-        const listenerAvatar = listenerObj?.profile_image || '';
-        const pushResult = await sendPushFCM(
-          targetFcmToken,
-          'Incoming Call',
-          `${listenerName} is calling you`,
-          {
-            type: 'incoming_call',
-            callId: String(callId),
-            callerId: String(listenerUserId),
-            callerName: String(listenerName),
-            callerAvatar: String(listenerAvatar),
-            listenerId: String(callData.listenerId || ''),
-            listener_id: String(callData.listenerId || ''),
-            channelName: String(callData.channelName || callId),
-            callType: String(callData.callType || 'audio'),
-            ratePerMinute: String(callData.ratePerMinute || '0'),
-          },
+        console.log(
+          `[SOCKET] listener_call:initiate: pending call ${callData.callId} timed out (no answer)`,
         );
-        if (!pushResult?.success && pushResult?.isInvalidToken) {
-          await User.clearFcmToken(targetUserId, targetFcmToken);
+
+        const initiatorSocketId =
+          connectedUsers.get(pending.initiatorUserId) ||
+          listenerSockets.get(pending.initiatorUserId);
+        if (initiatorSocketId) {
+          io.to(initiatorSocketId).emit('call:ended', {
+            callId: callData.callId,
+            endedBy: pending.calleeUserId || targetUserId,
+            reason: 'no_answer',
+            code: 'NO_ANSWER',
+          });
         }
+
+        if (pending.calleeSocketId) {
+          io.to(pending.calleeSocketId).emit('call:ended', {
+            callId: callData.callId,
+            endedBy: pending.initiatorUserId,
+            reason: 'ring_timeout',
+            code: 'NO_ANSWER',
+          });
+        }
+
+        try {
+          const checkCall = await Call.findById(callData.callId);
+          if (
+            checkCall &&
+            ['pending', 'ringing', 'initiated'].includes(checkCall.status)
+          ) {
+            await Call.updateStatus(callData.callId, 'missed');
+          }
+        } catch (err) {
+          console.error(
+            `[SOCKET] listener_call:initiate no-answer status update failed for ${callData.callId}:`,
+            err.message,
+          );
+        }
+      }, LISTENER_TO_USER_RING_TIMEOUT_MS);
+
+      pendingCalls.set(callData.callId, {
+        initiatorUserId: listenerUserId,
+        calleeUserId: targetUserId,
+        listenerUserId,
+        calleeSocketId: targetSocketId,
+        createdAt: Date.now(),
+        timeoutId: pendingTimeoutId,
+      });
+      console.log(`[SOCKET] listener_call:initiate: Tracking pending call ${callData.callId}`);
+    }
+
+    // Forward incoming-call to user IMMEDIATELY
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('incoming-call', callData);
+    }
+    console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€œ Forwarded to user ${targetUserId} (socket: ${targetSocketId})`);
+
+    const targetFcmToken = targetUser?.fcm_token ? String(targetUser.fcm_token).trim() : '';
+    if (targetUser && targetFcmToken) {
+      try {
+        console.log(`[SOCKET] listener_call:initiate: Sending FCM Push to user ${targetUserId}`);
+        
+        // Fetch listener details for notification
+        let listenerName = 'Experts';
+        let listenerAvatar = '';
+        try {
+           const listenerObj = await Listener.findByUserId(socket.userId);
+           if (listenerObj) {
+             listenerName = listenerObj.professional_name || listenerObj.full_name || 'Experts';
+             listenerAvatar = listenerObj.profile_image || '';
+           }
+        } catch (e) {}
+
+        const pushData = {
+          type: 'incoming_call',
+          callId: String(callData.callId || ''),
+          callerId: String(socket.userId || ''), // Listener is the caller from User perspective
+          callerName: String(listenerName),
+          callerAvatar: String(listenerAvatar),
+          listenerId: String(callData.listenerId || ''),
+          listener_id: String(callData.listenerId || ''),
+          channelName: String(callData.channelName || ''),
+          callType: String(callData.callType || 'audio'),
+          ratePerMinute: String(callData.ratePerMinute || '0')
+        };
+
+        const pushResult = await sendPushFCM(
+          targetFcmToken, 
+          'Incoming Call', 
+          `${listenerName} is calling you`, 
+          pushData
+        );
+        if (!pushResult?.success) {
+          console.error(
+            `[SOCKET] listener_call:initiate: FCM Push failed for user ${targetUserId}: ${pushResult?.error || 'Unknown FCM error'}`,
+          );
+          if (pushResult?.isInvalidToken) {
+            await User.clearFcmToken(targetUserId, targetFcmToken);
+          }
+        }
+        if (pushResult?.success) {
+        }
+        console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€œ FCM Push sent successfully to user ${targetUserId}`);
       } catch (fcmErr) {
-        console.error('[SOCKET] listener_call:initiate FCM failed:', fcmErr.message);
+        console.error(`[SOCKET] listener_call:initiate: Ã¢Å“â€” FCM Push failed:`, fcmErr.message);
       }
     }
   });
@@ -1059,29 +953,10 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (_isBusyForAnotherCall(callerId, callId) ||
-        _isBusyForAnotherCall(listenerUserId || socket.userId, callId)) {
-      socket.emit('call:busy', {
-        callId,
-        reason: 'call_busy',
-        message: 'This person is currently on another call.',
-      });
-      const callerSocketId = connectedUsers.get(callerId);
-      if (callerSocketId) {
-        io.to(callerSocketId).emit('call:busy', {
-          callId,
-          reason: 'call_busy',
-          message: 'This person is currently on another call.',
-        });
-      }
-      if (callId) Call.updateStatus(callId, 'cancelled').catch(() => {});
-      return;
-    }
-
     // BUSY: Mark BOTH parties as busy in memory.
     [listenerUserId, callerId].forEach(uid => {
       if (!uid) return;
-      busyListeners.set(uid, callId);
+      busyUsers.set(uid, callId);
       io.emit('listener_busy_status', {
         listenerUserId: uid,
         busy: true,
@@ -1113,7 +988,7 @@ io.on('connection', (socket) => {
         serverTime: serverTimestamp,
       });
     } else {
-      _clearBusyForCall(listenerUserId || socket.userId, callerId, callId);
+      _clearBusyForCall(listenerUserId || socket.userId, callerId);
       socket.emit('call:ended', {
         callId,
         endedBy: callerId,
@@ -1129,12 +1004,6 @@ io.on('connection', (socket) => {
 
     const pending = clearPendingCall(callId);
     const listenerUserId = pending?.listenerUserId || socket.userId;
-
-    // BUSY: Clear busy for BOTH parties since the call was rejected (never connected)
-    _clearBusyForCall(callerId, socket.userId, callId);
-    if (pending) {
-      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId, callId);
-    }
 
     const callerSocketId = connectedUsers.get(callerId);
     if (callerSocketId) {
@@ -1251,8 +1120,8 @@ io.on('connection', (socket) => {
 
               // Clear busy status for both parties
               channelUsers.forEach(uid => {
-                if (busyListeners.has(uid)) {
-                  busyListeners.delete(uid);
+                if (busyUsers.has(uid)) {
+                  busyUsers.delete(uid);
                   io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
                   Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusy timer error:', e.message));
                 }
@@ -1288,8 +1157,6 @@ io.on('connection', (socket) => {
                 });
               }
             });
-            channelUsers.forEach(uid => _clearBusyForCall(uid, null, callId));
-            activeChannels.delete(channelName);
           }
         } catch (err) {
           console.error(`[SOCKET] Error in call:joined handler for call ${callId}:`, err);
@@ -1323,7 +1190,7 @@ io.on('connection', (socket) => {
     }
     
     // BUSY: Clear busy for both parties (whichever is the listener)
-    _clearBusyForCall(endedBy, otherUserId, callId);
+    _clearBusyForCall(endedBy, otherUserId);
 
     const notifiedSocketIds = new Set();
     const notifyCallEnded = (targetUserId, extra = {}) => {
@@ -1347,7 +1214,6 @@ io.on('connection', (socket) => {
     const pending = pendingCalls.get(callId);
     if (pending) {
       clearPendingCall(callId);
-      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId, callId);
       notifyCallEnded(pending.calleeUserId, {
         reason: endReason || 'caller_cancelled',
       });
@@ -1364,7 +1230,6 @@ io.on('connection', (socket) => {
     for (const [channelName, users] of activeChannels.entries()) {
       if (candidateChannelNames.has(channelName) || users.has(endedBy) || users.has(otherUserId)) {
         users.forEach(uid => notifyCallEnded(uid, { channelName }));
-        users.forEach(uid => _clearBusyForCall(uid, null, callId));
         activeChannels.delete(channelName);
         console.log(`[SOCKET] call:end: Cleared active channel ${channelName}`);
       }
@@ -1748,7 +1613,6 @@ io.on('connection', (socket) => {
             console.error(`[SOCKET] disconnect: Safety billing error for call ${callId}:`, e.message);
           }
         })();
-        _clearBusyForCall(timerData.callerId, timerData.listenerUserId, callId);
       }
     }
 
@@ -1759,8 +1623,8 @@ io.on('connection', (socket) => {
       console.log(`[SOCKET] Listener marked offline: ${listenerUserId}`);
       
       // BUSY: Clear busy on disconnect (safety net)
-      if (busyListeners.has(listenerUserId)) {
-        busyListeners.delete(listenerUserId);
+      if (busyUsers.has(listenerUserId)) {
+        busyUsers.delete(listenerUserId);
         io.emit('listener_busy_status', { listenerUserId, busy: false });
         console.log(`[SOCKET] Listener ${listenerUserId} busy cleared on disconnect`);
         Listener.clearBusyByUserId(listenerUserId).catch(e => console.error('[SOCKET] clearBusyByUserId on disconnect error:', e.message));
@@ -1770,8 +1634,8 @@ io.on('connection', (socket) => {
     // Handle user cleanup and active calls
     if (userId) {
       // BUSY: Clear busy if this userId is a busy listener (covers both listenerUserId and userId)
-      if (busyListeners.has(userId)) {
-        busyListeners.delete(userId);
+      if (busyUsers.has(userId)) {
+        busyUsers.delete(userId);
         io.emit('listener_busy_status', { listenerUserId: userId, busy: false });
         console.log(`[SOCKET] User ${userId} busy cleared on disconnect (userId path)`);
         Listener.clearBusyByUserId(userId).catch(e => console.error('[SOCKET] clearBusyByUserId on disconnect error:', e.message));
@@ -1789,7 +1653,6 @@ io.on('connection', (socket) => {
               reason: 'caller_disconnected',
             });
           }
-          _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId, callId);
           clearPendingCall(callId);
         }
       }
@@ -1809,8 +1672,8 @@ io.on('connection', (socket) => {
               }
             }
           });
-          users.forEach(uid => _clearBusyForCall(uid, null, channelName));
-          activeChannels.delete(channelName);
+          users.delete(userId);
+          if (users.size === 0) activeChannels.delete(channelName);
         }
       }
 

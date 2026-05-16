@@ -120,11 +120,7 @@ router.get('/', async (req, res) => {
       params
     );
 
-    const busyMap = req.app.get('busyListeners');
-    const excludeBusy = req.query.exclude_busy?.toString().trim() === 'true';
-    const users = excludeBusy && busyMap
-      ? result.rows.filter((user) => !busyMap.has(user.user_id))
-      : result.rows;
+    const users = result.rows;
     res.json(users);
   } catch (error) {
     console.error('Get users error:', error);
