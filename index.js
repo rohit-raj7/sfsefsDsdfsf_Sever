@@ -150,8 +150,8 @@ app.use('/api/marketing', marketingRoutes);
 
 
 // In-memory maps
-const connectedUsers = new Map(); // Map of userId -> socketId
-const listenerSockets = new Map(); // Map of listenerUserId -> socketId
+const connectedUsers = new Map(); // Map of userId -> Set of socketIds
+const listenerSockets = new Map(); // Map of listenerUserId -> Set of socketIds
 const activeChannels = new Map(); // Map of channelName -> Set of userIds in channel
 const lastSeenMap = new Map(); // Map of userId -> timestamp
 const presenceTimeouts = new Map(); // Map of userId -> timeoutId
@@ -247,9 +247,13 @@ io.on('connection', (socket) => {
 
   function _markUserOffline(userId, reason = 'offline') {
     if (!userId) return false;
-    const currentSocketId = connectedUsers.get(userId);
-    if (!currentSocketId || currentSocketId !== socket.id) {
+    const sockets = connectedUsers.get(userId);
+    if (!sockets || !sockets.has(socket.id)) {
       return false;
+    }
+    sockets.delete(socket.id);
+    if (sockets.size > 0) {
+      return false; // Still has other active sockets
     }
 
     connectedUsers.delete(userId);
@@ -270,9 +274,13 @@ io.on('connection', (socket) => {
 
   function _markListenerOffline(listenerUserId, reason = 'offline') {
     if (!listenerUserId) return false;
-    const currentSocketId = listenerSockets.get(listenerUserId);
-    if (!currentSocketId || currentSocketId !== socket.id) {
+    const sockets = listenerSockets.get(listenerUserId);
+    if (!sockets || !sockets.has(socket.id)) {
       return false;
+    }
+    sockets.delete(socket.id);
+    if (sockets.size > 0) {
+      return false; // Still has other active sockets
     }
 
     listenerSockets.delete(listenerUserId);
@@ -305,7 +313,8 @@ io.on('connection', (socket) => {
     socket.userId = userId;
     socket.userName = userName || 'Unknown';
     socket.userAvatar = userAvatar;
-    connectedUsers.set(userId, socket.id);
+    if (!connectedUsers.has(userId)) connectedUsers.set(userId, new Set());
+    connectedUsers.get(userId).add(socket.id);
     lastSeenMap.set(userId, Date.now());
     
     // Initialize or update user chat state (WhatsApp-style tracking)
@@ -343,19 +352,11 @@ io.on('connection', (socket) => {
     socket.userId = listenerUserId; // Sync with userId
     socket.listenerUserId = listenerUserId;
     
-    // Remove old socket if exists to prevent ghost sessions
-    if (listenerSockets.has(listenerUserId)) {
-      const oldSocketId = listenerSockets.get(listenerUserId);
-      if (oldSocketId && oldSocketId !== socket.id) {
-        console.log(`[SOCKET] listener:join: Removing old socket ${oldSocketId} for listener ${listenerUserId}`);
-        const oldSocket = io.sockets.sockets.get(oldSocketId);
-        if (oldSocket) oldSocket.disconnect(true);
-      }
-    }
-    
-    // Register listener as available for calls
-    listenerSockets.set(listenerUserId, socket.id);
-    connectedUsers.set(listenerUserId, socket.id); // Also ensure in connectedUsers
+    if (!listenerSockets.has(listenerUserId)) listenerSockets.set(listenerUserId, new Set());
+    listenerSockets.get(listenerUserId).add(socket.id);
+
+    if (!connectedUsers.has(listenerUserId)) connectedUsers.set(listenerUserId, new Set());
+    connectedUsers.get(listenerUserId).add(socket.id);
 
     // CRITICAL FIX: Update last_active_at in DB so the REST API call route
     // can confirm listener is online (it checks last_active_at <= 2 min)
@@ -368,7 +369,8 @@ io.on('connection', (socket) => {
 
     // Keep last_active_at fresh every 90s so calls always work while listener is connected
     const keepAliveInterval = setInterval(async () => {
-      if (!listenerSockets.has(listenerUserId) || listenerSockets.get(listenerUserId) !== socket.id) {
+      const sockets = listenerSockets.get(listenerUserId);
+      if (!sockets || !sockets.has(socket.id)) {
         clearInterval(keepAliveInterval);
         return;
       }
@@ -627,10 +629,10 @@ io.on('connection', (socket) => {
       return;
     }
 
-    let listenerSocketId = listenerSockets.get(listenerId);
+    let listenerSocketIds = listenerSockets.get(listenerId);
     
     console.log(`[SOCKET] call:initiate: Looking for listener ${listenerId}`);
-    console.log(`[SOCKET] call:initiate: Found socketId: ${listenerSocketId || 'NONE'}`);
+    console.log(`[SOCKET] call:initiate: Found socketId: ${listenerSocketIds ? Array.from(listenerSocketIds).join(',') : 'NONE'}`);
     
     // Fetch listener user to check for FCM token
     let listenerUser = null;
@@ -640,7 +642,7 @@ io.on('connection', (socket) => {
       console.error('[SOCKET] Error fetching listener user for FCM:', e);
     }
 
-    if (!listenerSocketId) {
+    if (!listenerSocketIds || listenerSocketIds.size === 0) {
       // Listener is offline for calls when the Online button is off or the app
       // is backgrounded/closed, even if FCM is available.
       console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} offline for calls`);
@@ -666,15 +668,17 @@ io.on('connection', (socket) => {
         initiatorUserId: socket.userId,
         calleeUserId: listenerId,
         listenerUserId: listenerId,
-        calleeSocketId: listenerSocketId,
+        calleeSocketId: listenerSocketIds ? Array.from(listenerSocketIds)[0] : null,
         createdAt: Date.now(),
       });
       console.log(`[SOCKET] call:initiate: Tracking pending call ${callData.callId}`);
     }
 
     // Forward incoming-call to listener IMMEDIATELY (don't block on DB)
-    if (listenerSocketId) {
-      io.to(listenerSocketId).emit('incoming-call', callData);
+    if (listenerSocketIds) {
+      for (const sid of listenerSocketIds) {
+        io.to(sid).emit('incoming-call', callData);
+      }
     }
     console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
 
@@ -798,10 +802,10 @@ io.on('connection', (socket) => {
       callData.listener_id = resolvedListenerDbId;
     }
     
-    let targetSocketId = connectedUsers.get(targetUserId);
+    let targetSocketIds = connectedUsers.get(targetUserId);
     
     console.log(`[SOCKET] listener_call:initiate: Looking for target user ${targetUserId}`);
-    console.log(`[SOCKET] listener_call:initiate: Found socketId: ${targetSocketId || 'NONE'}`);
+    console.log(`[SOCKET] listener_call:initiate: Found socketIds: ${targetSocketIds ? Array.from(targetSocketIds).join(',') : 'NONE'}`);
     
     // Fetch target user to check for FCM token
     let targetUser = null;
@@ -811,7 +815,7 @@ io.on('connection', (socket) => {
       console.error('[SOCKET] Error fetching target user for FCM:', e);
     }
 
-    if (!targetSocketId) {
+    if (!targetSocketIds || targetSocketIds.size === 0) {
       console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€” User ${targetUserId} offline for calls`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'user_offline' });
       return;
@@ -827,16 +831,18 @@ io.on('connection', (socket) => {
           `[SOCKET] listener_call:initiate: pending call ${callData.callId} timed out (no answer)`,
         );
 
-        const initiatorSocketId =
+        const initiatorSocketIds =
           connectedUsers.get(pending.initiatorUserId) ||
           listenerSockets.get(pending.initiatorUserId);
-        if (initiatorSocketId) {
-          io.to(initiatorSocketId).emit('call:ended', {
-            callId: callData.callId,
-            endedBy: pending.calleeUserId || targetUserId,
-            reason: 'no_answer',
-            code: 'NO_ANSWER',
-          });
+        if (initiatorSocketIds) {
+          for (const sid of initiatorSocketIds) {
+            io.to(sid).emit('call:ended', {
+              callId: callData.callId,
+              endedBy: pending.calleeUserId || targetUserId,
+              reason: 'no_answer',
+              code: 'NO_ANSWER',
+            });
+          }
         }
 
         if (pending.calleeSocketId) {
@@ -868,7 +874,7 @@ io.on('connection', (socket) => {
         initiatorUserId: listenerUserId,
         calleeUserId: targetUserId,
         listenerUserId,
-        calleeSocketId: targetSocketId,
+        calleeSocketId: targetSocketIds ? Array.from(targetSocketIds)[0] : null,
         createdAt: Date.now(),
         timeoutId: pendingTimeoutId,
       });
@@ -876,10 +882,12 @@ io.on('connection', (socket) => {
     }
 
     // Forward incoming-call to user IMMEDIATELY
-    if (targetSocketId) {
-      io.to(targetSocketId).emit('incoming-call', callData);
+    if (targetSocketIds) {
+      for (const sid of targetSocketIds) {
+        io.to(sid).emit('incoming-call', callData);
+      }
     }
-    console.log(`[SOCKET] listener_call:initiate: Ã¢Å“â€œ Forwarded to user ${targetUserId} (socket: ${targetSocketId})`);
+    console.log(`[SOCKET] listener_call:initiate: ✅ Forwarded to user ${targetUserId}`);
 
     const targetFcmToken = targetUser?.fcm_token ? String(targetUser.fcm_token).trim() : '';
     if (targetUser && targetFcmToken) {
