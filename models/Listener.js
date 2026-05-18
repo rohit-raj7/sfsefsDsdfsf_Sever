@@ -1036,6 +1036,21 @@ class Listener {
     return result.rows[0];
   }
 
+  // Set busy by user_id
+  static async setBusyByUserId(user_id) {
+    const query = `
+      UPDATE listeners
+      SET is_busy = TRUE, updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = $1 AND is_busy = FALSE
+      RETURNING listener_id, is_busy
+    `;
+    const result = await pool.query(query, [user_id]);
+    if (result.rows.length > 0) {
+      console.log(`[LISTENER] setBusyByUserId: user ${user_id} → busy=true`);
+    }
+    return result.rows[0];
+  }
+
   // Check if listener is busy
   static async isBusy(listener_id) {
     const query = `SELECT is_busy FROM listeners WHERE listener_id = $1`;

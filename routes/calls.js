@@ -378,11 +378,14 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
       } catch(e) {}
 
       [call.caller_id, listenerUserId].forEach(uid => {
-        if (uid && busyMap && busyMap.has(uid)) {
-          busyMap.delete(uid);
+        if (uid) {
+          if (busyMap && busyMap.has(uid)) {
+            busyMap.delete(uid);
+          }
           if (io) {
             io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
           }
+          Listener.clearBusyByUserId(uid).catch(() => {});
         }
       });
 
@@ -420,11 +423,14 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
       } catch(e) {}
 
       [call.caller_id, listenerUserId].forEach(uid => {
-        if (uid && busyMap && busyMap.has(uid)) {
-          busyMap.delete(uid);
+        if (uid) {
+          if (busyMap && busyMap.has(uid)) {
+            busyMap.delete(uid);
+          }
           if (io) {
             io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
           }
+          Listener.clearBusyByUserId(uid).catch(() => {});
         }
       });
     }
@@ -492,11 +498,14 @@ router.post('/end', authenticate, async (req, res) => {
     } catch(e) {}
 
     [call.caller_id, listenerUserId].forEach(uid => {
-      if (uid && busyMap && busyMap.has(uid)) {
-        busyMap.delete(uid);
+      if (uid) {
+        if (busyMap && busyMap.has(uid)) {
+          busyMap.delete(uid);
+        }
         if (io) {
           io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
         }
+        Listener.clearBusyByUserId(uid).catch(() => {});
       }
     });
 

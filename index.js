@@ -171,19 +171,6 @@ const clearPendingCall = (callId) => {
   return pending;
 };
 
-// Helper: check if a user is in an active call (busyUsers) or ringing/pending call (pendingCalls)
-const _isUserInCallOrRinging = (userId) => {
-  if (!userId) return false;
-  if (busyUsers.has(String(userId))) return true;
-  for (const pending of pendingCalls.values()) {
-    if (String(pending.initiatorUserId) === String(userId) || String(pending.calleeUserId) === String(userId)) {
-      return true;
-    }
-  }
-  return false;
-};
-
-
 // Ã¢â€â‚¬Ã¢â€â‚¬ Random User-to-User Match Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // When "Match with Verified Expert" toggle is OFF, users join this pool.
 // The server instantly pairs two waiting users and emits `random:matched` to both.
@@ -209,7 +196,6 @@ setInterval(() => {
     if (now - pending.createdAt > 60000) {
       console.log(`[SOCKET] Stale pendingCall ${callId} removed (age: ${Math.round((now - pending.createdAt) / 1000)}s)`);
       clearPendingCall(callId);
-      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
     }
   }
 }, 30000);
@@ -249,13 +235,48 @@ io.on('connection', (socket) => {
   // Helper: Clear busy status for a user (checks both parties)
   function _clearBusyForCall(userId1, userId2) {
     for (const uid of [userId1, userId2]) {
-      if (uid && busyUsers.has(uid)) {
-        busyUsers.delete(uid);
+      if (uid) {
+        if (busyUsers.has(uid)) {
+          busyUsers.delete(uid);
+        }
         io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
         console.log(`[SOCKET] _clearBusyForCall: Listener ${uid} marked NOT BUSY`);
         // Also clear in DB (fire-and-forget)
         Listener.clearBusyByUserId(uid).catch(e => console.error('[SOCKET] clearBusyByUserId DB error:', e.message));
       }
+    }
+  }
+
+  // Self-Healing DB reconciliation on client connect/reconnect
+  async function _syncUserBusyStateWithDatabase(userId) {
+    if (!userId) return;
+    try {
+      // Check if there is a truly active call in the DB
+      const activeCheck = await pool.query(
+        `SELECT call_id FROM calls 
+         WHERE (caller_id = $1 OR listener_id = (SELECT listener_id FROM listeners WHERE user_id = $1))
+           AND status IN ('pending', 'ringing', 'initiated', 'ongoing')
+         LIMIT 1`,
+        [userId]
+      );
+      if (activeCheck.rows.length === 0) {
+        // No active call in database. Heal memory and database states!
+        if (busyUsers.has(userId)) {
+          busyUsers.delete(userId);
+          console.log(`[SELF-HEAL] Purged stale busy memory for user ${userId}`);
+        }
+        io.emit('listener_busy_status', { listenerUserId: userId, busy: false });
+        await Listener.clearBusyByUserId(userId).catch(() => {});
+      } else {
+        // True active call exists. Ensure in-memory busy map is correct!
+        const activeCallId = activeCheck.rows[0].call_id;
+        busyUsers.set(userId, activeCallId);
+        io.emit('listener_busy_status', { listenerUserId: userId, busy: true });
+        console.log(`[SELF-HEAL] Validated active busy state for user ${userId} (Call: ${activeCallId})`);
+        await Listener.setBusyByUserId(userId).catch(() => {});
+      }
+    } catch (err) {
+      console.error('[SELF-HEAL] Failed to sync busy status with database:', err.message);
     }
   }
 
@@ -283,6 +304,10 @@ io.on('connection', (socket) => {
 
     io.emit('user:offline', { userId, timestamp: Date.now(), reason });
     console.log(`[SOCKET] User ${userId} marked offline (${reason})`);
+    
+    // Clear busy flag on complete offline
+    _clearBusyForCall(userId);
+    
     return true;
   }
 
@@ -305,6 +330,10 @@ io.on('connection', (socket) => {
       reason,
     });
     console.log(`[SOCKET] Listener ${listenerUserId} marked offline (${reason})`);
+    
+    // Clear busy flag on complete offline
+    _clearBusyForCall(listenerUserId);
+    
     return true;
   }
 
@@ -371,6 +400,9 @@ io.on('connection', (socket) => {
     socket.emit('listeners:initial_status', onlineListeners);
     socket.emit('users:initial_status', onlineUsers);
     socket.emit('listeners:initial_busy', Array.from(busyUsers.keys()));
+
+    // SELF-HEAL: Sync presence state with DB
+    _syncUserBusyStateWithDatabase(userId);
   });
 
   // Listener specific join (for availability tracking)
@@ -391,7 +423,7 @@ io.on('connection', (socket) => {
     // can confirm listener is online (it checks last_active_at <= 2 min)
     try {
       await Listener.updateLastActiveByUserId(listenerUserId);
-      console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Updated last_active_at for ${listenerUserId}`);
+      console.log(`[SOCKET] listener:join: ✅ Updated last_active_at for ${listenerUserId}`);
     } catch (err) {
       console.error(`[SOCKET] listener:join: Failed to update last_active_at:`, err.message);
     }
@@ -413,8 +445,11 @@ io.on('connection', (socket) => {
     io.emit('listener_status', { listenerUserId, online: true, timestamp: Date.now() });
     socket.emit('users:initial_status', Array.from(connectedUsers.keys()));
     socket.emit('listeners:initial_busy', Array.from(busyUsers.keys()));
-    console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Listener ${listenerUserId} is now ONLINE (socket: ${socket.id})`);
+    console.log(`[SOCKET] listener:join: ✅ Listener ${listenerUserId} is now ONLINE (socket: ${socket.id})`);
     console.log(`[SOCKET] listener:join: Total online listeners: ${listenerSockets.size}`);
+
+    // SELF-HEAL: Sync presence state with DB
+    _syncUserBusyStateWithDatabase(listenerUserId);
   });
 
   // Explicit offline events clear foreground/call presence while the socket can
@@ -442,8 +477,8 @@ io.on('connection', (socket) => {
     const { userId, displayName, avatarUrl, gender, preferredGender } = data || {};
     if (!userId) return;
 
-    if (_isUserInCallOrRinging(userId)) {
-      console.log(`[SOCKET] random:join_pool: ❌ User ${userId} is BUSY/RINGING`);
+    if (busyUsers.has(userId)) {
+      console.log(`[SOCKET] random:join_pool: ❌ User ${userId} is BUSY`);
       socket.emit('random:join_rejected', {
         reason: 'user_busy',
         message: 'You are currently on another call.',
@@ -518,7 +553,7 @@ io.on('connection', (socket) => {
     if (preferredGender && preferredGender !== 'Any') {
       for (const [waitingUserId, entry] of randomUserPool.entries()) {
         if (waitingUserId === userId) continue;
-        if (_isUserInCallOrRinging(waitingUserId)) {
+        if (busyUsers.has(waitingUserId)) {
           randomUserPool.delete(waitingUserId);
           continue;
         }
@@ -535,7 +570,7 @@ io.on('connection', (socket) => {
     if (!matchedUserId) {
       for (const [waitingUserId, entry] of randomUserPool.entries()) {
         if (waitingUserId === userId) continue;
-        if (_isUserInCallOrRinging(waitingUserId)) {
+        if (busyUsers.has(waitingUserId)) {
           randomUserPool.delete(waitingUserId);
           continue;
         }
@@ -612,32 +647,7 @@ io.on('connection', (socket) => {
   // Relaying random match calls (free user-to-user) without billing
   socket.on('random:call_invite', (data) => {
     const { targetUserId, channelName, callerName, callerAvatar } = data || {};
-    if (!targetUserId || !socket.userId) return;
-
-    // Check concurrency
-    if (_isUserInCallOrRinging(socket.userId) || _isUserInCallOrRinging(targetUserId)) {
-      console.log(`[RANDOM] random:call_invite: Concurrency reject from ${socket.userId} to ${targetUserId}`);
-      socket.emit('call:failed', {
-        callId: channelName,
-        reason: 'caller_busy',
-        message: 'One of the participants is already in a call.'
-      });
-      return;
-    }
-
-    // Proactively mark both as busy in busyUsers
-    [socket.userId, targetUserId].forEach(uid => {
-      busyUsers.set(uid, channelName);
-      io.emit('listener_busy_status', { listenerUserId: uid, busy: true });
-      console.log(`[SOCKET] random:call_invite: User ${uid} marked BUSY`);
-      // Update in DB
-      Listener.setBusyByUserId(uid).catch(e => console.error('[SOCKET] random:call_invite setBusyByUserId DB error:', e.message));
-    });
-
-    // Proactively remove both from random match pool
-    randomUserPool.delete(socket.userId);
-    randomUserPool.delete(targetUserId);
-
+    if (!targetUserId) return;
     const targetSocketId = connectedUsers.get(targetUserId) || listenerSockets.get(targetUserId);
     if (targetSocketId) {
       _emitToTargetSockets(targetSocketId, 'random:call_invite', {
@@ -645,7 +655,7 @@ io.on('connection', (socket) => {
         callerName,
         callerAvatar,
       });
-      console.log(`[RANDOM] Call invite from ${socket.userId} to ${targetUserId} initiated`);
+      console.log(`[RANDOM] Call invite from ${socket.userId} to ${targetUserId}`);
     }
   });
 
@@ -681,8 +691,8 @@ io.on('connection', (socket) => {
     const { listenerId, ...callData } = data || {};
     
     // CALLER BUSY CHECK
-    if (socket.userId && _isUserInCallOrRinging(socket.userId)) {
-      console.log(`[SOCKET] call:initiate: ❌ Caller ${socket.userId} is already BUSY/RINGING`);
+    if (socket.userId && busyUsers.has(socket.userId)) {
+      console.log(`[SOCKET] call:initiate: ❌ Caller ${socket.userId} is already BUSY`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'caller_busy', message: 'You are already in a call' });
       return;
     }
@@ -708,9 +718,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // BUSY CHECK: If listener is already in an active or pending call, notify caller
-    if (_isUserInCallOrRinging(listenerId)) {
-      console.log(`[SOCKET] call:initiate: ❌ Listener ${listenerId} is BUSY/RINGING`);
+    // BUSY CHECK: If listener is already in an active call, notify caller
+    if (busyUsers.has(listenerId)) {
+      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} is BUSY (active call: ${busyUsers.get(listenerId)})`);
       socket.emit('call:busy', {
         callId: callData.callId,
         listenerId,
@@ -729,22 +739,7 @@ io.on('connection', (socket) => {
         calleeSocketId: listenerSocketIds ? Array.from(listenerSocketIds)[0] : null,
         createdAt: Date.now(),
       });
-      
-      // Proactively mark both caller and listener as busy/ringing
-      [socket.userId, listenerId].forEach(uid => {
-        if (!uid) return;
-        busyUsers.set(uid, callData.callId);
-        io.emit('listener_busy_status', { listenerUserId: uid, busy: true });
-        
-        // Remove from random matchmaking pool to prevent concurrency conflicts during ringing
-        if (randomUserPool.has(uid)) {
-          const entry = randomUserPool.get(uid);
-          if (entry.timeoutId) clearTimeout(entry.timeoutId);
-          randomUserPool.delete(uid);
-        }
-      });
-      
-      console.log(`[SOCKET] call:initiate: Proactively marked caller ${socket.userId} and listener ${listenerId} as busy/ringing`);
+      console.log(`[SOCKET] call:initiate: Tracking pending call ${callData.callId}`);
     }
 
     // Forward incoming-call to listener IMMEDIATELY (don't block on DB)
@@ -836,15 +831,15 @@ io.on('connection', (socket) => {
     const listenerUserId = socket.listenerUserId || socket.userId;
 
     // CALLER BUSY CHECK
-    if (listenerUserId && _isUserInCallOrRinging(listenerUserId)) {
-      console.log(`[SOCKET] listener_call:initiate: ❌ Caller ${listenerUserId} is already BUSY/RINGING`);
+    if (listenerUserId && busyUsers.has(listenerUserId)) {
+      console.log(`[SOCKET] listener_call:initiate: ❌ Caller ${listenerUserId} is already BUSY`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'caller_busy', message: 'You are already in a call' });
       return;
     }
 
     // TARGET BUSY CHECK
-    if (targetUserId && _isUserInCallOrRinging(targetUserId)) {
-      console.log(`[SOCKET] listener_call:initiate: ❌ Target user ${targetUserId} is BUSY/RINGING`);
+    if (targetUserId && busyUsers.has(targetUserId)) {
+      console.log(`[SOCKET] listener_call:initiate: ❌ Target user ${targetUserId} is BUSY`);
       socket.emit('call:busy', { callId: callData.callId, reason: 'user_busy', message: 'User is busy on another call' });
       return;
     }
@@ -900,9 +895,6 @@ io.on('connection', (socket) => {
         const pending = clearPendingCall(callData.callId);
         if (!pending) return;
 
-        // Clear busy status for both parties
-        _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
-
         console.log(
           `[SOCKET] listener_call:initiate: pending call ${callData.callId} timed out (no answer)`,
         );
@@ -954,22 +946,7 @@ io.on('connection', (socket) => {
         createdAt: Date.now(),
         timeoutId: pendingTimeoutId,
       });
-
-      // Proactively mark both listener and target user as busy/ringing
-      [listenerUserId, targetUserId].forEach(uid => {
-        if (!uid) return;
-        busyUsers.set(uid, callData.callId);
-        io.emit('listener_busy_status', { listenerUserId: uid, busy: true });
-        
-        // Remove from random matchmaking pool to prevent concurrency conflicts during ringing
-        if (randomUserPool.has(uid)) {
-          const entry = randomUserPool.get(uid);
-          if (entry.timeoutId) clearTimeout(entry.timeoutId);
-          randomUserPool.delete(uid);
-        }
-      });
-
-      console.log(`[SOCKET] listener_call:initiate: Proactively marked listener ${listenerUserId} and target user ${targetUserId} as busy/ringing`);
+      console.log(`[SOCKET] listener_call:initiate: Tracking pending call ${callData.callId}`);
     }
 
     // Forward incoming-call to user IMMEDIATELY
@@ -1053,14 +1030,7 @@ io.on('connection', (socket) => {
     }
 
     // BUSY: Mark BOTH parties as busy in memory.
-    const uids = new Set();
-    if (socket.userId) uids.add(String(socket.userId));
-    if (callerId) uids.add(String(callerId));
-    if (listenerUserId) uids.add(String(listenerUserId));
-    if (pending?.initiatorUserId) uids.add(String(pending.initiatorUserId));
-    if (pending?.calleeUserId) uids.add(String(pending.calleeUserId));
-
-    Array.from(uids).forEach(uid => {
+    [listenerUserId, callerId].forEach(uid => {
       if (!uid) return;
       busyUsers.set(uid, callId);
       io.emit('listener_busy_status', {
@@ -1119,10 +1089,6 @@ io.on('connection', (socket) => {
 
     const pending = clearPendingCall(callId);
     const listenerUserId = pending?.listenerUserId || socket.userId;
-    const targetUserId = pending?.calleeUserId || callerId;
-
-    // Clear busy status for both parties
-    _clearBusyForCall(listenerUserId, targetUserId);
 
     const callerSocketId = connectedUsers.get(callerId);
     if (callerSocketId) {
@@ -1263,7 +1229,7 @@ io.on('connection', (socket) => {
             });
             console.log(`[SOCKET] Call ${callId}: auto-disconnect timer set for ${maxAllowedSeconds + 3}s`);
           } else {
-            // Zero balance Ã¢â‚¬â€ disconnect immediately
+            // Zero balance — disconnect immediately
             console.log(`[SOCKET] Call ${callId}: zero allowed duration, disconnecting immediately`);
             channelUsers.forEach(uid => {
               const sid = connectedUsers.get(uid);
@@ -1308,8 +1274,27 @@ io.on('connection', (socket) => {
       console.log(`[SOCKET] call:end: Cleared auto-disconnect timer for call ${callId}`);
     }
     
-    // BUSY: Clear busy for both parties (whichever is the listener)
-    _clearBusyForCall(endedBy, otherUserId);
+    // Dynamic participant resolution to guarantee complete busy state purging
+    const resolvedParticipantIds = new Set();
+    if (endedBy) resolvedParticipantIds.add(String(endedBy));
+    if (otherUserId) resolvedParticipantIds.add(String(otherUserId));
+
+    if (endTimerData) {
+      if (endTimerData.callerId) resolvedParticipantIds.add(String(endTimerData.callerId));
+      if (endTimerData.listenerUserId) resolvedParticipantIds.add(String(endTimerData.listenerUserId));
+    }
+
+    const pending = pendingCalls.get(callId);
+    if (pending) {
+      if (pending.initiatorUserId) resolvedParticipantIds.add(String(pending.initiatorUserId));
+      if (pending.calleeUserId) resolvedParticipantIds.add(String(pending.calleeUserId));
+      if (pending.listenerUserId) resolvedParticipantIds.add(String(pending.listenerUserId));
+    }
+
+    // Un-busy all resolved participants instantly
+    for (const uid of resolvedParticipantIds) {
+      _clearBusyForCall(uid);
+    }
 
     const notifiedSocketIds = new Set();
     const notifyCallEnded = (targetUserId, extra = {}) => {
@@ -1333,13 +1318,9 @@ io.on('connection', (socket) => {
     notifyCallEnded(otherUserId);
     
     // 2. Check pendingCalls Ã¢â‚¬â€ caller cancelled BEFORE listener answered
-    const pending = pendingCalls.get(callId);
+
     if (pending) {
       clearPendingCall(callId);
-      
-      // Clear busy status for both parties
-      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
-
       notifyCallEnded(pending.calleeUserId, {
         reason: endReason || 'caller_cancelled',
       });
@@ -1732,6 +1713,23 @@ io.on('connection', (socket) => {
         clearTimeout(timerData.timerId);
         activeCallTimers.delete(callId);
         console.log(`[SOCKET] disconnect: Cleared timer for call ${callId} (${isCaller ? 'caller' : 'listener'} disconnected)`);
+        
+        // Notify the other peer that their partner disconnected during ongoing call
+        const otherPeerId = isCaller ? timerData.listenerUserId : timerData.callerId;
+        if (otherPeerId) {
+          const otherSockets = connectedUsers.get(otherPeerId) || listenerSockets.get(otherPeerId);
+          if (otherSockets) {
+            _emitToTargetSockets(otherSockets, 'call:ended', {
+              callId,
+              endedBy: userId,
+              reason: 'peer_disconnected',
+            });
+          }
+        }
+
+        // Clear busy status for both participants in memory & DB
+        _clearBusyForCall(timerData.callerId, timerData.listenerUserId);
+
         // Trigger billing safety net for disconnected calls
         (async () => {
           try {
@@ -1774,19 +1772,27 @@ io.on('connection', (socket) => {
         Listener.clearBusyByUserId(userId).catch(e => console.error('[SOCKET] clearBusyByUserId on disconnect error:', e.message));
       }
 
-      // PENDING CALLS: If this user was a caller who disconnected during ringing,
-      // notify the callee and clean up.
+      // PENDING CALLS: If this user was caller or callee who disconnected during ringing,
+      // notify the other participant and clean up.
       for (const [callId, pending] of pendingCalls.entries()) {
-        if (String(pending.initiatorUserId) === String(userId)) {
-          console.log(`[SOCKET] Caller ${userId} disconnected during pending call ${callId}, notifying callee`);
-          if (pending.calleeSocketId) {
-            io.to(pending.calleeSocketId).emit('call:ended', {
-              callId,
-              endedBy: userId,
-              reason: 'caller_disconnected',
-            });
+        const isCaller = String(pending.initiatorUserId) === String(userId);
+        const isCallee = String(pending.calleeUserId) === String(userId);
+        if (isCaller || isCallee) {
+          console.log(`[SOCKET] ${isCaller ? 'Caller' : 'Callee'} ${userId} disconnected during pending call ${callId}, notifying peer`);
+          
+          const peerId = isCaller ? pending.calleeUserId : pending.initiatorUserId;
+          if (peerId) {
+            const peerSockets = connectedUsers.get(peerId) || listenerSockets.get(peerId);
+            if (peerSockets) {
+              _emitToTargetSockets(peerSockets, 'call:ended', {
+                callId,
+                endedBy: userId,
+                reason: isCaller ? 'caller_disconnected' : 'callee_disconnected',
+              });
+            }
           }
           clearPendingCall(callId);
+          _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
         }
       }
 
@@ -1890,18 +1896,27 @@ async function startServer() {
       process.exit(1);
     }
 
-    // PRODUCTION SAFETY: Clear all stale is_busy flags on startup.
-    // If the server crashed or restarted, listeners may be stuck as busy.
+    // PRODUCTION SAFETY: Clear all stale is_busy flags and fail stuck active calls on startup.
+    // If the server crashed or restarted, listeners may be stuck as busy, and active calls stuck.
     try {
       const { pool: startupPool } = await import('./db.js');
       const cleared = await startupPool.query(
-        `UPDATE listeners SET is_busy = FALSE WHERE is_busy = TRUE RETURNING listener_id`
+        'UPDATE listeners SET is_busy = FALSE WHERE is_busy = TRUE RETURNING listener_id'
       );
       if (cleared.rowCount > 0) {
-        console.log(`Ã°Å¸Â§Â¹ Cleared ${cleared.rowCount} stale busy flag(s) on startup:`, cleared.rows.map(r => r.listener_id));
+        console.log(`🧹 Cleared ${cleared.rowCount} stale busy flag(s) on startup:`, cleared.rows.map(r => r.listener_id));
+      }
+
+      const clearedCalls = await startupPool.query(
+        `UPDATE calls SET status = 'failed', ended_at = CURRENT_TIMESTAMP 
+         WHERE (status IN ('pending', 'ringing', 'initiated') AND created_at < NOW() - INTERVAL '2 minutes')
+            OR (status = 'ongoing' AND started_at < NOW() - INTERVAL '1 hour')`
+      );
+      if (clearedCalls.rowCount > 0) {
+        console.log(`🧹 Failed ${clearedCalls.rowCount} stuck active call(s) in DB on startup.`);
       }
     } catch (err) {
-      console.error('Ã¢Å¡Â Ã¯Â¸Â  Failed to clear stale busy flags:', err.message);
+      console.error('⚠️  Failed to clear stale busy flags / stuck calls on startup:', err.message);
     }
 
     const listenWithFallback = (initialPort, attempts = 8) =>
