@@ -209,6 +209,7 @@ setInterval(() => {
     if (now - pending.createdAt > 60000) {
       console.log(`[SOCKET] Stale pendingCall ${callId} removed (age: ${Math.round((now - pending.createdAt) / 1000)}s)`);
       clearPendingCall(callId);
+      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
     }
   }
 }, 30000);
@@ -728,7 +729,22 @@ io.on('connection', (socket) => {
         calleeSocketId: listenerSocketIds ? Array.from(listenerSocketIds)[0] : null,
         createdAt: Date.now(),
       });
-      console.log(`[SOCKET] call:initiate: Tracking pending call ${callData.callId}`);
+      
+      // Proactively mark both caller and listener as busy/ringing
+      [socket.userId, listenerId].forEach(uid => {
+        if (!uid) return;
+        busyUsers.set(uid, callData.callId);
+        io.emit('listener_busy_status', { listenerUserId: uid, busy: true });
+        
+        // Remove from random matchmaking pool to prevent concurrency conflicts during ringing
+        if (randomUserPool.has(uid)) {
+          const entry = randomUserPool.get(uid);
+          if (entry.timeoutId) clearTimeout(entry.timeoutId);
+          randomUserPool.delete(uid);
+        }
+      });
+      
+      console.log(`[SOCKET] call:initiate: Proactively marked caller ${socket.userId} and listener ${listenerId} as busy/ringing`);
     }
 
     // Forward incoming-call to listener IMMEDIATELY (don't block on DB)
@@ -884,6 +900,9 @@ io.on('connection', (socket) => {
         const pending = clearPendingCall(callData.callId);
         if (!pending) return;
 
+        // Clear busy status for both parties
+        _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
+
         console.log(
           `[SOCKET] listener_call:initiate: pending call ${callData.callId} timed out (no answer)`,
         );
@@ -935,7 +954,22 @@ io.on('connection', (socket) => {
         createdAt: Date.now(),
         timeoutId: pendingTimeoutId,
       });
-      console.log(`[SOCKET] listener_call:initiate: Tracking pending call ${callData.callId}`);
+
+      // Proactively mark both listener and target user as busy/ringing
+      [listenerUserId, targetUserId].forEach(uid => {
+        if (!uid) return;
+        busyUsers.set(uid, callData.callId);
+        io.emit('listener_busy_status', { listenerUserId: uid, busy: true });
+        
+        // Remove from random matchmaking pool to prevent concurrency conflicts during ringing
+        if (randomUserPool.has(uid)) {
+          const entry = randomUserPool.get(uid);
+          if (entry.timeoutId) clearTimeout(entry.timeoutId);
+          randomUserPool.delete(uid);
+        }
+      });
+
+      console.log(`[SOCKET] listener_call:initiate: Proactively marked listener ${listenerUserId} and target user ${targetUserId} as busy/ringing`);
     }
 
     // Forward incoming-call to user IMMEDIATELY
@@ -1019,7 +1053,14 @@ io.on('connection', (socket) => {
     }
 
     // BUSY: Mark BOTH parties as busy in memory.
-    [listenerUserId, callerId].forEach(uid => {
+    const uids = new Set();
+    if (socket.userId) uids.add(String(socket.userId));
+    if (callerId) uids.add(String(callerId));
+    if (listenerUserId) uids.add(String(listenerUserId));
+    if (pending?.initiatorUserId) uids.add(String(pending.initiatorUserId));
+    if (pending?.calleeUserId) uids.add(String(pending.calleeUserId));
+
+    Array.from(uids).forEach(uid => {
       if (!uid) return;
       busyUsers.set(uid, callId);
       io.emit('listener_busy_status', {
@@ -1078,6 +1119,10 @@ io.on('connection', (socket) => {
 
     const pending = clearPendingCall(callId);
     const listenerUserId = pending?.listenerUserId || socket.userId;
+    const targetUserId = pending?.calleeUserId || callerId;
+
+    // Clear busy status for both parties
+    _clearBusyForCall(listenerUserId, targetUserId);
 
     const callerSocketId = connectedUsers.get(callerId);
     if (callerSocketId) {
@@ -1291,6 +1336,10 @@ io.on('connection', (socket) => {
     const pending = pendingCalls.get(callId);
     if (pending) {
       clearPendingCall(callId);
+      
+      // Clear busy status for both parties
+      _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
+
       notifyCallEnded(pending.calleeUserId, {
         reason: endReason || 'caller_cancelled',
       });

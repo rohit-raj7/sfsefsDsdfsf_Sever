@@ -132,6 +132,24 @@ router.post('/', authenticate, async (req, res) => {
           console.log(`[CALLS] Call ${call.call_id} timed out after 45s. Forcing fail.`);
           await Call.updateStatus(call.call_id, 'failed');
           try { await Listener.clearBusy(listener_id); } catch (e) { }
+
+          // Clean up socket busy map
+          const busyMap = req.app.get('busyUsers');
+          const io = req.app.get('io');
+          let listenerUserId = null;
+          try {
+            const listenerObj = await Listener.findById(listener_id);
+            listenerUserId = listenerObj?.user_id;
+          } catch(e) {}
+
+          [req.userId, listenerUserId].forEach(uid => {
+            if (uid && busyMap && busyMap.has(uid)) {
+              busyMap.delete(uid);
+              if (io) {
+                io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+              }
+            }
+          });
         }
       } catch (err) {
         console.error('[CALLS] Auto-timeout error:', err);
@@ -243,6 +261,18 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
         ) {
           console.log(`[CALLS] Listener-initiated call ${call.call_id} timed out after 45s.`);
           await Call.updateStatus(call.call_id, 'failed');
+
+          // Clean up socket busy map
+          const busyMap = req.app.get('busyUsers');
+          const io = req.app.get('io');
+          [target_user_id, req.userId].forEach(uid => {
+            if (uid && busyMap && busyMap.has(uid)) {
+              busyMap.delete(uid);
+              if (io) {
+                io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
+              }
+            }
+          });
         }
       } catch (err) {
         console.error('[CALLS] Auto-timeout error:', err);
@@ -341,7 +371,13 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
       // Clear user and listener busy status from memory and notify
       const busyMap = req.app.get('busyUsers');
       const io = req.app.get('io');
-      [call.caller_id, call.listener_id].forEach(uid => {
+      let listenerUserId = null;
+      try {
+        const listenerObj = await Listener.findById(call.listener_id);
+        listenerUserId = listenerObj?.user_id;
+      } catch(e) {}
+
+      [call.caller_id, listenerUserId].forEach(uid => {
         if (uid && busyMap && busyMap.has(uid)) {
           busyMap.delete(uid);
           if (io) {
@@ -371,7 +407,7 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
     // BUSY: Set busy when call becomes ongoing, clear on terminal states
     if (status === 'ongoing') {
       try { await Listener.setBusy(call.listener_id); } catch (e) { console.error('[CALLS] setBusy error:', e.message); }
-    } else if (['rejected', 'missed', 'cancelled'].includes(status)) {
+    } else if (['rejected', 'missed', 'cancelled', 'failed'].includes(status)) {
       try { await Listener.clearBusy(call.listener_id); } catch (e) { console.error('[CALLS] clearBusy error:', e.message); }
       
       // Clear user and listener busy status from memory and notify
