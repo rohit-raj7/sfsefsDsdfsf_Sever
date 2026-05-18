@@ -161,23 +161,6 @@ const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, list
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
 const LISTENER_TO_USER_RING_TIMEOUT_MS = 32000;
-const LISTENER_SOCKET_REAPER_MS = 10000;
-
-function emitListenerOfflinePresence(listenerUserId, reason = 'offline') {
-  if (!listenerUserId) return;
-  io.emit('listener_status', {
-    listenerUserId,
-    online: false,
-    timestamp: Date.now(),
-    reason,
-  });
-  Listener.clearLastActiveByUserId(listenerUserId).catch((err) => {
-    console.error(
-      `[SOCKET] Failed to clear listener last_active_at for ${listenerUserId}:`,
-      err.message,
-    );
-  });
-}
 
 const clearPendingCall = (callId) => {
   const pending = pendingCalls.get(callId);
@@ -187,32 +170,6 @@ const clearPendingCall = (callId) => {
   pendingCalls.delete(callId);
   return pending;
 };
-
-// Safety reaper: if disconnect callbacks are delayed/missed, drop stale socket IDs
-// so listeners do not remain online after app/process kill.
-setInterval(() => {
-  for (const [listenerUserId, sockets] of listenerSockets.entries()) {
-    if (!(sockets instanceof Set) || sockets.size === 0) {
-      listenerSockets.delete(listenerUserId);
-      emitListenerOfflinePresence(listenerUserId, 'stale_cleanup');
-      continue;
-    }
-
-    for (const sid of Array.from(sockets)) {
-      if (!io.sockets.sockets.has(sid)) {
-        sockets.delete(sid);
-      }
-    }
-
-    if (sockets.size === 0) {
-      listenerSockets.delete(listenerUserId);
-      emitListenerOfflinePresence(listenerUserId, 'stale_cleanup');
-      console.log(
-        `[SOCKET] Reaped stale listener presence for ${listenerUserId}`,
-      );
-    }
-  }
-}, LISTENER_SOCKET_REAPER_MS);
 
 // Ã¢â€â‚¬Ã¢â€â‚¬ Random User-to-User Match Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // When "Match with Verified Expert" toggle is OFF, users join this pool.
@@ -327,20 +284,17 @@ io.on('connection', (socket) => {
     }
 
     listenerSockets.delete(listenerUserId);
-    emitListenerOfflinePresence(listenerUserId, reason);
+    Listener.markOfflineByUserId(listenerUserId).catch((err) => {
+      console.error(`[SOCKET] Failed to mark listener offline in DB for ${listenerUserId}:`, err.message);
+    });
+    io.emit('listener_status', {
+      listenerUserId,
+      online: false,
+      timestamp: Date.now(),
+      reason,
+    });
     console.log(`[SOCKET] Listener ${listenerUserId} marked offline (${reason})`);
     return true;
-  }
-
-  function _forceListenerOffline(listenerUserId, reason = 'manual') {
-    if (!listenerUserId) return false;
-    const hadSockets = listenerSockets.has(listenerUserId);
-    listenerSockets.delete(listenerUserId);
-    emitListenerOfflinePresence(listenerUserId, reason);
-    console.log(
-      `[SOCKET] Listener ${listenerUserId} forced offline (${reason})`,
-    );
-    return hadSockets;
   }
 
   function _socketIdList(target) {
@@ -359,7 +313,7 @@ io.on('connection', (socket) => {
   }
 
   // 1. IDENTITY & PRESENCE
-  
+
   // User joins (can be regular user or listener)
   socket.on('user:join', (data) => {
     // Support both old format (just userId string) and new format (object with userId, userName, avatar)
@@ -372,7 +326,7 @@ io.on('connection', (socket) => {
       userAvatar = data.userAvatar;
       activelyViewingChatId = data.activelyViewingChatId; // WhatsApp-style: which chat is open
     }
-    
+
     if (!userId) return;
     socket.userId = userId;
     socket.userName = userName || 'Unknown';
@@ -380,23 +334,23 @@ io.on('connection', (socket) => {
     if (!connectedUsers.has(userId)) connectedUsers.set(userId, new Set());
     connectedUsers.get(userId).add(socket.id);
     lastSeenMap.set(userId, Date.now());
-    
+
     // Initialize or update user chat state (WhatsApp-style tracking)
     userChatState.set(userId, {
       activelyViewingChatId: activelyViewingChatId || null,
       appState: 'foreground'
     });
-    
+
     // Join user's personal room for notifications
     socket.join(`user_${userId}`);
     console.log(`[SOCKET] User ${userId} joined personal room: user_${userId}`);
-    
+
     // Clear any pending offline timeout
     if (presenceTimeouts.has(userId)) {
       clearTimeout(presenceTimeouts.get(userId));
       presenceTimeouts.delete(userId);
     }
-    
+
     io.emit('user:online', { userId, timestamp: Date.now() });
     console.log(`[SOCKET] User joined: ${userId} (${userName || 'unknown name'}), activeChat: ${activelyViewingChatId || 'none'}`);
 
@@ -412,62 +366,53 @@ io.on('connection', (socket) => {
   // CRITICAL: This is what makes a listener available to receive calls
   // Must be emitted when listener app is open (any page)
   socket.on('listener:join', async (listenerUserId) => {
-    const normalizedListenerUserId = String(listenerUserId || '').trim();
-    if (!normalizedListenerUserId) return;
-    socket.userId = normalizedListenerUserId; // Sync with userId
-    socket.listenerUserId = normalizedListenerUserId;
-    
-    if (!listenerSockets.has(normalizedListenerUserId)) listenerSockets.set(normalizedListenerUserId, new Set());
-    listenerSockets.get(normalizedListenerUserId).add(socket.id);
+    if (!listenerUserId) return;
+    socket.userId = listenerUserId; // Sync with userId
+    socket.listenerUserId = listenerUserId;
 
-    if (!connectedUsers.has(normalizedListenerUserId)) connectedUsers.set(normalizedListenerUserId, new Set());
-    connectedUsers.get(normalizedListenerUserId).add(socket.id);
+    if (!listenerSockets.has(listenerUserId)) listenerSockets.set(listenerUserId, new Set());
+    listenerSockets.get(listenerUserId).add(socket.id);
+
+    if (!connectedUsers.has(listenerUserId)) connectedUsers.set(listenerUserId, new Set());
+    connectedUsers.get(listenerUserId).add(socket.id);
 
     // CRITICAL FIX: Update last_active_at in DB so the REST API call route
     // can confirm listener is online (it checks last_active_at <= 2 min)
     try {
-      await Listener.updateLastActiveByUserId(normalizedListenerUserId);
-      console.log(`[SOCKET] listener:join: last_active_at updated for ${normalizedListenerUserId}`);
+      await Listener.updateLastActiveByUserId(listenerUserId);
+      console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Updated last_active_at for ${listenerUserId}`);
     } catch (err) {
       console.error(`[SOCKET] listener:join: Failed to update last_active_at:`, err.message);
     }
 
     // Keep last_active_at fresh every 90s so calls always work while listener is connected
     const keepAliveInterval = setInterval(async () => {
-      const sockets = listenerSockets.get(normalizedListenerUserId);
+      const sockets = listenerSockets.get(listenerUserId);
       if (!sockets || !sockets.has(socket.id)) {
         clearInterval(keepAliveInterval);
         return;
       }
       try {
-        await Listener.updateLastActiveByUserId(normalizedListenerUserId);
+        await Listener.updateLastActiveByUserId(listenerUserId);
       } catch (_) {}
     }, 90000);
 
     socket.once('disconnect', () => clearInterval(keepAliveInterval));
-    
-    io.emit('listener_status', { listenerUserId: normalizedListenerUserId, online: true, timestamp: Date.now() });
+
+    io.emit('listener_status', { listenerUserId, online: true, timestamp: Date.now() });
     socket.emit('users:initial_status', Array.from(connectedUsers.keys()));
     socket.emit('listeners:initial_busy', Array.from(busyUsers.keys()));
-    console.log(`[SOCKET] listener:join: Listener ${normalizedListenerUserId} is now ONLINE (socket: ${socket.id})`);
+    console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Listener ${listenerUserId} is now ONLINE (socket: ${socket.id})`);
     console.log(`[SOCKET] listener:join: Total online listeners: ${listenerSockets.size}`);
   });
 
   // Explicit offline events clear foreground/call presence while the socket can
   // remain connected for chat and notification coordination.
   socket.on('listener:offline', (data) => {
-    const requestedListenerUserId = String(data?.listenerUserId || '').trim();
-    const boundListenerUserId = String(socket.listenerUserId || '').trim();
-    const boundUserId = String(socket.userId || '').trim();
-    const listenerUserId =
-      boundListenerUserId ||
-      (requestedListenerUserId && requestedListenerUserId === boundUserId
-        ? requestedListenerUserId
-        : '');
-
+    const { listenerUserId } = data || {};
     if (listenerUserId) {
-      _forceListenerOffline(listenerUserId, 'manual');
-      console.log(`[SOCKET] listener:offline: Listener ${listenerUserId} manually went OFFLINE`);
+      _markListenerOffline(listenerUserId, 'manual');
+      console.log(`[SOCKET] listener:offline: Ã¢Å“â€œ Listener ${listenerUserId} manually went OFFLINE`);
     }
   });
 
@@ -698,7 +643,7 @@ io.on('connection', (socket) => {
   // the listener must have the Online button enabled and the app foregrounded.
   socket.on('call:initiate', async (data) => {
     const { listenerId, ...callData } = data || {};
-    
+
     // CALLER BUSY CHECK
     if (socket.userId && busyUsers.has(socket.userId)) {
       console.log(`[SOCKET] call:initiate: ❌ Caller ${socket.userId} is already BUSY`);
@@ -707,14 +652,11 @@ io.on('connection', (socket) => {
     }
 
     let listenerSocketIds = listenerSockets.get(listenerId);
-    const listenerSocketId =
-      listenerSocketIds && listenerSocketIds.size > 0
-        ? Array.from(listenerSocketIds)[0]
-        : null;
-    
+    const listenerSocketId = listenerSocketIds ? Array.from(listenerSocketIds)[0] : null;
+
     console.log(`[SOCKET] call:initiate: Looking for listener ${listenerId}`);
     console.log(`[SOCKET] call:initiate: Found socketId: ${listenerSocketIds ? Array.from(listenerSocketIds).join(',') : 'NONE'}`);
-    
+
     // Fetch listener user to check for FCM token
     let listenerUser = null;
     try {
@@ -726,14 +668,14 @@ io.on('connection', (socket) => {
     if (!listenerSocketIds || listenerSocketIds.size === 0) {
       // Listener is offline for calls when the Online button is off or the app
       // is backgrounded/closed, even if FCM is available.
-      console.log(`[SOCKET] call:initiate: Listener ${listenerId} offline for calls`);
+      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} offline for calls`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'listener_offline' });
       return;
     }
 
     // BUSY CHECK: If listener is already in an active call, notify caller
     if (busyUsers.has(listenerId)) {
-      console.log(`[SOCKET] call:initiate: Listener ${listenerId} is BUSY (active call: ${busyUsers.get(listenerId)})`);
+      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} is BUSY (active call: ${busyUsers.get(listenerId)})`);
       socket.emit('call:busy', {
         callId: callData.callId,
         listenerId,
@@ -749,7 +691,7 @@ io.on('connection', (socket) => {
         initiatorUserId: socket.userId,
         calleeUserId: listenerId,
         listenerUserId: listenerId,
-        calleeSocketId: listenerSocketId,
+        calleeSocketId: listenerSocketIds ? Array.from(listenerSocketIds)[0] : null,
         createdAt: Date.now(),
       });
       console.log(`[SOCKET] call:initiate: Tracking pending call ${callData.callId}`);
@@ -761,7 +703,8 @@ io.on('connection', (socket) => {
         io.to(sid).emit('incoming-call', callData);
       }
     }
-    console.log(`[SOCKET] call:initiate: Forwarded to listener ${listenerId} (socket: ${listenerSocketId || 'none'})`);
+    console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
+
     // THEN verify in background Ã¢â‚¬â€ if not approved, cancel the call
     try {
       const listener = await Listener.findByUserId(listenerId);
@@ -770,8 +713,8 @@ io.on('connection', (socket) => {
         if (verificationStatus !== 'approved') {
           console.log(`[SOCKET] call:initiate blocked: Listener ${listenerId} not approved (status: ${verificationStatus})`);
           // Notify caller that call failed
-          socket.emit('call:failed', { 
-            callId: callData.callId, 
+          socket.emit('call:failed', {
+            callId: callData.callId,
             reason: 'listener_not_approved',
             message: 'Listener not approved yet'
           });
@@ -795,7 +738,7 @@ io.on('connection', (socket) => {
     if (listenerUser && listenerFcmToken) {
       try {
         console.log(`[SOCKET] call:initiate: Sending FCM Push to listener ${listenerId} (token: ${listenerFcmToken.substring(0, 15)}...)`);
-        
+
         // Fetch caller details for notification
         const callerUser = await User.findByIdForRealtime(socket.userId);
         const callerName = callerUser ? (callerUser.display_name || callerUser.full_name) : 'User';
@@ -815,9 +758,9 @@ io.on('connection', (socket) => {
 
         // For CallKeep / background handling, data payload is the most important part
         const pushResult = await sendPushFCM(
-          listenerFcmToken, 
-          'Incoming Call', 
-          `${callerName} is calling you`, 
+          listenerFcmToken,
+          'Incoming Call',
+          `${callerName} is calling you`,
           pushData
         );
         if (!pushResult?.success) {
@@ -881,12 +824,12 @@ io.on('connection', (socket) => {
       callData.listenerId = resolvedListenerDbId;
       callData.listener_id = resolvedListenerDbId;
     }
-    
+
     let targetSocketIds = connectedUsers.get(targetUserId);
-    
+
     console.log(`[SOCKET] listener_call:initiate: Looking for target user ${targetUserId}`);
     console.log(`[SOCKET] listener_call:initiate: Found socketIds: ${targetSocketIds ? Array.from(targetSocketIds).join(',') : 'NONE'}`);
-    
+
     // Fetch target user to check for FCM token
     let targetUser = null;
     try {
@@ -973,7 +916,7 @@ io.on('connection', (socket) => {
     if (targetUser && targetFcmToken) {
       try {
         console.log(`[SOCKET] listener_call:initiate: Sending FCM Push to user ${targetUserId}`);
-        
+
         // Fetch listener details for notification
         let listenerName = 'Experts';
         let listenerAvatar = '';
@@ -999,9 +942,9 @@ io.on('connection', (socket) => {
         };
 
         const pushResult = await sendPushFCM(
-          targetFcmToken, 
-          'Incoming Call', 
-          `${listenerName} is calling you`, 
+          targetFcmToken,
+          'Incoming Call',
+          `${listenerName} is calling you`,
           pushData
         );
         if (!pushResult?.success) {
@@ -1049,7 +992,7 @@ io.on('connection', (socket) => {
         listenerUserId: uid,
         busy: true,
       });
-      
+
       // Proactively remove from random pool to prevent zombie matching
       if (randomUserPool.has(uid)) {
         const entry = randomUserPool.get(uid);
@@ -1057,7 +1000,7 @@ io.on('connection', (socket) => {
         randomUserPool.delete(uid);
         console.log(`[RANDOM] User ${uid} removed from random pool due to active call`);
       }
-      
+
       console.log(`[SOCKET] call:accept: User/Listener ${uid} marked BUSY`);
     });
 
@@ -1119,12 +1062,12 @@ io.on('connection', (socket) => {
     if (!userId) return;
 
     console.log(`[SOCKET] User ${userId} joined channel ${channelName}`);
-    
+
     if (!activeChannels.has(channelName)) {
       activeChannels.set(channelName, new Set());
     }
     activeChannels.get(channelName).add(userId);
-    
+
     const usersInChannel = activeChannels.get(channelName);
     if (usersInChannel.size >= 2 && callId) {
       // Dedup: prevent double execution when both parties race to this point
@@ -1276,7 +1219,7 @@ io.on('connection', (socket) => {
     const endedBy = socket.userId;
     const endReason = reason || 'call_ended';
     console.log(`[SOCKET] call:end: Call ${callId} ended by ${endedBy} (${endReason})`);
-    
+
     // Clear server-side auto-disconnect timer & capture data for safety billing
     let endTimerData = null;
     if (callId && activeCallTimers.has(callId)) {
@@ -1285,7 +1228,7 @@ io.on('connection', (socket) => {
       activeCallTimers.delete(callId);
       console.log(`[SOCKET] call:end: Cleared auto-disconnect timer for call ${callId}`);
     }
-    
+
     // BUSY: Clear busy for both parties (whichever is the listener)
     _clearBusyForCall(endedBy, otherUserId);
 
@@ -1306,10 +1249,10 @@ io.on('connection', (socket) => {
         });
       }
     };
-    
+
     // 1. Try direct otherUserId path (for connected calls)
     notifyCallEnded(otherUserId);
-    
+
     // 2. Check pendingCalls Ã¢â‚¬â€ caller cancelled BEFORE listener answered
     const pending = pendingCalls.get(callId);
     if (pending) {
@@ -1380,14 +1323,14 @@ io.on('connection', (socket) => {
     socket.join(`chat_${chatId}`);
     socket.chatRooms = socket.chatRooms || new Set();
     socket.chatRooms.add(chatId);
-    
+
     // WhatsApp-style: Track which chat user is actively viewing
     if (isActivelyViewing) {
       const state = userChatState.get(socket.userId) || { appState: 'foreground' };
       state.activelyViewingChatId = chatId;
       userChatState.set(socket.userId, state);
     }
-    
+
     console.log(`[SOCKET] User ${socket.userId} joined chat room: ${chatId} (activelyViewing: ${isActivelyViewing})`);
 
     // Fetch and send chat history
@@ -1423,14 +1366,14 @@ io.on('connection', (socket) => {
     if (socket.chatRooms) {
       socket.chatRooms.delete(chatId);
     }
-    
+
     // WhatsApp-style: Clear actively viewing state
     const state = userChatState.get(socket.userId);
     if (state && state.activelyViewingChatId === chatId) {
       state.activelyViewingChatId = null;
       userChatState.set(socket.userId, state);
     }
-    
+
     console.log(`[SOCKET] User ${socket.userId} left chat room: ${chatId}`);
   });
 
@@ -1438,11 +1381,11 @@ io.on('connection', (socket) => {
   socket.on('chat:set_active_viewing', (data) => {
     const { chatId, isActivelyViewing } = data || {};
     if (!socket.userId) return;
-    
+
     const state = userChatState.get(socket.userId) || { appState: 'foreground' };
     state.activelyViewingChatId = isActivelyViewing ? chatId : null;
     userChatState.set(socket.userId, state);
-    
+
     console.log(`[SOCKET] User ${socket.userId} set actively viewing: ${chatId || 'none'}`);
   });
 
@@ -1450,17 +1393,17 @@ io.on('connection', (socket) => {
   socket.on('user:app_state', (data) => {
     const { userId, state: appState, activelyViewingChatId } = data || {};
     if (!userId) return;
-    
+
     const chatState = userChatState.get(userId) || {};
     chatState.appState = appState || 'foreground';
-    
+
     // Also update actively viewing chat if provided
     if (appState === 'background') {
       chatState.activelyViewingChatId = null; // Not viewing any chat when in background
     } else if (activelyViewingChatId !== undefined) {
       chatState.activelyViewingChatId = activelyViewingChatId;
     }
-    
+
     userChatState.set(userId, chatState);
 
     if (appState === 'background') {
@@ -1495,7 +1438,7 @@ io.on('connection', (socket) => {
   // Send a message in a chat
   socket.on('chat:send', async (data) => {
     const { chatId, content, messageType = 'text', mediaUrl } = data || {};
-    
+
     if (!chatId || !content || !socket.userId) {
       console.log(`[SOCKET] chat:send failed - missing required fields`);
       socket.emit('chat:error', { error: 'Missing required fields' });
@@ -1590,11 +1533,11 @@ io.on('connection', (socket) => {
       Promise.resolve(chat).then(chatData => {
         if (chatData) {
           const otherUserState = userChatState.get(otherUserId);
-          
-          const isOtherUserViewingThisChat = otherUserState && 
-            otherUserState.appState === 'foreground' && 
+
+          const isOtherUserViewingThisChat = otherUserState &&
+            otherUserState.appState === 'foreground' &&
             otherUserState.activelyViewingChatId === chatId;
-          
+
           if (!isOtherUserViewingThisChat) {
             io.to(`user_${otherUserId}`).emit('chat:new_message_notification', messageData);
             console.log(`[SOCKET] Sent notification to user_${otherUserId}`);
@@ -1631,7 +1574,7 @@ io.on('connection', (socket) => {
 
     try {
       await Message.markAsRead(chatId, socket.userId);
-      
+
       // Notify the other user that messages were read
       socket.to(`chat_${chatId}`).emit('chat:messages_read', {
         chatId,
@@ -1647,7 +1590,7 @@ io.on('connection', (socket) => {
   // Backend does NOT store placeholder text - that's client-side only
   socket.on('delete_message', async (data) => {
     const { messageId, chatId, senderId, receiverId } = data || {};
-    
+
     if (!messageId || !senderId) {
       console.log(`[SOCKET] delete_message failed - missing messageId or senderId`);
       socket.emit('chat:error', { error: 'Missing required fields for delete' });
@@ -1657,7 +1600,7 @@ io.on('connection', (socket) => {
     try {
       // Delete message from database (validates sender ownership)
       const result = await Message.delete(messageId, senderId);
-      
+
       if (!result.success) {
         console.log(`[SOCKET] delete_message failed: ${result.error}`);
         socket.emit('chat:error', { error: result.error });
@@ -1676,7 +1619,7 @@ io.on('connection', (socket) => {
 
       // Emit to chat room (for users currently in the chat)
       io.to(`chat_${chatId}`).emit('message:deleted', deleteData);
-      
+
       // Also emit to both users' personal rooms (in case they're not in chat room)
       io.to(`user_${senderId}`).emit('message:deleted', deleteData);
       if (receiverId) {
@@ -1826,7 +1769,7 @@ app.use((req, res) => {
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Error:', err);
-  
+
   res.status(err.status || 500).json({
     error: err.message || 'Internal server error',
     ...(config.NODE_ENV === 'development' && { stack: err.stack })
@@ -1864,13 +1807,19 @@ async function startServer() {
       process.exit(1);
     }
 
-    // PRODUCTION SAFETY: Clear all stale is_busy flags on startup.
-    // If the server crashed or restarted, listeners may be stuck as busy.
+    // PRODUCTION SAFETY: Clear stale socket-derived flags on startup.
+    // If the server crashed or restarted, listeners may be stuck busy/online.
     try {
       const { pool: startupPool } = await import('./db.js');
       const cleared = await startupPool.query(
         `UPDATE listeners SET is_busy = FALSE WHERE is_busy = TRUE RETURNING listener_id`
       );
+      const clearedOnline = await startupPool.query(
+        `UPDATE listeners SET is_online = FALSE WHERE is_online = TRUE RETURNING listener_id`
+      );
+      if (clearedOnline.rowCount > 0) {
+        console.log(`Cleared ${clearedOnline.rowCount} stale online flag(s) on startup:`, clearedOnline.rows.map(r => r.listener_id));
+      }
       if (cleared.rowCount > 0) {
         console.log(`Ã°Å¸Â§Â¹ Cleared ${cleared.rowCount} stale busy flag(s) on startup:`, cleared.rows.map(r => r.listener_id));
       }
@@ -1968,4 +1917,4 @@ export { app, server, io };
 
 
 
- 
+
