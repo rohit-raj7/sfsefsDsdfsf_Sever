@@ -161,6 +161,23 @@ const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, list
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
 const LISTENER_TO_USER_RING_TIMEOUT_MS = 32000;
+const LISTENER_SOCKET_REAPER_MS = 10000;
+
+function emitListenerOfflinePresence(listenerUserId, reason = 'offline') {
+  if (!listenerUserId) return;
+  io.emit('listener_status', {
+    listenerUserId,
+    online: false,
+    timestamp: Date.now(),
+    reason,
+  });
+  Listener.clearLastActiveByUserId(listenerUserId).catch((err) => {
+    console.error(
+      `[SOCKET] Failed to clear listener last_active_at for ${listenerUserId}:`,
+      err.message,
+    );
+  });
+}
 
 const clearPendingCall = (callId) => {
   const pending = pendingCalls.get(callId);
@@ -170,6 +187,32 @@ const clearPendingCall = (callId) => {
   pendingCalls.delete(callId);
   return pending;
 };
+
+// Safety reaper: if disconnect callbacks are delayed/missed, drop stale socket IDs
+// so listeners do not remain online after app/process kill.
+setInterval(() => {
+  for (const [listenerUserId, sockets] of listenerSockets.entries()) {
+    if (!(sockets instanceof Set) || sockets.size === 0) {
+      listenerSockets.delete(listenerUserId);
+      emitListenerOfflinePresence(listenerUserId, 'stale_cleanup');
+      continue;
+    }
+
+    for (const sid of Array.from(sockets)) {
+      if (!io.sockets.sockets.has(sid)) {
+        sockets.delete(sid);
+      }
+    }
+
+    if (sockets.size === 0) {
+      listenerSockets.delete(listenerUserId);
+      emitListenerOfflinePresence(listenerUserId, 'stale_cleanup');
+      console.log(
+        `[SOCKET] Reaped stale listener presence for ${listenerUserId}`,
+      );
+    }
+  }
+}, LISTENER_SOCKET_REAPER_MS);
 
 // Ã¢â€â‚¬Ã¢â€â‚¬ Random User-to-User Match Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // When "Match with Verified Expert" toggle is OFF, users join this pool.
@@ -284,14 +327,20 @@ io.on('connection', (socket) => {
     }
 
     listenerSockets.delete(listenerUserId);
-    io.emit('listener_status', {
-      listenerUserId,
-      online: false,
-      timestamp: Date.now(),
-      reason,
-    });
+    emitListenerOfflinePresence(listenerUserId, reason);
     console.log(`[SOCKET] Listener ${listenerUserId} marked offline (${reason})`);
     return true;
+  }
+
+  function _forceListenerOffline(listenerUserId, reason = 'manual') {
+    if (!listenerUserId) return false;
+    const hadSockets = listenerSockets.has(listenerUserId);
+    listenerSockets.delete(listenerUserId);
+    emitListenerOfflinePresence(listenerUserId, reason);
+    console.log(
+      `[SOCKET] Listener ${listenerUserId} forced offline (${reason})`,
+    );
+    return hadSockets;
   }
 
   function _socketIdList(target) {
@@ -363,53 +412,62 @@ io.on('connection', (socket) => {
   // CRITICAL: This is what makes a listener available to receive calls
   // Must be emitted when listener app is open (any page)
   socket.on('listener:join', async (listenerUserId) => {
-    if (!listenerUserId) return;
-    socket.userId = listenerUserId; // Sync with userId
-    socket.listenerUserId = listenerUserId;
+    const normalizedListenerUserId = String(listenerUserId || '').trim();
+    if (!normalizedListenerUserId) return;
+    socket.userId = normalizedListenerUserId; // Sync with userId
+    socket.listenerUserId = normalizedListenerUserId;
     
-    if (!listenerSockets.has(listenerUserId)) listenerSockets.set(listenerUserId, new Set());
-    listenerSockets.get(listenerUserId).add(socket.id);
+    if (!listenerSockets.has(normalizedListenerUserId)) listenerSockets.set(normalizedListenerUserId, new Set());
+    listenerSockets.get(normalizedListenerUserId).add(socket.id);
 
-    if (!connectedUsers.has(listenerUserId)) connectedUsers.set(listenerUserId, new Set());
-    connectedUsers.get(listenerUserId).add(socket.id);
+    if (!connectedUsers.has(normalizedListenerUserId)) connectedUsers.set(normalizedListenerUserId, new Set());
+    connectedUsers.get(normalizedListenerUserId).add(socket.id);
 
     // CRITICAL FIX: Update last_active_at in DB so the REST API call route
     // can confirm listener is online (it checks last_active_at <= 2 min)
     try {
-      await Listener.updateLastActiveByUserId(listenerUserId);
-      console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Updated last_active_at for ${listenerUserId}`);
+      await Listener.updateLastActiveByUserId(normalizedListenerUserId);
+      console.log(`[SOCKET] listener:join: last_active_at updated for ${normalizedListenerUserId}`);
     } catch (err) {
       console.error(`[SOCKET] listener:join: Failed to update last_active_at:`, err.message);
     }
 
     // Keep last_active_at fresh every 90s so calls always work while listener is connected
     const keepAliveInterval = setInterval(async () => {
-      const sockets = listenerSockets.get(listenerUserId);
+      const sockets = listenerSockets.get(normalizedListenerUserId);
       if (!sockets || !sockets.has(socket.id)) {
         clearInterval(keepAliveInterval);
         return;
       }
       try {
-        await Listener.updateLastActiveByUserId(listenerUserId);
+        await Listener.updateLastActiveByUserId(normalizedListenerUserId);
       } catch (_) {}
     }, 90000);
 
     socket.once('disconnect', () => clearInterval(keepAliveInterval));
     
-    io.emit('listener_status', { listenerUserId, online: true, timestamp: Date.now() });
+    io.emit('listener_status', { listenerUserId: normalizedListenerUserId, online: true, timestamp: Date.now() });
     socket.emit('users:initial_status', Array.from(connectedUsers.keys()));
     socket.emit('listeners:initial_busy', Array.from(busyUsers.keys()));
-    console.log(`[SOCKET] listener:join: Ã¢Å“â€œ Listener ${listenerUserId} is now ONLINE (socket: ${socket.id})`);
+    console.log(`[SOCKET] listener:join: Listener ${normalizedListenerUserId} is now ONLINE (socket: ${socket.id})`);
     console.log(`[SOCKET] listener:join: Total online listeners: ${listenerSockets.size}`);
   });
 
   // Explicit offline events clear foreground/call presence while the socket can
   // remain connected for chat and notification coordination.
   socket.on('listener:offline', (data) => {
-    const { listenerUserId } = data || {};
+    const requestedListenerUserId = String(data?.listenerUserId || '').trim();
+    const boundListenerUserId = String(socket.listenerUserId || '').trim();
+    const boundUserId = String(socket.userId || '').trim();
+    const listenerUserId =
+      boundListenerUserId ||
+      (requestedListenerUserId && requestedListenerUserId === boundUserId
+        ? requestedListenerUserId
+        : '');
+
     if (listenerUserId) {
-      _markListenerOffline(listenerUserId, 'manual');
-      console.log(`[SOCKET] listener:offline: Ã¢Å“â€œ Listener ${listenerUserId} manually went OFFLINE`);
+      _forceListenerOffline(listenerUserId, 'manual');
+      console.log(`[SOCKET] listener:offline: Listener ${listenerUserId} manually went OFFLINE`);
     }
   });
 
@@ -649,6 +707,10 @@ io.on('connection', (socket) => {
     }
 
     let listenerSocketIds = listenerSockets.get(listenerId);
+    const listenerSocketId =
+      listenerSocketIds && listenerSocketIds.size > 0
+        ? Array.from(listenerSocketIds)[0]
+        : null;
     
     console.log(`[SOCKET] call:initiate: Looking for listener ${listenerId}`);
     console.log(`[SOCKET] call:initiate: Found socketId: ${listenerSocketIds ? Array.from(listenerSocketIds).join(',') : 'NONE'}`);
@@ -664,14 +726,14 @@ io.on('connection', (socket) => {
     if (!listenerSocketIds || listenerSocketIds.size === 0) {
       // Listener is offline for calls when the Online button is off or the app
       // is backgrounded/closed, even if FCM is available.
-      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} offline for calls`);
+      console.log(`[SOCKET] call:initiate: Listener ${listenerId} offline for calls`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'listener_offline' });
       return;
     }
 
     // BUSY CHECK: If listener is already in an active call, notify caller
     if (busyUsers.has(listenerId)) {
-      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} is BUSY (active call: ${busyUsers.get(listenerId)})`);
+      console.log(`[SOCKET] call:initiate: Listener ${listenerId} is BUSY (active call: ${busyUsers.get(listenerId)})`);
       socket.emit('call:busy', {
         callId: callData.callId,
         listenerId,
@@ -687,7 +749,7 @@ io.on('connection', (socket) => {
         initiatorUserId: socket.userId,
         calleeUserId: listenerId,
         listenerUserId: listenerId,
-        calleeSocketId: listenerSocketIds ? Array.from(listenerSocketIds)[0] : null,
+        calleeSocketId: listenerSocketId,
         createdAt: Date.now(),
       });
       console.log(`[SOCKET] call:initiate: Tracking pending call ${callData.callId}`);
@@ -699,8 +761,7 @@ io.on('connection', (socket) => {
         io.to(sid).emit('incoming-call', callData);
       }
     }
-    console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
-
+    console.log(`[SOCKET] call:initiate: Forwarded to listener ${listenerId} (socket: ${listenerSocketId || 'none'})`);
     // THEN verify in background Ã¢â‚¬â€ if not approved, cancel the call
     try {
       const listener = await Listener.findByUserId(listenerId);

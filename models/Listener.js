@@ -749,6 +749,16 @@ class Listener {
     await pool.query(query, [user_id]);
   }
 
+  // Clear last active timestamp by user_id (used when listener goes offline)
+  static async clearLastActiveByUserId(user_id) {
+    const query = `
+      UPDATE listeners
+      SET last_active_at = NULL
+      WHERE user_id = $1
+    `;
+    await pool.query(query, [user_id]);
+  }
+
   // Increment call statistics
   static async incrementCallStats(listener_id, duration_minutes) {
     const query = `
