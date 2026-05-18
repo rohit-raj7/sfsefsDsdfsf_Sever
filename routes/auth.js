@@ -309,9 +309,16 @@ router.post('/send-otp', async (req, res) => {
       return res.status(500).json({ error: 'Authentication service temporarily unavailable' });
     }
 
-    const response = await axios.get(
-      `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN`
-    );
+    // Build the 2Factor send-OTP URL.
+    // When SMS_TEMPLATE_NAME is set, the SMS will use a custom DLT-registered
+    // template that includes the SMS Retriever app hash, enabling automatic
+    // OTP detection on Android without READ_SMS permission.
+    const templateName = process.env.SMS_TEMPLATE_NAME;
+    const sendOtpUrl = templateName
+      ? `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN/${templateName}`
+      : `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN`;
+
+    const response = await axios.get(sendOtpUrl);
 
     if (response.data && response.data.Status === "Success") {
       try {
