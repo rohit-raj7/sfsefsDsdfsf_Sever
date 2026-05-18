@@ -171,6 +171,19 @@ const clearPendingCall = (callId) => {
   return pending;
 };
 
+// Helper: check if a user is in an active call (busyUsers) or ringing/pending call (pendingCalls)
+const _isUserInCallOrRinging = (userId) => {
+  if (!userId) return false;
+  if (busyUsers.has(String(userId))) return true;
+  for (const pending of pendingCalls.values()) {
+    if (String(pending.initiatorUserId) === String(userId) || String(pending.calleeUserId) === String(userId)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+
 // Ã¢â€â‚¬Ã¢â€â‚¬ Random User-to-User Match Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // When "Match with Verified Expert" toggle is OFF, users join this pool.
 // The server instantly pairs two waiting users and emits `random:matched` to both.
@@ -428,8 +441,8 @@ io.on('connection', (socket) => {
     const { userId, displayName, avatarUrl, gender, preferredGender } = data || {};
     if (!userId) return;
 
-    if (busyUsers.has(userId)) {
-      console.log(`[SOCKET] random:join_pool: ❌ User ${userId} is BUSY`);
+    if (_isUserInCallOrRinging(userId)) {
+      console.log(`[SOCKET] random:join_pool: ❌ User ${userId} is BUSY/RINGING`);
       socket.emit('random:join_rejected', {
         reason: 'user_busy',
         message: 'You are currently on another call.',
@@ -504,7 +517,7 @@ io.on('connection', (socket) => {
     if (preferredGender && preferredGender !== 'Any') {
       for (const [waitingUserId, entry] of randomUserPool.entries()) {
         if (waitingUserId === userId) continue;
-        if (busyUsers.has(waitingUserId)) {
+        if (_isUserInCallOrRinging(waitingUserId)) {
           randomUserPool.delete(waitingUserId);
           continue;
         }
@@ -521,7 +534,7 @@ io.on('connection', (socket) => {
     if (!matchedUserId) {
       for (const [waitingUserId, entry] of randomUserPool.entries()) {
         if (waitingUserId === userId) continue;
-        if (busyUsers.has(waitingUserId)) {
+        if (_isUserInCallOrRinging(waitingUserId)) {
           randomUserPool.delete(waitingUserId);
           continue;
         }
@@ -598,7 +611,32 @@ io.on('connection', (socket) => {
   // Relaying random match calls (free user-to-user) without billing
   socket.on('random:call_invite', (data) => {
     const { targetUserId, channelName, callerName, callerAvatar } = data || {};
-    if (!targetUserId) return;
+    if (!targetUserId || !socket.userId) return;
+
+    // Check concurrency
+    if (_isUserInCallOrRinging(socket.userId) || _isUserInCallOrRinging(targetUserId)) {
+      console.log(`[RANDOM] random:call_invite: Concurrency reject from ${socket.userId} to ${targetUserId}`);
+      socket.emit('call:failed', {
+        callId: channelName,
+        reason: 'caller_busy',
+        message: 'One of the participants is already in a call.'
+      });
+      return;
+    }
+
+    // Proactively mark both as busy in busyUsers
+    [socket.userId, targetUserId].forEach(uid => {
+      busyUsers.set(uid, channelName);
+      io.emit('listener_busy_status', { listenerUserId: uid, busy: true });
+      console.log(`[SOCKET] random:call_invite: User ${uid} marked BUSY`);
+      // Update in DB
+      Listener.setBusyByUserId(uid).catch(e => console.error('[SOCKET] random:call_invite setBusyByUserId DB error:', e.message));
+    });
+
+    // Proactively remove both from random match pool
+    randomUserPool.delete(socket.userId);
+    randomUserPool.delete(targetUserId);
+
     const targetSocketId = connectedUsers.get(targetUserId) || listenerSockets.get(targetUserId);
     if (targetSocketId) {
       _emitToTargetSockets(targetSocketId, 'random:call_invite', {
@@ -606,7 +644,7 @@ io.on('connection', (socket) => {
         callerName,
         callerAvatar,
       });
-      console.log(`[RANDOM] Call invite from ${socket.userId} to ${targetUserId}`);
+      console.log(`[RANDOM] Call invite from ${socket.userId} to ${targetUserId} initiated`);
     }
   });
 
@@ -642,8 +680,8 @@ io.on('connection', (socket) => {
     const { listenerId, ...callData } = data || {};
     
     // CALLER BUSY CHECK
-    if (socket.userId && busyUsers.has(socket.userId)) {
-      console.log(`[SOCKET] call:initiate: ❌ Caller ${socket.userId} is already BUSY`);
+    if (socket.userId && _isUserInCallOrRinging(socket.userId)) {
+      console.log(`[SOCKET] call:initiate: ❌ Caller ${socket.userId} is already BUSY/RINGING`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'caller_busy', message: 'You are already in a call' });
       return;
     }
@@ -669,9 +707,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // BUSY CHECK: If listener is already in an active call, notify caller
-    if (busyUsers.has(listenerId)) {
-      console.log(`[SOCKET] call:initiate: Ã¢Å“â€” Listener ${listenerId} is BUSY (active call: ${busyUsers.get(listenerId)})`);
+    // BUSY CHECK: If listener is already in an active or pending call, notify caller
+    if (_isUserInCallOrRinging(listenerId)) {
+      console.log(`[SOCKET] call:initiate: ❌ Listener ${listenerId} is BUSY/RINGING`);
       socket.emit('call:busy', {
         callId: callData.callId,
         listenerId,
@@ -782,15 +820,15 @@ io.on('connection', (socket) => {
     const listenerUserId = socket.listenerUserId || socket.userId;
 
     // CALLER BUSY CHECK
-    if (listenerUserId && busyUsers.has(listenerUserId)) {
-      console.log(`[SOCKET] listener_call:initiate: ❌ Caller ${listenerUserId} is already BUSY`);
+    if (listenerUserId && _isUserInCallOrRinging(listenerUserId)) {
+      console.log(`[SOCKET] listener_call:initiate: ❌ Caller ${listenerUserId} is already BUSY/RINGING`);
       socket.emit('call:failed', { callId: callData.callId, reason: 'caller_busy', message: 'You are already in a call' });
       return;
     }
 
     // TARGET BUSY CHECK
-    if (targetUserId && busyUsers.has(targetUserId)) {
-      console.log(`[SOCKET] listener_call:initiate: ❌ Target user ${targetUserId} is BUSY`);
+    if (targetUserId && _isUserInCallOrRinging(targetUserId)) {
+      console.log(`[SOCKET] listener_call:initiate: ❌ Target user ${targetUserId} is BUSY/RINGING`);
       socket.emit('call:busy', { callId: callData.callId, reason: 'user_busy', message: 'User is busy on another call' });
       return;
     }
