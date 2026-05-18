@@ -43,7 +43,7 @@ class Call {
   // Get call by ID
   static async findById(call_id) {
     const query = `
-      SELECT c.*,
+      SELECT c.*, 
              u1.display_name as caller_name, u1.avatar_url as caller_avatar,
              u2.display_name as listener_name, u2.avatar_url as listener_avatar,
              l.professional_name
@@ -97,17 +97,15 @@ class Call {
   // Get user's call history
   static async getUserCallHistory(user_id, limit = 20, offset = 0) {
     const query = `
-      SELECT c.*,
-             l.professional_name as listener_name,
+      SELECT c.*, 
+             l.professional_name as listener_name, 
              l.profile_image as listener_avatar,
              l.user_id as listener_user_id,
              l.last_active_at as listener_last_seen,
-             CASE
-                WHEN COALESCE(l.is_online, FALSE) = TRUE
-                  AND l.last_active_at IS NOT NULL
-                  AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-                THEN true
-                ELSE false
+             CASE 
+                WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+                THEN true 
+                ELSE false 
              END as listener_online,
              u.display_name as listener_display_name,
              u.city
@@ -176,21 +174,19 @@ class Call {
   // Get active calls for a user
   static async getActiveCalls(user_id) {
     const query = `
-      SELECT c.*,
+      SELECT c.*, 
              l.professional_name, l.profile_image,
              l.user_id as listener_user_id,
-              CASE
-                WHEN COALESCE(l.is_online, FALSE) = TRUE
-                  AND l.last_active_at IS NOT NULL
-                  AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-               THEN true
-               ELSE false
+             CASE 
+               WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+               THEN true 
+               ELSE false 
              END as listener_online,
              u.display_name as listener_display_name
       FROM calls c
       JOIN listeners l ON c.listener_id = l.listener_id
       JOIN users u ON l.user_id = u.user_id
-      WHERE c.caller_id = $1
+      WHERE c.caller_id = $1 
         AND (
           c.status = 'ongoing'
           OR (

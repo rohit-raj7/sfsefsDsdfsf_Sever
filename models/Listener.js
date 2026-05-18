@@ -213,7 +213,7 @@ class Listener {
   // Update listener experiences (separate from creation)
   static async updateExperiences(listener_id, experiences) {
     const query = `
-      UPDATE listeners
+      UPDATE listeners 
       SET experiences = $1, updated_at = CURRENT_TIMESTAMP
       WHERE listener_id = $2
       RETURNING experiences
@@ -236,7 +236,7 @@ class Listener {
     `;
     const result = await pool.query(query, [user_id]);
     const listener = (await attachResolvedRates(result.rows))[0];
-
+    
     if (listener) {
       // Structure payment info
       if (listener.payment_method) {
@@ -256,7 +256,7 @@ class Listener {
           payout_currency: listener.currency || 'INR'
         };
       }
-
+      
       // Clean up individual payment fields
       delete listener.payment_method;
       delete listener.payment_mobile_number;
@@ -271,7 +271,7 @@ class Listener {
       delete listener.pan_aadhaar_bank;
       delete listener.payment_verified;
     }
-
+    
     return listener;
   }
 
@@ -279,12 +279,10 @@ class Listener {
   static async findById(listener_id) {
     const query = `
       SELECT l.*, u.phone_number, u.email, u.city, u.country, u.display_name,
-        CASE
-          WHEN COALESCE(l.is_online, FALSE) = TRUE
-            AND l.last_active_at IS NOT NULL
-            AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-          THEN true
-          ELSE false
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN true 
+          ELSE false 
         END as is_online,
         pd.payment_method, pd.mobile_number as payment_mobile_number, pd.upi_id, pd.aadhaar_number, pd.pan_number, pd.name_as_per_pan,
         pd.account_number, pd.ifsc_code, pd.bank_name, pd.account_holder_name, pd.pan_aadhaar_bank,
@@ -296,7 +294,7 @@ class Listener {
     `;
     const result = await pool.query(query, [listener_id]);
     const listener = (await attachResolvedRates(result.rows))[0];
-
+    
     if (listener) {
       // Structure payment info
       if (listener.payment_method) {
@@ -316,7 +314,7 @@ class Listener {
           payout_currency: listener.currency || 'INR'
         };
       }
-
+      
       // Clean up individual fields
       delete listener.payment_method;
       delete listener.payment_mobile_number;
@@ -331,7 +329,7 @@ class Listener {
       delete listener.pan_aadhaar_bank;
       delete listener.payment_verified;
     }
-
+    
     return listener;
   }
 
@@ -362,19 +360,15 @@ class Listener {
         u.country,
         u.gender,
         u.display_name,
-        CASE
-          WHEN COALESCE(l.is_online, FALSE) = TRUE
-            AND l.last_active_at IS NOT NULL
-            AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-          THEN true
-          ELSE false
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN true 
+          ELSE false 
         END as is_online,
-        CASE
-          WHEN COALESCE(l.is_online, FALSE) = TRUE
-            AND l.last_active_at IS NOT NULL
-            AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-          THEN 1
-          ELSE 0
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN 1 
+          ELSE 0 
         END as online_sort
       FROM listeners l
       JOIN users u ON l.user_id = u.user_id
@@ -416,9 +410,9 @@ class Listener {
     // Filter by online status - filter based on calculated is_online
     if (filters.is_online !== undefined) {
       if (filters.is_online) {
-        query += ` AND COALESCE(l.is_online, FALSE) = TRUE AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'`;
+        query += ` AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'`;
       } else {
-        query += ` AND (COALESCE(l.is_online, FALSE) = FALSE OR l.last_active_at IS NULL OR (NOW() - l.last_active_at) > INTERVAL '2 minutes')`;
+        query += ` AND (l.last_active_at IS NULL OR (NOW() - l.last_active_at) > INTERVAL '2 minutes')`;
       }
     }
 
@@ -440,13 +434,13 @@ class Listener {
     const sortBy = filters.sort_by || 'rating';
     const needsResolvedPriceSort = sortBy === 'price_low' || sortBy === 'price_high';
     let orderClause = ' ORDER BY online_sort DESC';
-
+    
     if (sortBy === 'rating') {
       orderClause += ', l.average_rating DESC, l.total_ratings DESC';
     } else if (sortBy === 'recent') {
       orderClause += ', l.created_at DESC';
     }
-
+    
     query += orderClause;
 
     const limit = filters.limit || 20;
@@ -510,19 +504,15 @@ class Listener {
         u.city,
         u.country,
         u.display_name,
-        CASE
-          WHEN COALESCE(l.is_online, FALSE) = TRUE
-            AND l.last_active_at IS NOT NULL
-            AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-          THEN true
-          ELSE false
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN true 
+          ELSE false 
         END as is_online,
-        CASE
-          WHEN COALESCE(l.is_online, FALSE) = TRUE
-            AND l.last_active_at IS NOT NULL
-            AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-          THEN 1
-          ELSE 0
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN 1 
+          ELSE 0 
         END as online_sort
       FROM listeners l
       JOIN users u ON l.user_id = u.user_id
@@ -530,19 +520,19 @@ class Listener {
         AND l.is_active = TRUE
         AND COALESCE(l.verification_status, 'approved') = 'approved' -- VERIFICATION CHECK: Only show approved listeners
         AND (
-          l.professional_name ILIKE $1
+          l.professional_name ILIKE $1 
           OR u.city ILIKE $1
           OR EXISTS (
-            SELECT 1 FROM unnest(l.specialties) AS specialty
+            SELECT 1 FROM unnest(l.specialties) AS specialty 
             WHERE specialty ILIKE $1
           )
         )
       ORDER BY online_sort DESC, l.average_rating DESC
       LIMIT 20
     `;
-
+    
     const result = await pool.query(query, [`%${searchTerm}%`]);
-
+    
     return attachResolvedRates(result.rows);
   }
 
@@ -573,12 +563,10 @@ class Listener {
         l.updated_at,
         l.last_active_at,
         l.mobile_number,
-        CASE
-          WHEN COALESCE(l.is_online, FALSE) = TRUE
-            AND l.last_active_at IS NOT NULL
-            AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-          THEN true
-          ELSE false
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN true 
+          ELSE false 
         END as is_online,
         u.display_name as user_display_name,
         u.email,
@@ -744,8 +732,8 @@ class Listener {
   // Update last active timestamp
   static async updateLastActive(listener_id) {
     const query = `
-      UPDATE listeners
-      SET is_online = TRUE, last_active_at = CURRENT_TIMESTAMP
+      UPDATE listeners 
+      SET last_active_at = CURRENT_TIMESTAMP
       WHERE listener_id = $1
     `;
     await pool.query(query, [listener_id]);
@@ -754,17 +742,8 @@ class Listener {
   // Update last active timestamp by user_id (used from socket handler)
   static async updateLastActiveByUserId(user_id) {
     const query = `
-      UPDATE listeners
-      SET is_online = TRUE, last_active_at = CURRENT_TIMESTAMP
-      WHERE user_id = $1
-    `;
-    await pool.query(query, [user_id]);
-  }
-
-  static async markOfflineByUserId(user_id) {
-    const query = `
-      UPDATE listeners
-      SET is_online = FALSE
+      UPDATE listeners 
+      SET last_active_at = CURRENT_TIMESTAMP
       WHERE user_id = $1
     `;
     await pool.query(query, [user_id]);
@@ -773,7 +752,7 @@ class Listener {
   // Increment call statistics
   static async incrementCallStats(listener_id, duration_minutes) {
     const query = `
-      UPDATE listeners
+      UPDATE listeners 
       SET total_calls = total_calls + 1,
           total_minutes = total_minutes + $1
       WHERE listener_id = $2
@@ -812,7 +791,7 @@ class Listener {
           AND c.status = 'completed'
         GROUP BY c.listener_id
       )
-      SELECT
+      SELECT 
         COALESCE(cs.total_calls, 0) AS total_calls,
         COALESCE(cs.total_minutes, 0) AS total_minutes,
         l.average_rating,
@@ -844,7 +823,7 @@ class Listener {
   // Update voice verification status
   static async updateVoiceVerification(listener_id, voice_url, { verified = true } = {}) {
     const query = `
-      UPDATE listeners
+      UPDATE listeners 
       SET voice_verified = $1, voice_verification_url = $2, updated_at = CURRENT_TIMESTAMP
       WHERE listener_id = $3
       RETURNING listener_id, voice_verified, voice_verification_url
@@ -857,7 +836,7 @@ class Listener {
   static async updateExperiences(listener_id, experiences) {
     try {
       const query = `
-        UPDATE listeners
+        UPDATE listeners 
         SET experiences = $1, updated_at = CURRENT_TIMESTAMP
         WHERE listener_id = $2
         RETURNING experiences
@@ -872,7 +851,7 @@ class Listener {
           await pool.query('ALTER TABLE listeners ADD COLUMN IF NOT EXISTS experiences TEXT[]');
           // Retry the update
           const result = await pool.query(`
-            UPDATE listeners
+            UPDATE listeners 
             SET experiences = $1, updated_at = CURRENT_TIMESTAMP
             WHERE listener_id = $2
             RETURNING experiences
@@ -911,20 +890,15 @@ class Listener {
         u.city,
         u.country,
         u.display_name,
-        CASE
-          WHEN COALESCE(l.is_online, FALSE) = TRUE
-            AND l.last_active_at IS NOT NULL
-            AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
-          THEN true
-          ELSE false
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN true 
+          ELSE false 
         END as is_online
       FROM listeners l
       JOIN users u ON l.user_id = u.user_id
       WHERE l.is_available = TRUE AND u.is_active = TRUE
         AND l.is_active = TRUE
-        AND COALESCE(l.is_online, FALSE) = TRUE
-        AND l.last_active_at IS NOT NULL
-        AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
         AND COALESCE(l.is_busy, false) = FALSE
         AND COALESCE(l.verification_status, 'approved') = 'approved' -- VERIFICATION CHECK: Only show approved listeners
     `;
@@ -939,14 +913,14 @@ class Listener {
     values.push(limit);
 
     const result = await pool.query(query, values);
-
+    
     return attachResolvedRates(result.rows);
   }
 
   // Update listener rating statistics
   static async updateRatingStats(listener_id, average_rating, total_ratings) {
     const query = `
-      UPDATE listeners
+      UPDATE listeners 
       SET average_rating = $1, total_ratings = $2
       WHERE listener_id = $3
     `;
@@ -968,15 +942,15 @@ class Listener {
     const reason = status === 'rejected' ? (rejection_reason || null) : null;
 
     const query = `
-      UPDATE listeners
-      SET verification_status = $1,
+      UPDATE listeners 
+      SET verification_status = $1, 
           is_verified = $2,
           rejection_reason = $3,
           updated_at = CURRENT_TIMESTAMP
       WHERE listener_id = $4
       RETURNING listener_id, verification_status, is_verified, rejection_reason, reapply_attempts
     `;
-
+    
     const result = await pool.query(query, [status, isVerified, reason, listener_id]);
     return result.rows[0];
   }
@@ -985,28 +959,28 @@ class Listener {
   static async reapplyForVerification(listener_id) {
     // Check current status and attempts
     const checkQuery = `
-      SELECT verification_status, reapply_attempts
+      SELECT verification_status, reapply_attempts 
       FROM listeners WHERE listener_id = $1
     `;
     const checkResult = await pool.query(checkQuery, [listener_id]);
-
+    
     if (checkResult.rows.length === 0) {
       throw new Error('Listener not found');
     }
-
+    
     const { verification_status, reapply_attempts } = checkResult.rows[0];
-
+    
     if (verification_status !== 'rejected') {
       throw new Error('Can only reapply when status is rejected');
     }
-
+    
     const MAX_REAPPLY_ATTEMPTS = 3;
     if (reapply_attempts >= MAX_REAPPLY_ATTEMPTS) {
       throw new Error(`Maximum reapply attempts (${MAX_REAPPLY_ATTEMPTS}) reached. Please contact support.`);
     }
 
     const query = `
-      UPDATE listeners
+      UPDATE listeners 
       SET verification_status = 'reapplied',
           reapply_attempts = reapply_attempts + 1,
           rejection_reason = NULL,
@@ -1014,7 +988,7 @@ class Listener {
       WHERE listener_id = $1
       RETURNING listener_id, verification_status, is_verified, rejection_reason, reapply_attempts
     `;
-
+    
     const result = await pool.query(query, [listener_id]);
     return result.rows[0];
   }
@@ -1095,7 +1069,7 @@ class Listener {
         [listener_id, user_id]
       );
 
-      // (Call records, calls, and call billing audit have ON DELETE SET NULL,
+      // (Call records, calls, and call billing audit have ON DELETE SET NULL, 
       //  so we keep them instead of deleting, which protects transaction FKs)
 
       // 6. Delete ratings for this listener (CASCADE should handle, but explicit for safety)
