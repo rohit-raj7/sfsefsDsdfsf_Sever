@@ -1034,30 +1034,12 @@ io.on('connection', (socket) => {
   });
 
   // Reject call: Listener -> User
-  socket.on('call:reject', async (data) => {
+  socket.on('call:reject', (data) => {
     const { callId, callerId } = data;
     console.log(`[SOCKET] call:reject: Call ${callId} rejected by ${socket.userId}`);
 
     const pending = clearPendingCall(callId);
     const listenerUserId = pending?.listenerUserId || socket.userId;
-    const serverTimestamp = Date.now();
-
-    // Persist terminal state so both app and backend remain in sync.
-    if (callId) {
-      try {
-        const existingCall = await Call.findById(callId);
-        if (
-          existingCall &&
-          ['pending', 'ringing', 'initiated'].includes(
-            String(existingCall.status || '').toLowerCase(),
-          )
-        ) {
-          await Call.updateStatus(callId, 'rejected');
-        }
-      } catch (err) {
-        console.error(`[SOCKET] call:reject status update failed for ${callId}:`, err.message);
-      }
-    }
 
     const callerSocketId = connectedUsers.get(callerId);
     if (callerSocketId) {
@@ -1065,26 +1047,8 @@ io.on('connection', (socket) => {
         callId,
         listenerId: listenerUserId,
         rejectedBy: socket.userId,
-        serverTime: serverTimestamp,
-      });
-      // Some client flows only handle call:ended as the terminal signal.
-      _emitToTargetSockets(callerSocketId, 'call:ended', {
-        callId,
-        endedBy: socket.userId,
-        reason: 'listener_rejected',
-        code: 'CALL_REJECTED',
       });
     }
-
-    // Close out ringing UI on rejecting side too (foreground or notification flow).
-    socket.emit('call:ended', {
-      callId,
-      endedBy: socket.userId,
-      reason: 'rejected',
-      code: 'CALL_REJECTED',
-    });
-
-    _clearBusyForCall(listenerUserId, callerId);
   });
 
   // Joined call channel (for both parties)
