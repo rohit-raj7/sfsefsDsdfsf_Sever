@@ -251,6 +251,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         FROM listeners l
         JOIN users u ON l.user_id = u.user_id
         WHERE l.is_active = TRUE
+          AND l.is_available = TRUE
           AND l.verification_status = 'approved'
           AND (l.quality_status IN ('probation', 'active', 'warning'))
           AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}${genderClause}
@@ -269,6 +270,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         FROM listeners l
         JOIN users u ON l.user_id = u.user_id
         WHERE l.is_active = TRUE
+          AND l.is_available = TRUE
           AND l.verification_status = 'approved'
           AND l.quality_status IN ('active', 'warning')
           AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}${genderClause}
@@ -287,6 +289,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         FROM listeners l
         JOIN users u ON l.user_id = u.user_id
         WHERE l.is_active = TRUE
+          AND l.is_available = TRUE
           AND l.verification_status = 'approved'
           AND l.quality_status = 'active'
           AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}${genderClause}
@@ -310,6 +313,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         FROM listeners l
         JOIN users u ON l.user_id = u.user_id
         WHERE l.is_active = TRUE
+          AND l.is_available = TRUE
           AND l.verification_status = 'approved'
           AND l.quality_status = 'active'
           AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}
