@@ -749,6 +749,16 @@ class Listener {
     await pool.query(query, [user_id]);
   }
 
+  // Clear last active timestamp by user_id to mark offline immediately
+  static async setOfflineByUserId(user_id) {
+    const query = `
+      UPDATE listeners 
+      SET last_active_at = NULL
+      WHERE user_id = $1
+    `;
+    await pool.query(query, [user_id]);
+  }
+
   // Increment call statistics
   static async incrementCallStats(listener_id, duration_minutes) {
     const query = `
@@ -900,6 +910,7 @@ class Listener {
       WHERE l.is_available = TRUE AND u.is_active = TRUE
         AND l.is_active = TRUE
         AND COALESCE(l.is_busy, false) = FALSE
+        AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes'
         AND COALESCE(l.verification_status, 'approved') = 'approved' -- VERIFICATION CHECK: Only show approved listeners
     `;
     const values = [];

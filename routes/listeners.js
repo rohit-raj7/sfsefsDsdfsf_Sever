@@ -253,7 +253,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         WHERE l.is_active = TRUE
           AND l.verification_status = 'approved'
           AND (l.quality_status IN ('probation', 'active', 'warning'))
-          AND l.is_online = TRUE AND l.is_busy = FALSE${expertFilter}${genderClause}
+          AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}${genderClause}
         ORDER BY match_rank ASC, l.average_rating DESC
         LIMIT 50
       `;
@@ -271,7 +271,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         WHERE l.is_active = TRUE
           AND l.verification_status = 'approved'
           AND l.quality_status IN ('active', 'warning')
-          AND l.is_online = TRUE AND l.is_busy = FALSE${expertFilter}${genderClause}
+          AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}${genderClause}
         ORDER BY match_rank ASC, l.average_rating DESC
         LIMIT 50
       `;
@@ -289,7 +289,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         WHERE l.is_active = TRUE
           AND l.verification_status = 'approved'
           AND l.quality_status = 'active'
-          AND l.is_online = TRUE AND l.is_busy = FALSE${expertFilter}${genderClause}
+          AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}${genderClause}
         ORDER BY match_rank ASC, l.average_rating DESC, l.total_calls DESC
         LIMIT 50
       `;
@@ -312,7 +312,7 @@ router.get('/smart-match', authenticate, async (req, res) => {
         WHERE l.is_active = TRUE
           AND l.verification_status = 'approved'
           AND l.quality_status = 'active'
-          AND l.is_online = TRUE AND l.is_busy = FALSE${expertFilter}
+          AND l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' AND l.is_busy = FALSE${expertFilter}
           ${whereFilter}
         ORDER BY l.average_rating DESC, l.total_calls DESC
         LIMIT 50

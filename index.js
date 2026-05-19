@@ -454,11 +454,16 @@ io.on('connection', (socket) => {
 
   // Explicit offline events clear foreground/call presence while the socket can
   // remain connected for chat and notification coordination.
-  socket.on('listener:offline', (data) => {
+  socket.on('listener:offline', async (data) => {
     const { listenerUserId } = data || {};
     if (listenerUserId) {
       _markListenerOffline(listenerUserId, 'manual');
-      console.log(`[SOCKET] listener:offline: Ã¢Å“â€œ Listener ${listenerUserId} manually went OFFLINE`);
+      try {
+        await Listener.setOfflineByUserId(listenerUserId);
+      } catch (err) {
+        console.error(`[SOCKET] Error setting DB offline for ${listenerUserId}:`, err);
+      }
+      console.log(`[SOCKET] listener:offline: ✓ Listener ${listenerUserId} manually went OFFLINE`);
     }
   });
 
