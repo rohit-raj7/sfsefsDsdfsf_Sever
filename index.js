@@ -352,79 +352,10 @@ io.on('connection', (socket) => {
     return socketIds;
   }
 
-  const _toIso = (value) => {
-    if (!value) return null;
-    if (value instanceof Date) return value.toISOString();
-    return value;
-  };
-
-  function _buildMessageStatusPayload(row, extra = {}) {
-    const status = row.message_status || row.status || 'sent';
-    return {
-      messageId: row.message_id?.toString?.() ?? row.messageId?.toString?.(),
-      chatId: row.chat_id?.toString?.() ?? row.chatId?.toString?.(),
-      senderId: row.sender_id?.toString?.() ?? row.senderId?.toString?.(),
-      receiverId: row.receiver_id?.toString?.() ?? row.receiverId?.toString?.(),
-      status,
-      deliveredAt: _toIso(row.delivered_at ?? row.deliveredAt),
-      seenAt: _toIso(row.read_at ?? row.seen_at ?? row.seenAt),
-      updatedAt: _toIso(new Date()),
-      ...extra,
-    };
-  }
-
-  function _emitMessageStatus(payload) {
-    if (!payload?.messageId || !payload?.chatId || !payload?.senderId) return;
-
-    io.to(`user_${payload.senderId}`).emit('message:statusUpdated', payload);
-    io.to(`chat_${payload.chatId}`).emit('message:statusUpdated', payload);
-    io.to(`user_${payload.senderId}`).emit('message_status_updated', payload);
-    io.to(`chat_${payload.chatId}`).emit('message_status_updated', payload);
-
-    if (payload.status === 'sent') {
-      io.to(`user_${payload.senderId}`).emit('message:sent', payload);
-    } else if (payload.status === 'delivered') {
-      io.to(`user_${payload.senderId}`).emit('message:delivered', payload);
-      io.to(`user_${payload.senderId}`).emit('message_delivered', payload);
-    } else if (payload.status === 'seen') {
-      io.to(`user_${payload.senderId}`).emit('message:seen', payload);
-      io.to(`user_${payload.senderId}`).emit('messages_seen', {
-        conversationId: payload.chatId,
-        chatId: payload.chatId,
-        readBy: payload.receiverId,
-        seenBy: payload.receiverId,
-        messageIds: [payload.messageId],
-        statuses: [payload],
-      });
-      io.to(`chat_${payload.chatId}`).emit('chat:messages_read', {
-        chatId: payload.chatId,
-        readBy: payload.receiverId,
-        messageIds: [payload.messageId],
-        statuses: [payload],
-      });
-      io.to(`chat_${payload.chatId}`).emit('messages_seen', {
-        conversationId: payload.chatId,
-        chatId: payload.chatId,
-        readBy: payload.receiverId,
-        seenBy: payload.receiverId,
-        messageIds: [payload.messageId],
-        statuses: [payload],
-      });
-    }
-  }
-
-  function _emitStatusRows(rows, extra = {}) {
-    if (!Array.isArray(rows) || rows.length === 0) return;
-    for (const row of rows) {
-      const payload = _buildMessageStatusPayload(row, extra);
-      _emitMessageStatus(payload);
-    }
-  }
-
   // 1. IDENTITY & PRESENCE
   
   // User joins (can be regular user or listener)
-  socket.on('user:join', async (data) => {
+  socket.on('user:join', (data) => {
     // Support both old format (just userId string) and new format (object with userId, userName, avatar)
     let userId, userName, userAvatar, activelyViewingChatId;
     if (typeof data === 'string') {
@@ -472,14 +403,6 @@ io.on('connection', (socket) => {
 
     // SELF-HEAL: Sync presence state with DB
     _syncUserBusyStateWithDatabase(userId);
-
-    // Mark all pending incoming messages as delivered for this user and notify senders.
-    try {
-      const deliveredRows = await Message.markUndeliveredAsDeliveredForUser(userId);
-      _emitStatusRows(deliveredRows, { receiverId: userId, updatedBy: userId });
-    } catch (deliveryErr) {
-      console.error('[SOCKET] Failed to mark pending messages as delivered on user:join:', deliveryErr.message);
-    }
   });
 
   // Listener specific join (for availability tracking)
@@ -1479,15 +1402,6 @@ io.on('connection', (socket) => {
     
     console.log(`[SOCKET] User ${socket.userId} joined chat room: ${chatId} (activelyViewing: ${isActivelyViewing})`);
 
-    // Joining chat means receiver device can receive messages in this conversation.
-    // Mark all still-sent incoming messages as delivered and notify sender side.
-    try {
-      const deliveredRows = await Message.markAsDelivered(chatId, socket.userId);
-      _emitStatusRows(deliveredRows, { receiverId: socket.userId, updatedBy: socket.userId });
-    } catch (deliveryErr) {
-      console.error('[SOCKET] Error marking chat messages delivered on join:', deliveryErr.message);
-    }
-
     // Fetch and send chat history
     try {
       const messages = await Message.getChatMessages(chatId, 50, 0);
@@ -1591,14 +1505,11 @@ io.on('connection', (socket) => {
   });
 
   // Send a message in a chat
-  const handleSendMessage = async (data, sourceEvent = 'chat:send') => {
-    const chatId = data?.chatId || data?.conversationId;
-    const content = data?.content || data?.message_content || data?.messageContent;
-    const messageType = data?.messageType || data?.message_type || 'text';
-    const mediaUrl = data?.mediaUrl || data?.media_url;
+  socket.on('chat:send', async (data) => {
+    const { chatId, content, messageType = 'text', mediaUrl } = data || {};
     
     if (!chatId || !content || !socket.userId) {
-      console.log(`[SOCKET] ${sourceEvent} failed - missing required fields`);
+      console.log(`[SOCKET] chat:send failed - missing required fields`);
       socket.emit('chat:error', { error: 'Missing required fields' });
       return;
     }
@@ -1683,35 +1594,9 @@ io.on('connection', (socket) => {
         }
       };
 
-      // Sender-side ack: persisted successfully in backend
-      const sentStatusPayload = _buildMessageStatusPayload(
-        {
-          message_id: message.message_id,
-          chat_id: chatId,
-          sender_id: socket.userId,
-          receiver_id: otherUserId,
-          message_status: 'sent',
-          delivered_at: null,
-          read_at: null,
-        },
-        { updatedBy: socket.userId }
-      );
-      _emitMessageStatus(sentStatusPayload);
-
       // Broadcast message to all users in the chat room IMMEDIATELY (real-time UI update)
       console.log(`[SOCKET] chat:send timestamp debug: raw=${message.created_at}, type=${typeof message.created_at}, isDate=${message.created_at instanceof Date}, final=${messageData.message.created_at}`);
       io.to(`chat_${chatId}`).emit('chat:message', messageData);
-      io.to(`chat_${chatId}`).emit('receive_message', {
-        conversationId: chatId,
-        ...messageData,
-      });
-
-      // Delivery ack: if receiver is connected to any socket, mark as delivered right away.
-      const receiverSockets = connectedUsers.get(otherUserId);
-      if (receiverSockets && receiverSockets.size > 0) {
-        const deliveredRows = await Message.markAsDelivered(chatId, otherUserId);
-        _emitStatusRows(deliveredRows, { receiverId: otherUserId, updatedBy: otherUserId });
-      }
 
       // Send notification to offline/non-viewing users asynchronously (don't block)
       Promise.resolve(chat).then(chatData => {
@@ -1735,10 +1620,7 @@ io.on('connection', (socket) => {
       console.error(`[SOCKET] Error stack:`, error.stack);
       socket.emit('chat:error', { error: `Failed to send message: ${error.message || 'Unknown error'}` });
     }
-  };
-
-  socket.on('chat:send', (data) => handleSendMessage(data, 'chat:send'));
-  socket.on('send_message', (data) => handleSendMessage(data, 'send_message'));
+  });
 
   // Typing indicator
   socket.on('chat:typing', (data) => {
@@ -1754,33 +1636,57 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Mark messages as read
-  const handleMessagesSeen = async (data, sourceEvent = 'chat:read') => {
+  // Mark messages as read (seen) — WhatsApp-style
+  // 1. Updates DB: is_read=TRUE, status='seen'
+  // 2. Notifies ONLY the original sender of each message via their personal
+  //    room (user_${senderId}) so their tick turns green. We do NOT emit to
+  //    the chat room because:
+  //    a) That would deliver the event twice to the sender (who is in the room)
+  //    b) The receiver (who triggered chat:read) should never update their own ticks
+  socket.on('chat:read', async (data) => {
     const { chatId } = data || {};
     if (!chatId || !socket.userId) return;
 
     try {
-      const seenRows = await Message.markAsRead(chatId, socket.userId);
-      _emitStatusRows(seenRows, { receiverId: socket.userId, updatedBy: socket.userId });
+      // markAsRead returns [{message_id, sender_id}, ...] — only unread messages
+      // sent by OTHER users (not the reader themselves)
+      const updatedRows = await Message.markAsRead(chatId, socket.userId);
 
-      // Backward-compatible aggregate read event
+      // Broadcast generic read receipt to the whole chat room (for typing indicator
+      // dismissal and other generic UI updates on the sender side)
       socket.to(`chat_${chatId}`).emit('chat:messages_read', {
         chatId,
-        readBy: socket.userId,
-        messageIds: seenRows.map((row) => row.message_id),
+        readBy: socket.userId
       });
-    } catch (error) {
-      console.error(`[SOCKET] Error handling ${sourceEvent}:`, error);
-    }
-  };
 
-  socket.on('chat:read', (data) => handleMessagesSeen(data, 'chat:read'));
-  socket.on('messages_seen', (data) => {
-    const normalized = {
-      ...data,
-      chatId: data?.chatId || data?.conversationId,
-    };
-    handleMessagesSeen(normalized, 'messages_seen');
+      if (!updatedRows || updatedRows.length === 0) return;
+
+      // Group message IDs by original sender
+      const bySender = {};
+      for (const row of updatedRows) {
+        const sid = row.sender_id;
+        if (!sid) continue; // skip rows with null sender (deleted users)
+        if (!bySender[sid]) bySender[sid] = [];
+        bySender[sid].push(row.message_id);
+      }
+
+      // Notify each original sender via their personal room ONLY
+      // Using personal room avoids double delivery when sender is also in chat room
+      for (const [senderId, messageIds] of Object.entries(bySender)) {
+        if (messageIds.length === 0) continue;
+        const payload = {
+          chatId,
+          messageIds,
+          status: 'seen',
+          seenBy: socket.userId,
+        };
+        // Personal room: sender receives this regardless of which screen they're on
+        io.to(`user_${senderId}`).emit('message_status_updated', payload);
+        console.log(`[SOCKET] chat:read: Notified sender ${senderId} — ${messageIds.length} msg(s) seen in chat ${chatId}`);
+      }
+    } catch (error) {
+      console.error(`[SOCKET] Error marking messages as read:`, error);
+    }
   });
 
   // WhatsApp-style: Delete message for everyone

@@ -431,8 +431,6 @@ async function ensureSchema() {
         message_type VARCHAR(20) DEFAULT 'text',
         message_content TEXT NOT NULL,
         media_url TEXT,
-        message_status VARCHAR(20) DEFAULT 'sent',
-        delivered_at TIMESTAMP,
         is_read BOOLEAN DEFAULT FALSE,
         read_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -660,32 +658,7 @@ async function ensureSchema() {
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_applied BOOLEAN DEFAULT FALSE;
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_flat_price DECIMAL(10, 2);
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_minutes_limit INTEGER;
-
-      -- Chat message lifecycle columns for WhatsApp-like ticks
-      ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_status VARCHAR(20) DEFAULT 'sent';
-      ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP;
-
-      -- Backfill status for existing rows before we enforce/check status transitions
-      UPDATE messages
-      SET message_status = CASE
-        WHEN is_read = TRUE THEN 'seen'
-        WHEN delivered_at IS NOT NULL THEN 'delivered'
-        ELSE 'sent'
-      END
-      WHERE message_status IS NULL;
-
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'messages_status_check'
-        ) THEN
-          ALTER TABLE messages
-          ADD CONSTRAINT messages_status_check
-          CHECK (message_status IN ('sent', 'delivered', 'seen'));
-        END IF;
-      END$$;
-    `;
+`;
     await pool.query(alterSql);
     console.log('✓ Ensured users and listeners table schema');
 
@@ -803,6 +776,16 @@ async function ensureSchema() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS last_charge_applied_at TIMESTAMP;
     `);
     console.log('✓ Ensured users table has chat charging columns');
+
+    // Add WhatsApp-style message status column (sent/delivered/seen) for tick UI
+    await pool.query(`
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'sent';
+    `);
+    // Backfill existing is_read=TRUE messages to status='seen'
+    await pool.query(`
+      UPDATE messages SET status = 'seen' WHERE is_read = TRUE AND (status IS NULL OR status = 'sent');
+    `);
+    console.log('✓ Ensured messages table has status column (sent/delivered/seen)');
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS call_records (
