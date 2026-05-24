@@ -352,10 +352,60 @@ io.on('connection', (socket) => {
     return socketIds;
   }
 
+  const _toIso = (value) => {
+    if (!value) return null;
+    if (value instanceof Date) return value.toISOString();
+    return value;
+  };
+
+  function _buildMessageStatusPayload(row, extra = {}) {
+    const status = row.message_status || row.status || 'sent';
+    return {
+      messageId: row.message_id?.toString?.() ?? row.messageId?.toString?.(),
+      chatId: row.chat_id?.toString?.() ?? row.chatId?.toString?.(),
+      senderId: row.sender_id?.toString?.() ?? row.senderId?.toString?.(),
+      receiverId: row.receiver_id?.toString?.() ?? row.receiverId?.toString?.(),
+      status,
+      deliveredAt: _toIso(row.delivered_at ?? row.deliveredAt),
+      seenAt: _toIso(row.read_at ?? row.seen_at ?? row.seenAt),
+      updatedAt: _toIso(new Date()),
+      ...extra,
+    };
+  }
+
+  function _emitMessageStatus(payload) {
+    if (!payload?.messageId || !payload?.chatId || !payload?.senderId) return;
+
+    io.to(`user_${payload.senderId}`).emit('message:statusUpdated', payload);
+    io.to(`chat_${payload.chatId}`).emit('message:statusUpdated', payload);
+
+    if (payload.status === 'sent') {
+      io.to(`user_${payload.senderId}`).emit('message:sent', payload);
+    } else if (payload.status === 'delivered') {
+      io.to(`user_${payload.senderId}`).emit('message:delivered', payload);
+    } else if (payload.status === 'seen') {
+      io.to(`user_${payload.senderId}`).emit('message:seen', payload);
+      io.to(`chat_${payload.chatId}`).emit('chat:messages_read', {
+        chatId: payload.chatId,
+        readBy: payload.receiverId,
+        messageIds: [payload.messageId],
+        statuses: [payload],
+      });
+    }
+  }
+
+  function _emitStatusRows(rows, extra = {}) {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    for (const row of rows) {
+      const payload = _buildMessageStatusPayload(row, extra);
+      _emitMessageStatus(payload);
+    }
+  }
+
   // 1. IDENTITY & PRESENCE
   
   // User joins (can be regular user or listener)
-  socket.on('user:join', (data) => {
+  socket.on('user:join', async (data) => {
     // Support both old format (just userId string) and new format (object with userId, userName, avatar)
     let userId, userName, userAvatar, activelyViewingChatId;
     if (typeof data === 'string') {
@@ -403,6 +453,14 @@ io.on('connection', (socket) => {
 
     // SELF-HEAL: Sync presence state with DB
     _syncUserBusyStateWithDatabase(userId);
+
+    // Mark all pending incoming messages as delivered for this user and notify senders.
+    try {
+      const deliveredRows = await Message.markUndeliveredAsDeliveredForUser(userId);
+      _emitStatusRows(deliveredRows, { receiverId: userId, updatedBy: userId });
+    } catch (deliveryErr) {
+      console.error('[SOCKET] Failed to mark pending messages as delivered on user:join:', deliveryErr.message);
+    }
   });
 
   // Listener specific join (for availability tracking)
@@ -1402,6 +1460,15 @@ io.on('connection', (socket) => {
     
     console.log(`[SOCKET] User ${socket.userId} joined chat room: ${chatId} (activelyViewing: ${isActivelyViewing})`);
 
+    // Joining chat means receiver device can receive messages in this conversation.
+    // Mark all still-sent incoming messages as delivered and notify sender side.
+    try {
+      const deliveredRows = await Message.markAsDelivered(chatId, socket.userId);
+      _emitStatusRows(deliveredRows, { receiverId: socket.userId, updatedBy: socket.userId });
+    } catch (deliveryErr) {
+      console.error('[SOCKET] Error marking chat messages delivered on join:', deliveryErr.message);
+    }
+
     // Fetch and send chat history
     try {
       const messages = await Message.getChatMessages(chatId, 50, 0);
@@ -1594,9 +1661,31 @@ io.on('connection', (socket) => {
         }
       };
 
+      // Sender-side ack: persisted successfully in backend
+      const sentStatusPayload = _buildMessageStatusPayload(
+        {
+          message_id: message.message_id,
+          chat_id: chatId,
+          sender_id: socket.userId,
+          receiver_id: otherUserId,
+          message_status: 'sent',
+          delivered_at: null,
+          read_at: null,
+        },
+        { updatedBy: socket.userId }
+      );
+      _emitMessageStatus(sentStatusPayload);
+
       // Broadcast message to all users in the chat room IMMEDIATELY (real-time UI update)
       console.log(`[SOCKET] chat:send timestamp debug: raw=${message.created_at}, type=${typeof message.created_at}, isDate=${message.created_at instanceof Date}, final=${messageData.message.created_at}`);
       io.to(`chat_${chatId}`).emit('chat:message', messageData);
+
+      // Delivery ack: if receiver is connected to any socket, mark as delivered right away.
+      const receiverSockets = connectedUsers.get(otherUserId);
+      if (receiverSockets && receiverSockets.size > 0) {
+        const deliveredRows = await Message.markAsDelivered(chatId, otherUserId);
+        _emitStatusRows(deliveredRows, { receiverId: otherUserId, updatedBy: otherUserId });
+      }
 
       // Send notification to offline/non-viewing users asynchronously (don't block)
       Promise.resolve(chat).then(chatData => {
@@ -1642,12 +1731,14 @@ io.on('connection', (socket) => {
     if (!chatId || !socket.userId) return;
 
     try {
-      await Message.markAsRead(chatId, socket.userId);
-      
-      // Notify the other user that messages were read
+      const seenRows = await Message.markAsRead(chatId, socket.userId);
+      _emitStatusRows(seenRows, { receiverId: socket.userId, updatedBy: socket.userId });
+
+      // Backward-compatible aggregate read event
       socket.to(`chat_${chatId}`).emit('chat:messages_read', {
         chatId,
-        readBy: socket.userId
+        readBy: socket.userId,
+        messageIds: seenRows.map((row) => row.message_id),
       });
     } catch (error) {
       console.error(`[SOCKET] Error marking messages as read:`, error);

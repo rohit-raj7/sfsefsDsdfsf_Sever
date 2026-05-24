@@ -129,6 +129,10 @@ class Chat {
 }
 
 class Message {
+  static STATUS_SENT = 'sent';
+  static STATUS_DELIVERED = 'delivered';
+  static STATUS_SEEN = 'seen';
+
   // Send a message
   static async create(messageData) {
     const {
@@ -140,12 +144,26 @@ class Message {
     } = messageData;
 
     const query = `
-      INSERT INTO messages (chat_id, sender_id, message_type, message_content, media_url)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO messages (
+        chat_id,
+        sender_id,
+        message_type,
+        message_content,
+        media_url,
+        message_status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
     `;
 
-    const values = [chat_id, sender_id, message_type, message_content, media_url];
+    const values = [
+      chat_id,
+      sender_id,
+      message_type,
+      message_content,
+      media_url,
+      Message.STATUS_SENT,
+    ];
     const result = await pool.query(query, values);
 
     // Update last message in chat
@@ -157,7 +175,15 @@ class Message {
   // Get messages for a chat
   static async getChatMessages(chat_id, limit = 50, offset = 0) {
     const query = `
-      SELECT m.*, 
+      SELECT m.*,
+             COALESCE(
+               m.message_status,
+               CASE
+                 WHEN m.is_read = TRUE THEN '${Message.STATUS_SEEN}'
+                 WHEN m.delivered_at IS NOT NULL THEN '${Message.STATUS_DELIVERED}'
+                 ELSE '${Message.STATUS_SENT}'
+               END
+             ) as message_status,
              COALESCE(l.professional_name, u.display_name) as sender_name, 
              COALESCE(l.profile_image, u.avatar_url) as sender_avatar
       FROM messages m
@@ -175,13 +201,51 @@ class Message {
   static async markAsRead(chat_id, user_id) {
     const query = `
       UPDATE messages 
-      SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
+      SET is_read = TRUE,
+          read_at = CURRENT_TIMESTAMP,
+          delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP),
+          message_status = '${Message.STATUS_SEEN}'
       WHERE chat_id = $1 
         AND sender_id != $2 
-        AND is_read = FALSE
-      RETURNING message_id
+        AND (
+          is_read = FALSE
+          OR COALESCE(message_status, '${Message.STATUS_SENT}') != '${Message.STATUS_SEEN}'
+        )
+      RETURNING message_id, chat_id, sender_id, message_status, delivered_at, read_at
     `;
     const result = await pool.query(query, [chat_id, user_id]);
+    return result.rows;
+  }
+
+  // Mark received messages in a chat as delivered (idempotent)
+  static async markAsDelivered(chat_id, user_id) {
+    const query = `
+      UPDATE messages
+      SET message_status = '${Message.STATUS_DELIVERED}',
+          delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP)
+      WHERE chat_id = $1
+        AND sender_id != $2
+        AND COALESCE(message_status, '${Message.STATUS_SENT}') = '${Message.STATUS_SENT}'
+      RETURNING message_id, chat_id, sender_id, message_status, delivered_at, read_at
+    `;
+    const result = await pool.query(query, [chat_id, user_id]);
+    return result.rows;
+  }
+
+  // Mark all pending incoming messages as delivered when user connects/reconnects
+  static async markUndeliveredAsDeliveredForUser(user_id) {
+    const query = `
+      UPDATE messages m
+      SET message_status = '${Message.STATUS_DELIVERED}',
+          delivered_at = COALESCE(m.delivered_at, CURRENT_TIMESTAMP)
+      FROM chats c
+      WHERE m.chat_id = c.chat_id
+        AND (c.user1_id = $1 OR c.user2_id = $1)
+        AND m.sender_id != $1
+        AND COALESCE(m.message_status, '${Message.STATUS_SENT}') = '${Message.STATUS_SENT}'
+      RETURNING m.message_id, m.chat_id, m.sender_id, m.message_status, m.delivered_at, m.read_at
+    `;
+    const result = await pool.query(query, [user_id]);
     return result.rows;
   }
 

@@ -7,6 +7,45 @@ import { authenticate } from '../middleware/auth.js';
 export default function createChatsRouter(io) {
   const router = express.Router();
 
+  const toIso = (value) => {
+    if (!value) return null;
+    if (value instanceof Date) return value.toISOString();
+    return value;
+  };
+
+  const emitStatusPayload = (payload) => {
+    if (!io || !payload?.messageId || !payload?.chatId || !payload?.senderId) return;
+
+    io.to(`user_${payload.senderId}`).emit('message:statusUpdated', payload);
+    io.to(`chat_${payload.chatId}`).emit('message:statusUpdated', payload);
+
+    if (payload.status === 'sent') {
+      io.to(`user_${payload.senderId}`).emit('message:sent', payload);
+    } else if (payload.status === 'delivered') {
+      io.to(`user_${payload.senderId}`).emit('message:delivered', payload);
+    } else if (payload.status === 'seen') {
+      io.to(`user_${payload.senderId}`).emit('message:seen', payload);
+    }
+  };
+
+  const emitStatusRows = (rows, { receiverId, updatedBy } = {}) => {
+    if (!io || !Array.isArray(rows) || rows.length === 0) return;
+    for (const row of rows) {
+      const payload = {
+        messageId: row.message_id?.toString(),
+        chatId: row.chat_id?.toString(),
+        senderId: row.sender_id?.toString(),
+        receiverId: receiverId?.toString(),
+        status: row.message_status || 'sent',
+        deliveredAt: toIso(row.delivered_at),
+        seenAt: toIso(row.read_at),
+        updatedBy: updatedBy?.toString(),
+        updatedAt: new Date().toISOString(),
+      };
+      emitStatusPayload(payload);
+    }
+  };
+
   // GET /api/chats
   // Get all chats for current user
   router.get('/', authenticate, async (req, res) => {
@@ -108,8 +147,9 @@ router.get('/:chat_id/messages', authenticate, async (req, res) => {
 
     const messages = await Message.getChatMessages(req.params.chat_id, limit, offset);
 
-    // Mark messages as read
-    await Message.markAsRead(req.params.chat_id, req.userId);
+    // Mark messages as read and notify sender side
+    const seenRows = await Message.markAsRead(req.params.chat_id, req.userId);
+    emitStatusRows(seenRows, { receiverId: req.userId, updatedBy: req.userId });
 
     res.json({
       messages,
@@ -205,12 +245,30 @@ router.post('/:chat_id/messages', authenticate, async (req, res) => {
         }
       };
 
+      emitStatusPayload({
+        messageId: message.message_id?.toString(),
+        chatId: req.params.chat_id,
+        senderId: req.userId,
+        receiverId: otherUserId,
+        status: 'sent',
+        deliveredAt: null,
+        seenAt: null,
+        updatedBy: req.userId,
+        updatedAt: new Date().toISOString(),
+      });
+
       // Broadcast to all users in the chat room
       io.to(`chat_${req.params.chat_id}`).emit('chat:message', messageData);
 
       // Also send notification to the other user
-      const otherUserId = chat.user1_id === req.userId ? chat.user2_id : chat.user1_id;
       io.to(`user_${otherUserId}`).emit('chat:new_message_notification', messageData);
+
+      // If receiver is connected, mark as delivered immediately
+      const receiverRoom = io.sockets.adapter.rooms.get(`user_${otherUserId}`);
+      if (receiverRoom && receiverRoom.size > 0) {
+        const deliveredRows = await Message.markAsDelivered(req.params.chat_id, otherUserId);
+        emitStatusRows(deliveredRows, { receiverId: otherUserId, updatedBy: otherUserId });
+      }
       
       console.log(`[REST API] Message sent in chat ${req.params.chat_id}, emitted to socket`);
     }
@@ -264,6 +322,7 @@ router.delete('/:chat_id/messages', authenticate, async (req, res) => {
 router.put('/:chat_id/read', authenticate, async (req, res) => {
   try {
     const markedMessages = await Message.markAsRead(req.params.chat_id, req.userId);
+    emitStatusRows(markedMessages, { receiverId: req.userId, updatedBy: req.userId });
 
     res.json({
       message: 'Messages marked as read',

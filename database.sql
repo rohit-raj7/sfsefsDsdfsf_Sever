@@ -246,6 +246,8 @@ CREATE TABLE IF NOT EXISTS messages (
     message_type VARCHAR(20) DEFAULT 'text' CHECK (message_type IN ('text', 'image', 'audio', 'video', 'file')),
     message_content TEXT NOT NULL,
     media_url TEXT,
+    message_status VARCHAR(20) DEFAULT 'sent' CHECK (message_status IN ('sent', 'delivered', 'seen')),
+    delivered_at TIMESTAMP,
     is_read BOOLEAN DEFAULT FALSE,
     read_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

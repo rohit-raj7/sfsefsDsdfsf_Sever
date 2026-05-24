@@ -431,6 +431,8 @@ async function ensureSchema() {
         message_type VARCHAR(20) DEFAULT 'text',
         message_content TEXT NOT NULL,
         media_url TEXT,
+        message_status VARCHAR(20) DEFAULT 'sent',
+        delivered_at TIMESTAMP,
         is_read BOOLEAN DEFAULT FALSE,
         read_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -658,6 +660,31 @@ async function ensureSchema() {
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_applied BOOLEAN DEFAULT FALSE;
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_flat_price DECIMAL(10, 2);
       ALTER TABLE calls ADD COLUMN IF NOT EXISTS offer_minutes_limit INTEGER;
+
+      -- Chat message lifecycle columns for WhatsApp-like ticks
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_status VARCHAR(20) DEFAULT 'sent';
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP;
+
+      -- Backfill status for existing rows before we enforce/check status transitions
+      UPDATE messages
+      SET message_status = CASE
+        WHEN is_read = TRUE THEN 'seen'
+        WHEN delivered_at IS NOT NULL THEN 'delivered'
+        ELSE 'sent'
+      END
+      WHERE message_status IS NULL;
+
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'messages_status_check'
+        ) THEN
+          ALTER TABLE messages
+          ADD CONSTRAINT messages_status_check
+          CHECK (message_status IN ('sent', 'delivered', 'seen'));
+        END IF;
+      END$$;
     `;
     await pool.query(alterSql);
     console.log('✓ Ensured users and listeners table schema');
