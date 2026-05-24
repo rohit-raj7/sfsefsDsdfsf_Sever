@@ -378,16 +378,35 @@ io.on('connection', (socket) => {
 
     io.to(`user_${payload.senderId}`).emit('message:statusUpdated', payload);
     io.to(`chat_${payload.chatId}`).emit('message:statusUpdated', payload);
+    io.to(`user_${payload.senderId}`).emit('message_status_updated', payload);
+    io.to(`chat_${payload.chatId}`).emit('message_status_updated', payload);
 
     if (payload.status === 'sent') {
       io.to(`user_${payload.senderId}`).emit('message:sent', payload);
     } else if (payload.status === 'delivered') {
       io.to(`user_${payload.senderId}`).emit('message:delivered', payload);
+      io.to(`user_${payload.senderId}`).emit('message_delivered', payload);
     } else if (payload.status === 'seen') {
       io.to(`user_${payload.senderId}`).emit('message:seen', payload);
+      io.to(`user_${payload.senderId}`).emit('messages_seen', {
+        conversationId: payload.chatId,
+        chatId: payload.chatId,
+        readBy: payload.receiverId,
+        seenBy: payload.receiverId,
+        messageIds: [payload.messageId],
+        statuses: [payload],
+      });
       io.to(`chat_${payload.chatId}`).emit('chat:messages_read', {
         chatId: payload.chatId,
         readBy: payload.receiverId,
+        messageIds: [payload.messageId],
+        statuses: [payload],
+      });
+      io.to(`chat_${payload.chatId}`).emit('messages_seen', {
+        conversationId: payload.chatId,
+        chatId: payload.chatId,
+        readBy: payload.receiverId,
+        seenBy: payload.receiverId,
         messageIds: [payload.messageId],
         statuses: [payload],
       });
@@ -1572,11 +1591,14 @@ io.on('connection', (socket) => {
   });
 
   // Send a message in a chat
-  socket.on('chat:send', async (data) => {
-    const { chatId, content, messageType = 'text', mediaUrl } = data || {};
+  const handleSendMessage = async (data, sourceEvent = 'chat:send') => {
+    const chatId = data?.chatId || data?.conversationId;
+    const content = data?.content || data?.message_content || data?.messageContent;
+    const messageType = data?.messageType || data?.message_type || 'text';
+    const mediaUrl = data?.mediaUrl || data?.media_url;
     
     if (!chatId || !content || !socket.userId) {
-      console.log(`[SOCKET] chat:send failed - missing required fields`);
+      console.log(`[SOCKET] ${sourceEvent} failed - missing required fields`);
       socket.emit('chat:error', { error: 'Missing required fields' });
       return;
     }
@@ -1679,6 +1701,10 @@ io.on('connection', (socket) => {
       // Broadcast message to all users in the chat room IMMEDIATELY (real-time UI update)
       console.log(`[SOCKET] chat:send timestamp debug: raw=${message.created_at}, type=${typeof message.created_at}, isDate=${message.created_at instanceof Date}, final=${messageData.message.created_at}`);
       io.to(`chat_${chatId}`).emit('chat:message', messageData);
+      io.to(`chat_${chatId}`).emit('receive_message', {
+        conversationId: chatId,
+        ...messageData,
+      });
 
       // Delivery ack: if receiver is connected to any socket, mark as delivered right away.
       const receiverSockets = connectedUsers.get(otherUserId);
@@ -1709,7 +1735,10 @@ io.on('connection', (socket) => {
       console.error(`[SOCKET] Error stack:`, error.stack);
       socket.emit('chat:error', { error: `Failed to send message: ${error.message || 'Unknown error'}` });
     }
-  });
+  };
+
+  socket.on('chat:send', (data) => handleSendMessage(data, 'chat:send'));
+  socket.on('send_message', (data) => handleSendMessage(data, 'send_message'));
 
   // Typing indicator
   socket.on('chat:typing', (data) => {
@@ -1726,7 +1755,7 @@ io.on('connection', (socket) => {
   });
 
   // Mark messages as read
-  socket.on('chat:read', async (data) => {
+  const handleMessagesSeen = async (data, sourceEvent = 'chat:read') => {
     const { chatId } = data || {};
     if (!chatId || !socket.userId) return;
 
@@ -1741,8 +1770,17 @@ io.on('connection', (socket) => {
         messageIds: seenRows.map((row) => row.message_id),
       });
     } catch (error) {
-      console.error(`[SOCKET] Error marking messages as read:`, error);
+      console.error(`[SOCKET] Error handling ${sourceEvent}:`, error);
     }
+  };
+
+  socket.on('chat:read', (data) => handleMessagesSeen(data, 'chat:read'));
+  socket.on('messages_seen', (data) => {
+    const normalized = {
+      ...data,
+      chatId: data?.chatId || data?.conversationId,
+    };
+    handleMessagesSeen(normalized, 'messages_seen');
   });
 
   // WhatsApp-style: Delete message for everyone
