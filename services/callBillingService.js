@@ -3,12 +3,30 @@ import { resolveRateForListener } from './rateSettingsService.js';
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 
-const calculateCallCharge = (durationSeconds, userRate, payoutRate) => {
+const calculateCallCharge = (durationSeconds, userRate, payoutRate, incrementOptions = null) => {
   const seconds = Math.max(0, Math.floor(Number(durationSeconds) || 0));
   const minutes = Math.ceil(seconds / 60);
   const userCharge = roundMoney(minutes * Number(userRate || 0));
 
-  const listenerEarn = roundMoney(minutes * Number(payoutRate || 0));
+  let listenerEarn = 0;
+  if (incrementOptions && incrementOptions.interval > 0 && incrementOptions.increment > 0) {
+    const { interval, increment, maxRate } = incrementOptions;
+    let currentRate = Number(payoutRate || 0);
+
+    for (let m = 1; m <= minutes; m++) {
+      if (m > 1 && (m - 1) % interval === 0) {
+        currentRate += increment;
+        if (maxRate && currentRate > maxRate) {
+          currentRate = maxRate;
+        }
+      }
+      listenerEarn += currentRate;
+    }
+  } else {
+    listenerEarn = roundMoney(minutes * Number(payoutRate || 0));
+  }
+
+  listenerEarn = roundMoney(listenerEarn);
 
   return { minutes, userCharge, listenerEarn };
 };
@@ -285,8 +303,9 @@ const finalizeCallBilling = async ({ callId, durationSeconds }) => {
     let userRate = Number(call.billed_user_rate_per_min || call.rate_per_minute || 0);
     let payoutRate = Number(call.billed_payout_rate_per_min || 0);
 
+    const resolvedRates = await resolveRateForListener(call.listener_id, client);
+
     if (!Number.isFinite(userRate) || userRate <= 0 || !Number.isFinite(payoutRate) || payoutRate <= 0) {
-      const resolvedRates = await resolveRateForListener(call.listener_id, client);
       if (!Number.isFinite(userRate) || userRate <= 0) {
         userRate = Number(resolvedRates?.userRate || 0);
       }
@@ -321,10 +340,17 @@ const finalizeCallBilling = async ({ callId, durationSeconds }) => {
     const offer = normalizeOfferForCall(call, caller);
     const offerApplied = offer.applied;
 
+    const incrementOptions = resolvedRates ? {
+      interval: Number(resolvedRates.incrementIntervalMins || 0),
+      increment: Number(resolvedRates.payoutIncrement || 0),
+      maxRate: Number(resolvedRates.maxPayoutRate || 0),
+    } : null;
+
     const { minutes, listenerEarn } = calculateCallCharge(
       durationSeconds,
       userRate,
-      payoutRate
+      payoutRate,
+      incrementOptions
     );
     const userCharge = calculateUserChargeWithOffer(minutes, userRate, offer);
 

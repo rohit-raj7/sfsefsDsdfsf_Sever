@@ -82,6 +82,9 @@ const mapGlobalRate = (row) => ({
   configId: row.config_id,
   userRate: Number(row.user_rate),
   payoutRate: Number(row.payout_rate),
+  incrementIntervalMins: Number(row.increment_interval_mins) || 0,
+  payoutIncrement: Number(row.payout_increment) || 0,
+  maxPayoutRate: Number(row.max_payout_rate) || 0,
   updatedAt: row.updated_at,
 });
 
@@ -124,9 +127,12 @@ const findDuplicateRuleByRange = async (
   return result.rows[0] || null;
 };
 
-const validateGlobalRateInput = ({ userRate, payoutRate }) => {
+const validateGlobalRateInput = ({ userRate, payoutRate, incrementIntervalMins, payoutIncrement, maxPayoutRate }) => {
   const parsedUserRate = toNumber(userRate);
   const parsedPayoutRate = toNumber(payoutRate);
+  const parsedInterval = toNumber(incrementIntervalMins) || 0;
+  const parsedIncrement = toNumber(payoutIncrement) || 0;
+  const parsedMax = toNumber(maxPayoutRate) || 0;
 
   if (!isPositiveNumber(parsedUserRate) || !isPositiveNumber(parsedPayoutRate)) {
     return { error: 'User rate and payout must be positive numbers' };
@@ -136,10 +142,17 @@ const validateGlobalRateInput = ({ userRate, payoutRate }) => {
     return { error: 'Payout must be less than or equal to user rate' };
   }
 
+  if (parsedMax > parsedUserRate && parsedMax > 0) {
+    return { error: 'Max payout rate cannot exceed the user rate' };
+  }
+
   return {
     value: {
       userRate: parsedUserRate,
       payoutRate: parsedPayoutRate,
+      incrementIntervalMins: parsedInterval,
+      payoutIncrement: parsedIncrement,
+      maxPayoutRate: parsedMax,
     },
   };
 };
@@ -197,7 +210,7 @@ const validateRuleInput = (rule) => {
 
 const getGlobalRate = async (queryable = pool) => {
   const result = await queryable.query(
-    `SELECT config_id, user_rate, payout_rate, updated_at
+    `SELECT config_id, user_rate, payout_rate, increment_interval_mins, payout_increment, max_payout_rate, updated_at
      FROM listener_global_rate_config
      ORDER BY updated_at DESC
      LIMIT 1`
@@ -209,18 +222,21 @@ const getGlobalRate = async (queryable = pool) => {
   return null;
 };
 
-const upsertGlobalRate = async ({ userRate, payoutRate, adminId }) => {
+const upsertGlobalRate = async ({ userRate, payoutRate, incrementIntervalMins, payoutIncrement, maxPayoutRate, adminId }) => {
   const result = await pool.query(
-    `INSERT INTO listener_global_rate_config (singleton_key, user_rate, payout_rate, updated_by, updated_at)
-     VALUES (TRUE, $1, $2, $3, CURRENT_TIMESTAMP)
+    `INSERT INTO listener_global_rate_config (singleton_key, user_rate, payout_rate, increment_interval_mins, payout_increment, max_payout_rate, updated_by, updated_at)
+     VALUES (TRUE, $1, $2, $4, $5, $6, $3, CURRENT_TIMESTAMP)
      ON CONFLICT (singleton_key)
      DO UPDATE SET
        user_rate = EXCLUDED.user_rate,
        payout_rate = EXCLUDED.payout_rate,
+       increment_interval_mins = EXCLUDED.increment_interval_mins,
+       payout_increment = EXCLUDED.payout_increment,
+       max_payout_rate = EXCLUDED.max_payout_rate,
        updated_by = EXCLUDED.updated_by,
        updated_at = CURRENT_TIMESTAMP
-     RETURNING config_id, user_rate, payout_rate, updated_at`,
-    [userRate, payoutRate, adminId || null]
+     RETURNING config_id, user_rate, payout_rate, increment_interval_mins, payout_increment, max_payout_rate, updated_at`,
+    [userRate, payoutRate, adminId || null, incrementIntervalMins || 0, payoutIncrement || 0, maxPayoutRate || 0]
   );
 
   return mapGlobalRate(result.rows[0]);
@@ -433,11 +449,19 @@ const resolveRateForListener = async (listenerId, queryable = pool) => {
     [averageRating, totalCallMinutes]
   );
 
+  const globalRate = await getGlobalRate(queryable);
+  const incrementIntervalMins = globalRate ? globalRate.incrementIntervalMins : null;
+  const payoutIncrement = globalRate ? globalRate.payoutIncrement : null;
+  const maxPayoutRate = globalRate ? globalRate.maxPayoutRate : null;
+
   if (matchingRule.rows.length > 0) {
     const rule = mapRule(matchingRule.rows[0]);
     return {
       userRate: rule.userRate,
       payoutRate: rule.payoutRate,
+      incrementIntervalMins,
+      payoutIncrement,
+      maxPayoutRate,
       source: 'rule',
       rule,
       averageRating,
@@ -445,11 +469,13 @@ const resolveRateForListener = async (listenerId, queryable = pool) => {
     };
   }
 
-  const globalRate = await getGlobalRate(queryable);
   if (!globalRate) {
     return {
       userRate: null,
       payoutRate: null,
+      incrementIntervalMins: null,
+      payoutIncrement: null,
+      maxPayoutRate: null,
       source: 'none',
       rule: null,
       averageRating,
@@ -459,6 +485,9 @@ const resolveRateForListener = async (listenerId, queryable = pool) => {
   return {
     userRate: globalRate.userRate,
     payoutRate: globalRate.payoutRate,
+    incrementIntervalMins: globalRate.incrementIntervalMins,
+    payoutIncrement: globalRate.payoutIncrement,
+    maxPayoutRate: globalRate.maxPayoutRate,
     source: 'global',
     rule: null,
     averageRating,
