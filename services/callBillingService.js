@@ -3,30 +3,45 @@ import { resolveRateForListener } from './rateSettingsService.js';
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 
-const calculateCallCharge = (durationSeconds, userRate, payoutRate, incrementOptions = null) => {
+const calculateSlabPayout = (minutes, basePayoutRate, slabs = []) => {
+  if (!slabs || slabs.length === 0) {
+    return roundMoney(minutes * Number(basePayoutRate || 0));
+  }
+
+  const maxSlabEnd = Math.max(...slabs.map(s => Number(s.end_duration ?? s.endDuration ?? 0)));
+  let totalEarn = 0;
+
+  for (let m = 1; m <= minutes; m++) {
+    if (m > maxSlabEnd) {
+      // Stop calculation after last slab
+      continue;
+    }
+
+    const matchingSlab = slabs.find(
+      s => Number(s.start_duration ?? s.startDuration ?? 0) <= m && m <= Number(s.end_duration ?? s.endDuration ?? 0)
+    );
+
+    if (matchingSlab) {
+      const rateVal = matchingSlab.payout_per_minute !== undefined ? matchingSlab.payout_per_minute : matchingSlab.payoutPerMinute;
+      const rate = (rateVal !== null && rateVal !== undefined && rateVal !== '')
+        ? Number(rateVal)
+        : Number(basePayoutRate || 0);
+      totalEarn += rate;
+    } else {
+      // Gaps use base rate
+      totalEarn += Number(basePayoutRate || 0);
+    }
+  }
+
+  return roundMoney(totalEarn);
+};
+
+const calculateCallCharge = (durationSeconds, userRate, payoutRate, slabs = []) => {
   const seconds = Math.max(0, Math.floor(Number(durationSeconds) || 0));
   const minutes = Math.ceil(seconds / 60);
   const userCharge = roundMoney(minutes * Number(userRate || 0));
 
-  let listenerEarn = 0;
-  if (incrementOptions && incrementOptions.interval > 0 && incrementOptions.increment > 0) {
-    const { interval, increment, maxRate } = incrementOptions;
-    let currentRate = Number(payoutRate || 0);
-
-    for (let m = 1; m <= minutes; m++) {
-      if (m > 1 && (m - 1) % interval === 0) {
-        currentRate += increment;
-        if (maxRate && currentRate > maxRate) {
-          currentRate = maxRate;
-        }
-      }
-      listenerEarn += currentRate;
-    }
-  } else {
-    listenerEarn = roundMoney(minutes * Number(payoutRate || 0));
-  }
-
-  listenerEarn = roundMoney(listenerEarn);
+  const listenerEarn = calculateSlabPayout(minutes, payoutRate, slabs);
 
   return { minutes, userCharge, listenerEarn };
 };
@@ -303,9 +318,8 @@ const finalizeCallBilling = async ({ callId, durationSeconds }) => {
     let userRate = Number(call.billed_user_rate_per_min || call.rate_per_minute || 0);
     let payoutRate = Number(call.billed_payout_rate_per_min || 0);
 
-    const resolvedRates = await resolveRateForListener(call.listener_id, client);
-
     if (!Number.isFinite(userRate) || userRate <= 0 || !Number.isFinite(payoutRate) || payoutRate <= 0) {
+      const resolvedRates = await resolveRateForListener(call.listener_id, client);
       if (!Number.isFinite(userRate) || userRate <= 0) {
         userRate = Number(resolvedRates?.userRate || 0);
       }
@@ -328,6 +342,11 @@ const finalizeCallBilling = async ({ callId, durationSeconds }) => {
       throw error;
     }
 
+    const slabsResult = await client.query(
+      'SELECT start_duration, end_duration, payout_per_minute FROM listener_payout_slabs ORDER BY start_duration ASC'
+    );
+    const slabs = slabsResult.rows;
+
     const callerResult = await client.query(
       `SELECT is_first_time_user, offer_used, unlimited_expires_at
        FROM users
@@ -340,17 +359,11 @@ const finalizeCallBilling = async ({ callId, durationSeconds }) => {
     const offer = normalizeOfferForCall(call, caller);
     const offerApplied = offer.applied;
 
-    const incrementOptions = resolvedRates ? {
-      interval: Number(resolvedRates.incrementIntervalMins || 0),
-      increment: Number(resolvedRates.payoutIncrement || 0),
-      maxRate: Number(resolvedRates.maxPayoutRate || 0),
-    } : null;
-
     const { minutes, listenerEarn } = calculateCallCharge(
       durationSeconds,
       userRate,
       payoutRate,
-      incrementOptions
+      slabs
     );
     const userCharge = calculateUserChargeWithOffer(minutes, userRate, offer);
 
@@ -374,7 +387,7 @@ const finalizeCallBilling = async ({ callId, durationSeconds }) => {
       const affordableMinutes = calculateAffordableMinutes(walletBalance, userRate, offer);
       billedMinutes = affordableMinutes;
       billedUserCharge = calculateUserChargeWithOffer(billedMinutes, userRate, offer);
-      billedListenerEarn = roundMoney(billedMinutes * payoutRate);
+      billedListenerEarn = calculateSlabPayout(billedMinutes, payoutRate, slabs);
       console.log(`[BILLING] CAPPED: wallet=₹${walletBalance} < charge=₹${userCharge}. Capped to ${billedMinutes}min → user=₹${billedUserCharge}, listener=₹${billedListenerEarn}`);
     }
 
@@ -502,5 +515,5 @@ const finalizeCallBilling = async ({ callId, durationSeconds }) => {
   }
 };
 
-export { calculateCallCharge, finalizeCallBilling, calculateMaxCallDuration, markCallStarted };
+export { calculateCallCharge, finalizeCallBilling, calculateMaxCallDuration, markCallStarted, calculateSlabPayout };
 

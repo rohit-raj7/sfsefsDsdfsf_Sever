@@ -19,7 +19,11 @@ import {
   updateRateRule,
   deleteRateRule,
   getDropdownSettings,
-  updateDropdownSettings
+  updateDropdownSettings,
+  listPayoutSlabs,
+  createPayoutSlab,
+  updatePayoutSlab,
+  deletePayoutSlab
 } from '../services/rateSettingsService.js';
 
 const router = express.Router();
@@ -347,6 +351,66 @@ router.put('/rates/dropdown-settings', authenticateAdmin, async (req, res) => {
   } catch (error) {
     console.error('Update rate dropdown settings error:', error);
     res.status(500).json({ error: 'Failed to save dropdown settings' });
+  }
+});
+
+// GET /api/admin/payout-slabs
+// List all listener payout slabs.
+router.get('/payout-slabs', authenticateAdmin, async (req, res) => {
+  try {
+    const slabs = await listPayoutSlabs();
+    res.json({ slabs });
+  } catch (error) {
+    console.error('Get payout slabs error:', error);
+    res.status(500).json({ error: 'Failed to fetch payout slabs' });
+  }
+});
+
+// POST /api/admin/payout-slabs
+// Create a listener payout slab.
+router.post('/payout-slabs', authenticateAdmin, async (req, res) => {
+  try {
+    const slab = await createPayoutSlab(req.body || {}, req.adminId);
+    res.status(201).json({ message: 'Payout slab saved', slab });
+  } catch (error) {
+    console.error('Create payout slab error:', error);
+    if (error.code === 'OVERLAPPING_SLAB') {
+      return res.status(409).json({ error: error.message });
+    }
+    res.status(500).json({ error: error.message || 'Failed to save payout slab' });
+  }
+});
+
+// PUT /api/admin/payout-slabs/:slabId
+// Update a listener payout slab.
+router.put('/payout-slabs/:slabId', authenticateAdmin, async (req, res) => {
+  try {
+    const slab = await updatePayoutSlab(req.params.slabId, req.body || {}, req.adminId);
+    if (!slab) {
+      return res.status(404).json({ error: 'Payout slab not found' });
+    }
+    res.json({ message: 'Payout slab updated', slab });
+  } catch (error) {
+    console.error('Update payout slab error:', error);
+    if (error.code === 'OVERLAPPING_SLAB') {
+      return res.status(409).json({ error: error.message });
+    }
+    res.status(500).json({ error: error.message || 'Failed to update payout slab' });
+  }
+});
+
+// DELETE /api/admin/payout-slabs/:slabId
+// Delete a listener payout slab.
+router.delete('/payout-slabs/:slabId', authenticateAdmin, async (req, res) => {
+  try {
+    const deleted = await deletePayoutSlab(req.params.slabId);
+    if (!deleted) {
+      return res.status(404).json({ error: 'Payout slab not found' });
+    }
+    res.json({ message: 'Payout slab deleted' });
+  } catch (error) {
+    console.error('Delete payout slab error:', error);
+    res.status(500).json({ error: 'Failed to delete payout slab' });
   }
 });
 

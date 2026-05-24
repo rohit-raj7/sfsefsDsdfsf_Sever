@@ -82,9 +82,6 @@ const mapGlobalRate = (row) => ({
   configId: row.config_id,
   userRate: Number(row.user_rate),
   payoutRate: Number(row.payout_rate),
-  incrementIntervalMins: Number(row.increment_interval_mins) || 0,
-  payoutIncrement: Number(row.payout_increment) || 0,
-  maxPayoutRate: Number(row.max_payout_rate) || 0,
   updatedAt: row.updated_at,
 });
 
@@ -127,12 +124,9 @@ const findDuplicateRuleByRange = async (
   return result.rows[0] || null;
 };
 
-const validateGlobalRateInput = ({ userRate, payoutRate, incrementIntervalMins, payoutIncrement, maxPayoutRate }) => {
+const validateGlobalRateInput = ({ userRate, payoutRate }) => {
   const parsedUserRate = toNumber(userRate);
   const parsedPayoutRate = toNumber(payoutRate);
-  const parsedInterval = toNumber(incrementIntervalMins) || 0;
-  const parsedIncrement = toNumber(payoutIncrement) || 0;
-  const parsedMax = toNumber(maxPayoutRate) || 0;
 
   if (!isPositiveNumber(parsedUserRate) || !isPositiveNumber(parsedPayoutRate)) {
     return { error: 'User rate and payout must be positive numbers' };
@@ -142,17 +136,10 @@ const validateGlobalRateInput = ({ userRate, payoutRate, incrementIntervalMins, 
     return { error: 'Payout must be less than or equal to user rate' };
   }
 
-  if (parsedMax > parsedUserRate && parsedMax > 0) {
-    return { error: 'Max payout rate cannot exceed the user rate' };
-  }
-
   return {
     value: {
       userRate: parsedUserRate,
       payoutRate: parsedPayoutRate,
-      incrementIntervalMins: parsedInterval,
-      payoutIncrement: parsedIncrement,
-      maxPayoutRate: parsedMax,
     },
   };
 };
@@ -210,7 +197,7 @@ const validateRuleInput = (rule) => {
 
 const getGlobalRate = async (queryable = pool) => {
   const result = await queryable.query(
-    `SELECT config_id, user_rate, payout_rate, increment_interval_mins, payout_increment, max_payout_rate, updated_at
+    `SELECT config_id, user_rate, payout_rate, updated_at
      FROM listener_global_rate_config
      ORDER BY updated_at DESC
      LIMIT 1`
@@ -222,21 +209,18 @@ const getGlobalRate = async (queryable = pool) => {
   return null;
 };
 
-const upsertGlobalRate = async ({ userRate, payoutRate, incrementIntervalMins, payoutIncrement, maxPayoutRate, adminId }) => {
+const upsertGlobalRate = async ({ userRate, payoutRate, adminId }) => {
   const result = await pool.query(
-    `INSERT INTO listener_global_rate_config (singleton_key, user_rate, payout_rate, increment_interval_mins, payout_increment, max_payout_rate, updated_by, updated_at)
-     VALUES (TRUE, $1, $2, $4, $5, $6, $3, CURRENT_TIMESTAMP)
+    `INSERT INTO listener_global_rate_config (singleton_key, user_rate, payout_rate, updated_by, updated_at)
+     VALUES (TRUE, $1, $2, $3, CURRENT_TIMESTAMP)
      ON CONFLICT (singleton_key)
      DO UPDATE SET
        user_rate = EXCLUDED.user_rate,
        payout_rate = EXCLUDED.payout_rate,
-       increment_interval_mins = EXCLUDED.increment_interval_mins,
-       payout_increment = EXCLUDED.payout_increment,
-       max_payout_rate = EXCLUDED.max_payout_rate,
        updated_by = EXCLUDED.updated_by,
        updated_at = CURRENT_TIMESTAMP
-     RETURNING config_id, user_rate, payout_rate, increment_interval_mins, payout_increment, max_payout_rate, updated_at`,
-    [userRate, payoutRate, adminId || null, incrementIntervalMins || 0, payoutIncrement || 0, maxPayoutRate || 0]
+     RETURNING config_id, user_rate, payout_rate, updated_at`,
+    [userRate, payoutRate, adminId || null]
   );
 
   return mapGlobalRate(result.rows[0]);
@@ -449,19 +433,11 @@ const resolveRateForListener = async (listenerId, queryable = pool) => {
     [averageRating, totalCallMinutes]
   );
 
-  const globalRate = await getGlobalRate(queryable);
-  const incrementIntervalMins = globalRate ? globalRate.incrementIntervalMins : null;
-  const payoutIncrement = globalRate ? globalRate.payoutIncrement : null;
-  const maxPayoutRate = globalRate ? globalRate.maxPayoutRate : null;
-
   if (matchingRule.rows.length > 0) {
     const rule = mapRule(matchingRule.rows[0]);
     return {
       userRate: rule.userRate,
       payoutRate: rule.payoutRate,
-      incrementIntervalMins,
-      payoutIncrement,
-      maxPayoutRate,
       source: 'rule',
       rule,
       averageRating,
@@ -469,13 +445,11 @@ const resolveRateForListener = async (listenerId, queryable = pool) => {
     };
   }
 
+  const globalRate = await getGlobalRate(queryable);
   if (!globalRate) {
     return {
       userRate: null,
       payoutRate: null,
-      incrementIntervalMins: null,
-      payoutIncrement: null,
-      maxPayoutRate: null,
       source: 'none',
       rule: null,
       averageRating,
@@ -485,14 +459,141 @@ const resolveRateForListener = async (listenerId, queryable = pool) => {
   return {
     userRate: globalRate.userRate,
     payoutRate: globalRate.payoutRate,
-    incrementIntervalMins: globalRate.incrementIntervalMins,
-    payoutIncrement: globalRate.payoutIncrement,
-    maxPayoutRate: globalRate.maxPayoutRate,
     source: 'global',
     rule: null,
     averageRating,
     totalCallMinutes,
   };
+};
+
+const findOverlappingSlab = async (start_duration, end_duration, excludeSlabId = null) => {
+  const result = await pool.query(
+    `SELECT slab_id, start_duration, end_duration
+     FROM listener_payout_slabs
+     WHERE NOT (end_duration < $1 OR start_duration > $2)
+       AND ($3::uuid IS NULL OR slab_id <> $3::uuid)
+     LIMIT 1`,
+    [start_duration, end_duration, excludeSlabId]
+  );
+  return result.rows[0] || null;
+};
+
+const listPayoutSlabs = async () => {
+  const result = await pool.query(
+    `SELECT slab_id, start_duration, end_duration, payout_per_minute, created_at, updated_at
+     FROM listener_payout_slabs
+     ORDER BY start_duration ASC`
+  );
+  return result.rows.map(row => ({
+    slabId: row.slab_id,
+    startDuration: Number(row.start_duration),
+    endDuration: Number(row.end_duration),
+    payoutPerMinute: row.payout_per_minute !== null ? Number(row.payout_per_minute) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
+};
+
+const createPayoutSlab = async (slab, adminId) => {
+  const start = Math.floor(Number(slab.startDuration));
+  const end = Math.floor(Number(slab.endDuration));
+  
+  if (!Number.isInteger(start) || start < 0) {
+    throw new Error('Start duration must be a non-negative integer');
+  }
+  if (!Number.isInteger(end) || end < start) {
+    throw new Error('End duration must be an integer greater than or equal to start duration');
+  }
+
+  let payoutRate = null;
+  if (slab.payoutPerMinute !== undefined && slab.payoutPerMinute !== null && String(slab.payoutPerMinute).trim() !== '') {
+    payoutRate = Number(slab.payoutPerMinute);
+    if (!Number.isFinite(payoutRate) || payoutRate < 0) {
+      throw new Error('Payout rate must be a non-negative number');
+    }
+  }
+
+  const overlap = await findOverlappingSlab(start, end);
+  if (overlap) {
+    const err = new Error(`Duration range overlaps with existing slab ${overlap.start_duration}-${overlap.end_duration}`);
+    err.code = 'OVERLAPPING_SLAB';
+    throw err;
+  }
+
+  const result = await pool.query(
+    `INSERT INTO listener_payout_slabs (start_duration, end_duration, payout_per_minute, updated_by)
+     VALUES ($1, $2, $3, $4)
+     RETURNING slab_id, start_duration, end_duration, payout_per_minute, created_at, updated_at`,
+    [start, end, payoutRate, adminId || null]
+  );
+
+  const row = result.rows[0];
+  return {
+    slabId: row.slab_id,
+    startDuration: Number(row.start_duration),
+    endDuration: Number(row.end_duration),
+    payoutPerMinute: row.payout_per_minute !== null ? Number(row.payout_per_minute) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const updatePayoutSlab = async (slabId, slab, adminId) => {
+  const start = Math.floor(Number(slab.startDuration));
+  const end = Math.floor(Number(slab.endDuration));
+  
+  if (!Number.isInteger(start) || start < 0) {
+    throw new Error('Start duration must be a non-negative integer');
+  }
+  if (!Number.isInteger(end) || end < start) {
+    throw new Error('End duration must be an integer greater than or equal to start duration');
+  }
+
+  let payoutRate = null;
+  if (slab.payoutPerMinute !== undefined && slab.payoutPerMinute !== null && String(slab.payoutPerMinute).trim() !== '') {
+    payoutRate = Number(slab.payoutPerMinute);
+    if (!Number.isFinite(payoutRate) || payoutRate < 0) {
+      throw new Error('Payout rate must be a non-negative number');
+    }
+  }
+
+  const overlap = await findOverlappingSlab(start, end, slabId);
+  if (overlap) {
+    const err = new Error(`Duration range overlaps with existing slab ${overlap.start_duration}-${overlap.end_duration}`);
+    err.code = 'OVERLAPPING_SLAB';
+    throw err;
+  }
+
+  const result = await pool.query(
+    `UPDATE listener_payout_slabs
+     SET start_duration = $2,
+         end_duration = $3,
+         payout_per_minute = $4,
+         updated_by = $5,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE slab_id = $1
+     RETURNING slab_id, start_duration, end_duration, payout_per_minute, created_at, updated_at`,
+    [slabId, start, end, payoutRate, adminId || null]
+  );
+
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    slabId: row.slab_id,
+    startDuration: Number(row.start_duration),
+    endDuration: Number(row.end_duration),
+    payoutPerMinute: row.payout_per_minute !== null ? Number(row.payout_per_minute) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const deletePayoutSlab = async (slabId) => {
+  const result = await pool.query(
+    'DELETE FROM listener_payout_slabs WHERE slab_id = $1 RETURNING slab_id',
+    [slabId]
+  );
+  return result.rowCount > 0;
 };
 
 export {
@@ -507,4 +608,8 @@ export {
   getDropdownSettings,
   updateDropdownSettings,
   resolveRateForListener,
+  listPayoutSlabs,
+  createPayoutSlab,
+  updatePayoutSlab,
+  deletePayoutSlab,
 };

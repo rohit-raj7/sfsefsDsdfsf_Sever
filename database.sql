@@ -600,6 +600,22 @@ CREATE TABLE IF NOT EXISTS admins (
 );
 
 -- ============================================
+-- LISTENER PAYOUT SLABS TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS listener_payout_slabs (
+    slab_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    start_duration INTEGER NOT NULL,
+    end_duration INTEGER NOT NULL,
+    payout_per_minute DECIMAL(10, 2) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL,
+    CONSTRAINT chk_start_duration CHECK (start_duration >= 0),
+    CONSTRAINT chk_end_duration CHECK (end_duration >= start_duration),
+    CONSTRAINT chk_payout_per_minute CHECK (payout_per_minute >= 0)
+);
+
+-- ============================================
 -- INDEXES FOR PERFORMANCE
 -- ============================================
 
@@ -607,6 +623,7 @@ CREATE INDEX idx_users_phone ON users(phone_number);
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_listeners_online ON listeners(is_online, is_available);
 CREATE INDEX idx_listeners_rating ON listeners(average_rating DESC);
+CREATE INDEX idx_listener_payout_slabs_start ON listener_payout_slabs(start_duration);
 
 -- ============================================
 -- END OF SCHEMA

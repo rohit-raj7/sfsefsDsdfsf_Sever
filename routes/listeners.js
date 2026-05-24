@@ -8,8 +8,6 @@ import { pool } from '../db.js';
 import { authenticate, authenticateAdmin } from '../middleware/auth.js';
 import multer from 'multer';
 import { deleteFromMinioByUrl, uploadToMinio } from '../utils/minioUpload.js';
-import { resolveRateForListener } from '../services/rateSettingsService.js';
-
 
 
 // Multer memory storage for voice uploads (no disk writes)
@@ -1310,21 +1308,17 @@ router.get('/me/withdrawal-meta', authenticate, async (req, res) => {
 
     const transactionFee = await getWithdrawalTransactionFee();
     const availableBalance = await getListenerWithdrawableBalance(listener);
-    const resolvedRates = await resolveRateForListener(listener.listener_id);
 
     return res.json({
       listenerId: listener.listener_id,
       availableBalance,
       transactionFee,
       currentUserRatePerMinute: Number(
-        resolvedRates?.userRate || listener.user_rate_per_min || listener.rate_per_minute || 0
+        listener.user_rate_per_min || listener.rate_per_minute || 0
       ),
       currentPayoutRatePerMinute: Number(
-        resolvedRates?.payoutRate || listener.listener_payout_per_min || 0
+        listener.listener_payout_per_min || 0
       ),
-      incrementIntervalMins: Number(resolvedRates?.incrementIntervalMins || 0),
-      payoutIncrement: Number(resolvedRates?.payoutIncrement || 0),
-      maxPayoutRate: Number(resolvedRates?.maxPayoutRate || 0),
       payoutMethods,
     });
   } catch (error) {
