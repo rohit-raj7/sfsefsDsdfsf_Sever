@@ -5,7 +5,6 @@ import { OAuth2Client } from 'google-auth-library';
 
 import User from '../models/User.js';
 import Listener from '../models/Listener.js';
-import TrustedDevice from '../models/TrustedDevice.js';
 import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 
@@ -291,6 +290,165 @@ router.post('/logout', authenticate, async (req, res) => {
  * Phone Number + 2Factor API
  * =====================================================
  */
+router.post('/trusted-login', async (req, res) => {
+  try {
+    const { 
+      phone_number, 
+      device_id, 
+      platform, 
+      device_name, 
+      manufacturer, 
+      model, 
+      os_version, 
+      app_version, 
+      firebase_installation_id,
+      fcm_token 
+    } = req.body;
+
+    if (!phone_number) {
+      return res.status(400).json({ error: 'phone_number is required' });
+    }
+
+    const phoneRegex = /^[0-9]{10}$/;
+    if (!phoneRegex.test(phone_number)) {
+      return res.status(400).json({ error: 'Invalid phone number format. Must be exactly 10 digits.' });
+    }
+
+    const normalizedFcmToken = normalizeFcmToken(fcm_token);
+    
+    // Check if there is a trusted device record for this phone number
+    const trustedDevicesResult = await pool.query(
+      'SELECT * FROM trusted_devices WHERE mobile_number = $1 AND is_trusted = TRUE',
+      [phone_number]
+    );
+
+    let matchedDevice = null;
+    let needsDeviceIdUpdate = false;
+
+    if (trustedDevicesResult.rows.length > 0) {
+      // 1. Try exact device_id match
+      if (device_id) {
+        matchedDevice = trustedDevicesResult.rows.find(d => d.device_id === device_id);
+      }
+      
+      // 2. If no exact match, try fingerprint matching (fallback for app reinstall/clear data)
+      if (!matchedDevice && platform && model && manufacturer) {
+        // We look for a strong match: same platform, model, manufacturer
+        // and optionally firebase_installation_id if available.
+        matchedDevice = trustedDevicesResult.rows.find(d => {
+          const strongFingerprintMatch = 
+            d.platform === platform && 
+            d.model === model && 
+            d.manufacturer === manufacturer;
+            
+          // If firebase_installation_id is provided by both, they must match
+          if (strongFingerprintMatch && firebase_installation_id && d.firebase_installation_id) {
+            return d.firebase_installation_id === firebase_installation_id;
+          }
+          
+          return strongFingerprintMatch;
+        });
+        
+        if (matchedDevice) {
+          needsDeviceIdUpdate = true;
+        }
+      }
+    }
+
+    // If we have a confident match, skip OTP
+    if (matchedDevice) {
+      console.log(`[AUTH] Trusted device login successful for ${phone_number}`);
+      
+      // Update device id if it was a fingerprint match, and update last_login_at
+      if (needsDeviceIdUpdate && device_id) {
+        await pool.query(
+          'UPDATE trusted_devices SET device_id = $1, last_login_at = CURRENT_TIMESTAMP WHERE id = $2',
+          [device_id, matchedDevice.id]
+        );
+      } else {
+        await pool.query(
+          'UPDATE trusted_devices SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1',
+          [matchedDevice.id]
+        );
+      }
+
+      // Generate token (same as verify-otp logic)
+      let user = await User.findByPhone(phone_number);
+      let isNewUser = false;
+      
+      if (!user) {
+        const isFirstTimeUser = true;
+        user = await User.create({
+          phone_number: phone_number,
+          auth_provider: 'phone',
+          fcm_token: normalizedFcmToken,
+          account_type: 'user',
+          is_first_time_user: isFirstTimeUser,
+          offer_used: false
+        });
+        if (normalizedFcmToken) {
+          await User.updateFcmToken(user.user_id, normalizedFcmToken);
+        }
+        isNewUser = true;
+      } else {
+        await User.updateLastLogin(user.user_id);
+        if (normalizedFcmToken) {
+          await User.updateFcmToken(user.user_id, normalizedFcmToken);
+        }
+      }
+
+      await User.verifyUser(user.user_id);
+
+      const jwtToken = jwt.sign(
+        { user_id: user.user_id, provider: 'phone' },
+        process.env.JWT_SECRET,
+        { expiresIn: '30d' }
+      );
+
+      return res.json({
+        action: 'LOGIN_SUCCESS',
+        message: 'Login successful',
+        token: jwtToken,
+        user: await User.findById(user.user_id),
+        isNewUser,
+      });
+    }
+
+    // If no trusted device found, proceed to send OTP
+    console.log(`[AUTH] No trusted device found for ${phone_number}, sending OTP`);
+    const apiKey = process.env.TWO_FACTOR_API_KEY || process.env.MOBILE_NUMBER_AUTH;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'Authentication service temporarily unavailable' });
+    }
+
+    const templateName = process.env.SMS_TEMPLATE_NAME;
+    const sendOtpUrl = templateName
+      ? `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN/${templateName}`
+      : `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN`;
+
+    const response = await axios.get(sendOtpUrl);
+
+    if (response.data && response.data.Status === "Success") {
+      try {
+        await pool.query('INSERT INTO otp_tracking (phone_number) VALUES ($1)', [phone_number]);
+      } catch (err) {
+        console.error('Failed to log OTP track:', err);
+      }
+
+      return res.json({
+        action: 'OTP_REQUIRED',
+        message: 'OTP sent successfully',
+        session_id: response.data.Details
+      });
+    } else {
+      return res.status(400).json({ error: 'Failed to send OTP. Please try again later.' });
+    }
+  } catch (error) {
+    console.error('Trusted Login error:', error.message || error);
+    return res.status(500).json({ error: 'Internal server error during login' });
+  }
+});
+
 router.post('/send-otp', async (req, res) => {
   try {
     const { phone_number } = req.body;
@@ -341,126 +499,22 @@ router.post('/send-otp', async (req, res) => {
   }
 });
 
-/**
- * =====================================================
- * REQUEST LOGIN (Trusted Device check + OTP fallback)
- * =====================================================
- */
-router.post('/request-login', async (req, res) => {
-  try {
-    const { phone_number, deviceId, platform, appVersion, deviceName } = req.body;
-
-    console.log(`[AUTH] request-login: phone=${phone_number} deviceId=${deviceId ? deviceId.substring(0, 8) + '...' : 'NONE'} platform=${platform}`);
-
-    if (!phone_number) {
-      return res.status(400).json({ error: 'phone_number is required' });
-    }
-
-    const phoneRegex = /^[0-9]{10}$/;
-    if (!phoneRegex.test(phone_number)) {
-      return res.status(400).json({ error: 'Invalid phone number format. Must be exactly 10 digits.' });
-    }
-
-    // STEP 1: Check if user exists
-    let user = null;
-    try {
-      user = await User.findByPhone(phone_number);
-      console.log(`[AUTH] request-login: user found=${!!user} userId=${user?.user_id || 'N/A'}`);
-    } catch (dbErr) {
-      console.error('[AUTH] request-login: DB error looking up user:', dbErr.message, dbErr.stack);
-      return res.status(500).json({ error: 'Internal server error while processing login request' });
-    }
-
-    // Guard: inactive account
-    if (user && user.is_active === false) {
-      console.log(`[AUTH] request-login: Account inactive phone=${phone_number}`);
-      return res.status(403).json({ error: 'Your account has been deactivated. Please contact support.' });
-    }
-
-    // STEP 2: Trusted device check (only if user exists and deviceId provided)
-    if (user && deviceId && typeof deviceId === 'string' && deviceId.trim().length >= 8) {
-      try {
-        const trustedDevice = await TrustedDevice.findByUserAndDeviceId(user.user_id, deviceId.trim());
-        console.log(`[AUTH] request-login: trustedDevice=${!!trustedDevice} isTrusted=${trustedDevice?.is_trusted}`);
-
-        if (trustedDevice && trustedDevice.is_trusted === true) {
-          await TrustedDevice.updateLastLogin(trustedDevice.id);
-          await User.updateLastLogin(user.user_id);
-          await User.verifyUser(user.user_id);
-
-          const jwtToken = jwt.sign(
-            { user_id: user.user_id, provider: 'phone' },
-            process.env.JWT_SECRET,
-            { expiresIn: '30d' }
-          );
-
-          const fullUser = await User.findById(user.user_id);
-          console.log(`[AUTH] request-login: ✅ Trusted device bypass userId=${user.user_id}`);
-
-          return res.json({
-            message: 'Login successful',
-            token: jwtToken,
-            user: fullUser,
-            isNewUser: false,
-            requiresOtp: false
-          });
-        }
-      } catch (tdErr) {
-        // Non-fatal: log and fall through to OTP
-        console.error('[AUTH] request-login: TrustedDevice error (fallthrough to OTP):', tdErr.message, tdErr.stack);
-      }
-    } else {
-      console.log(`[AUTH] request-login: Skipping trusted check. user=${!!user} deviceId=${deviceId ? 'provided' : 'missing'}`);
-    }
-
-    // STEP 3: Send OTP
-    const apiKey = process.env.TWO_FACTOR_API_KEY || process.env.MOBILE_NUMBER_AUTH;
-    if (!apiKey) {
-      console.error('[AUTH] request-login: TWO_FACTOR_API_KEY missing from env');
-      return res.status(500).json({ error: 'Authentication service temporarily unavailable' });
-    }
-
-    const templateName = process.env.SMS_TEMPLATE_NAME;
-    const sendOtpUrl = templateName
-      ? `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN/${templateName}`
-      : `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN`;
-
-    let otpResponse;
-    try {
-      otpResponse = await axios.get(sendOtpUrl, { timeout: 10000 });
-    } catch (otpErr) {
-      console.error('[AUTH] request-login: 2Factor API call failed:', otpErr.message);
-      return res.status(502).json({ error: 'Failed to send OTP. Please check your internet and try again.' });
-    }
-
-    if (otpResponse.data && otpResponse.data.Status === 'Success') {
-      try {
-        await pool.query('INSERT INTO otp_tracking (phone_number) VALUES ($1)', [phone_number]);
-      } catch (trackErr) {
-        console.error('[AUTH] request-login: otp_tracking insert failed (non-fatal):', trackErr.message);
-      }
-
-      console.log(`[AUTH] request-login: OTP sent phone=${phone_number} session=${otpResponse.data.Details}`);
-      return res.json({
-        message: 'OTP sent successfully',
-        session_id: otpResponse.data.Details,
-        requiresOtp: true
-      });
-    } else {
-      console.error('[AUTH] request-login: 2Factor non-success:', otpResponse.data);
-      return res.status(400).json({ error: 'Failed to send OTP. Please try again later.' });
-    }
-
-  } catch (error) {
-    console.error('[AUTH] request-login: Unhandled error:', error.message, error.stack);
-    return res.status(500).json({ error: 'Internal server error while processing login request' });
-  }
-});
-
-
 router.post('/verify-otp', async (req, res) => {
   try {
-    const { phone_number, otp, session_id, fcm_token, deviceId, platform, appVersion, deviceName } = req.body;
+    const { 
+      phone_number, 
+      otp, 
+      session_id, 
+      fcm_token,
+      device_id, 
+      platform, 
+      device_name, 
+      manufacturer, 
+      model, 
+      os_version, 
+      app_version, 
+      firebase_installation_id 
+    } = req.body;
     const normalizedFcmToken = normalizeFcmToken(fcm_token);
 
     if (!phone_number || !otp || !session_id) {
@@ -523,18 +577,30 @@ router.post('/verify-otp', async (req, res) => {
 
     await User.verifyUser(user.user_id);
 
-    // ===================== SAVE TRUSTED DEVICE =====================
-    if (deviceId) {
+    // Save trusted device information
+    if (device_id) {
       try {
-        await TrustedDevice.addOrUpdate({
-          user_id: user.user_id,
-          device_id: deviceId,
-          platform: platform || 'unknown',
-          device_name: deviceName || 'Unknown Device',
-          app_version: appVersion || 'unknown'
-        });
-      } catch (err) {
-        console.error('Failed to save trusted device:', err);
+        // Check if this device_id already exists for this phone number
+        const existingDevice = await pool.query(
+          'SELECT id FROM trusted_devices WHERE mobile_number = $1 AND device_id = $2',
+          [phone_number, device_id]
+        );
+        
+        if (existingDevice.rows.length === 0) {
+          await pool.query(`
+            INSERT INTO trusted_devices 
+            (mobile_number, device_id, platform, device_name, manufacturer, model, os_version, app_version, firebase_installation_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          `, [phone_number, device_id, platform, device_name, manufacturer, model, os_version, app_version, firebase_installation_id]);
+        } else {
+          await pool.query(
+            'UPDATE trusted_devices SET last_login_at = CURRENT_TIMESTAMP, is_trusted = TRUE WHERE id = $1',
+            [existingDevice.rows[0].id]
+          );
+        }
+      } catch (deviceError) {
+        console.error('Failed to save trusted device:', deviceError);
+        // Continue login even if trusted device save fails
       }
     }
 

@@ -610,6 +610,31 @@ async function ensureSchema() {
     `;
     await pool.query(createDeleteRequestsSql);
 
+    const createTrustedDevicesSql = `
+      CREATE TABLE IF NOT EXISTS trusted_devices (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        mobile_number VARCHAR(15) NOT NULL,
+        device_id VARCHAR(255),
+        device_hash VARCHAR(255),
+        platform VARCHAR(50),
+        device_name VARCHAR(255),
+        manufacturer VARCHAR(100),
+        model VARCHAR(100),
+        os_version VARCHAR(50),
+        app_version VARCHAR(50),
+        firebase_installation_id VARCHAR(255),
+        first_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_trusted BOOLEAN DEFAULT TRUE,
+        trust_status VARCHAR(20) DEFAULT 'trusted',
+        revoked_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_trusted_devices_mobile ON trusted_devices(mobile_number, is_trusted);
+      CREATE INDEX IF NOT EXISTS idx_trusted_devices_device_id ON trusted_devices(device_id);
+    `;
+    await pool.query(createTrustedDevicesSql);
+
     // Add commonly used social auth columns if they don't exist yet
     const alterSql = `
       ALTER TABLE admins ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
@@ -906,27 +931,6 @@ async function ensureSchema() {
       CREATE INDEX IF NOT EXISTS idx_listener_payout_slabs_start ON listener_payout_slabs(start_duration);
     `);
     
-    // ============================================
-    // TRUSTED DEVICES TABLE (Trusted Device Login)
-    // ============================================
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS trusted_devices (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
-        device_id VARCHAR(255) NOT NULL,
-        platform VARCHAR(50),
-        device_name VARCHAR(255),
-        app_version VARCHAR(50),
-        is_trusted BOOLEAN DEFAULT TRUE,
-        first_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, device_id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_trusted_devices_user ON trusted_devices(user_id);
-      CREATE INDEX IF NOT EXISTS idx_trusted_devices_device ON trusted_devices(device_id);
-    `);
-    console.log('✓ Ensured trusted_devices table exists');
-
     // If phone_number is marked NOT NULL in the existing DB, allow nulls for social accounts
     const dropNotNullSql = `
       DO $$
