@@ -343,12 +343,14 @@ router.post('/send-otp', async (req, res) => {
 
 /**
  * =====================================================
- * REQUEST LOGIN (Trusted Device check)
+ * REQUEST LOGIN (Trusted Device check + OTP fallback)
  * =====================================================
  */
 router.post('/request-login', async (req, res) => {
   try {
     const { phone_number, deviceId, platform, appVersion, deviceName } = req.body;
+
+    console.log(`[AUTH] request-login: phone=${phone_number} deviceId=${deviceId ? deviceId.substring(0, 8) + '...' : 'NONE'} platform=${platform}`);
 
     if (!phone_number) {
       return res.status(400).json({ error: 'phone_number is required' });
@@ -359,42 +361,62 @@ router.post('/request-login', async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number format. Must be exactly 10 digits.' });
     }
 
-    // Check if user exists
-    let user = await User.findByPhone(phone_number);
-    
-    // Check if trusted device exists and is valid
-    if (user && deviceId) {
-      const trustedDevice = await TrustedDevice.findByUserAndDeviceId(user.user_id, deviceId);
-      
-      if (trustedDevice && trustedDevice.is_trusted) {
-        // Update login timestamps
-        await TrustedDevice.updateLastLogin(trustedDevice.id);
-        await User.updateLastLogin(user.user_id);
-        await User.verifyUser(user.user_id);
-
-        const jwtToken = jwt.sign(
-          {
-            user_id: user.user_id,
-            provider: 'phone',
-          },
-          process.env.JWT_SECRET,
-          { expiresIn: '30d' }
-        );
-
-        return res.json({
-          message: 'Login successful',
-          token: jwtToken,
-          user: await User.findById(user.user_id),
-          isNewUser: false,
-          requiresOtp: false
-        });
-      }
+    // STEP 1: Check if user exists
+    let user = null;
+    try {
+      user = await User.findByPhone(phone_number);
+      console.log(`[AUTH] request-login: user found=${!!user} userId=${user?.user_id || 'N/A'}`);
+    } catch (dbErr) {
+      console.error('[AUTH] request-login: DB error looking up user:', dbErr.message, dbErr.stack);
+      return res.status(500).json({ error: 'Internal server error while processing login request' });
     }
 
-    // Not a trusted device or user doesn't exist, proceed to send OTP
+    // Guard: inactive account
+    if (user && user.is_active === false) {
+      console.log(`[AUTH] request-login: Account inactive phone=${phone_number}`);
+      return res.status(403).json({ error: 'Your account has been deactivated. Please contact support.' });
+    }
+
+    // STEP 2: Trusted device check (only if user exists and deviceId provided)
+    if (user && deviceId && typeof deviceId === 'string' && deviceId.trim().length >= 8) {
+      try {
+        const trustedDevice = await TrustedDevice.findByUserAndDeviceId(user.user_id, deviceId.trim());
+        console.log(`[AUTH] request-login: trustedDevice=${!!trustedDevice} isTrusted=${trustedDevice?.is_trusted}`);
+
+        if (trustedDevice && trustedDevice.is_trusted === true) {
+          await TrustedDevice.updateLastLogin(trustedDevice.id);
+          await User.updateLastLogin(user.user_id);
+          await User.verifyUser(user.user_id);
+
+          const jwtToken = jwt.sign(
+            { user_id: user.user_id, provider: 'phone' },
+            process.env.JWT_SECRET,
+            { expiresIn: '30d' }
+          );
+
+          const fullUser = await User.findById(user.user_id);
+          console.log(`[AUTH] request-login: ✅ Trusted device bypass userId=${user.user_id}`);
+
+          return res.json({
+            message: 'Login successful',
+            token: jwtToken,
+            user: fullUser,
+            isNewUser: false,
+            requiresOtp: false
+          });
+        }
+      } catch (tdErr) {
+        // Non-fatal: log and fall through to OTP
+        console.error('[AUTH] request-login: TrustedDevice error (fallthrough to OTP):', tdErr.message, tdErr.stack);
+      }
+    } else {
+      console.log(`[AUTH] request-login: Skipping trusted check. user=${!!user} deviceId=${deviceId ? 'provided' : 'missing'}`);
+    }
+
+    // STEP 3: Send OTP
     const apiKey = process.env.TWO_FACTOR_API_KEY || process.env.MOBILE_NUMBER_AUTH;
     if (!apiKey) {
-      console.error('[AUTH] TWO_FACTOR_API_KEY/MOBILE_NUMBER_AUTH is missing from environment variables');
+      console.error('[AUTH] request-login: TWO_FACTOR_API_KEY missing from env');
       return res.status(500).json({ error: 'Authentication service temporarily unavailable' });
     }
 
@@ -403,28 +425,38 @@ router.post('/request-login', async (req, res) => {
       ? `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN/${templateName}`
       : `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN`;
 
-    const response = await axios.get(sendOtpUrl);
+    let otpResponse;
+    try {
+      otpResponse = await axios.get(sendOtpUrl, { timeout: 10000 });
+    } catch (otpErr) {
+      console.error('[AUTH] request-login: 2Factor API call failed:', otpErr.message);
+      return res.status(502).json({ error: 'Failed to send OTP. Please check your internet and try again.' });
+    }
 
-    if (response.data && response.data.Status === "Success") {
+    if (otpResponse.data && otpResponse.data.Status === 'Success') {
       try {
         await pool.query('INSERT INTO otp_tracking (phone_number) VALUES ($1)', [phone_number]);
-      } catch (err) {
-        console.error('Failed to log OTP track:', err);
+      } catch (trackErr) {
+        console.error('[AUTH] request-login: otp_tracking insert failed (non-fatal):', trackErr.message);
       }
 
+      console.log(`[AUTH] request-login: OTP sent phone=${phone_number} session=${otpResponse.data.Details}`);
       return res.json({
         message: 'OTP sent successfully',
-        session_id: response.data.Details,
+        session_id: otpResponse.data.Details,
         requiresOtp: true
       });
     } else {
+      console.error('[AUTH] request-login: 2Factor non-success:', otpResponse.data);
       return res.status(400).json({ error: 'Failed to send OTP. Please try again later.' });
     }
+
   } catch (error) {
-    console.error('Request Login error:', error.message || error);
+    console.error('[AUTH] request-login: Unhandled error:', error.message, error.stack);
     return res.status(500).json({ error: 'Internal server error while processing login request' });
   }
 });
+
 
 router.post('/verify-otp', async (req, res) => {
   try {

@@ -906,6 +906,27 @@ async function ensureSchema() {
       CREATE INDEX IF NOT EXISTS idx_listener_payout_slabs_start ON listener_payout_slabs(start_duration);
     `);
     
+    // ============================================
+    // TRUSTED DEVICES TABLE (Trusted Device Login)
+    // ============================================
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trusted_devices (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
+        device_id VARCHAR(255) NOT NULL,
+        platform VARCHAR(50),
+        device_name VARCHAR(255),
+        app_version VARCHAR(50),
+        is_trusted BOOLEAN DEFAULT TRUE,
+        first_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, device_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_trusted_devices_user ON trusted_devices(user_id);
+      CREATE INDEX IF NOT EXISTS idx_trusted_devices_device ON trusted_devices(device_id);
+    `);
+    console.log('✓ Ensured trusted_devices table exists');
+
     // If phone_number is marked NOT NULL in the existing DB, allow nulls for social accounts
     const dropNotNullSql = `
       DO $$
