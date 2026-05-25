@@ -7,7 +7,7 @@ const patchDB = async () => {
     // Create trusted_devices table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS trusted_devices (
-          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
           user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
           device_id VARCHAR(255) NOT NULL,
           platform VARCHAR(50),
