@@ -5,6 +5,7 @@ import { OAuth2Client } from 'google-auth-library';
 
 import User from '../models/User.js';
 import Listener from '../models/Listener.js';
+import TrustedDevice from '../models/TrustedDevice.js';
 import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 
@@ -340,9 +341,94 @@ router.post('/send-otp', async (req, res) => {
   }
 });
 
+/**
+ * =====================================================
+ * REQUEST LOGIN (Trusted Device check)
+ * =====================================================
+ */
+router.post('/request-login', async (req, res) => {
+  try {
+    const { phone_number, deviceId, platform, appVersion, deviceName } = req.body;
+
+    if (!phone_number) {
+      return res.status(400).json({ error: 'phone_number is required' });
+    }
+
+    const phoneRegex = /^[0-9]{10}$/;
+    if (!phoneRegex.test(phone_number)) {
+      return res.status(400).json({ error: 'Invalid phone number format. Must be exactly 10 digits.' });
+    }
+
+    // Check if user exists
+    let user = await User.findByPhone(phone_number);
+    
+    // Check if trusted device exists and is valid
+    if (user && deviceId) {
+      const trustedDevice = await TrustedDevice.findByUserAndDeviceId(user.user_id, deviceId);
+      
+      if (trustedDevice && trustedDevice.is_trusted) {
+        // Update login timestamps
+        await TrustedDevice.updateLastLogin(trustedDevice.id);
+        await User.updateLastLogin(user.user_id);
+        await User.verifyUser(user.user_id);
+
+        const jwtToken = jwt.sign(
+          {
+            user_id: user.user_id,
+            provider: 'phone',
+          },
+          process.env.JWT_SECRET,
+          { expiresIn: '30d' }
+        );
+
+        return res.json({
+          message: 'Login successful',
+          token: jwtToken,
+          user: await User.findById(user.user_id),
+          isNewUser: false,
+          requiresOtp: false
+        });
+      }
+    }
+
+    // Not a trusted device or user doesn't exist, proceed to send OTP
+    const apiKey = process.env.TWO_FACTOR_API_KEY || process.env.MOBILE_NUMBER_AUTH;
+    if (!apiKey) {
+      console.error('[AUTH] TWO_FACTOR_API_KEY/MOBILE_NUMBER_AUTH is missing from environment variables');
+      return res.status(500).json({ error: 'Authentication service temporarily unavailable' });
+    }
+
+    const templateName = process.env.SMS_TEMPLATE_NAME;
+    const sendOtpUrl = templateName
+      ? `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN/${templateName}`
+      : `https://2factor.in/API/V1/${apiKey}/SMS/${phone_number}/AUTOGEN`;
+
+    const response = await axios.get(sendOtpUrl);
+
+    if (response.data && response.data.Status === "Success") {
+      try {
+        await pool.query('INSERT INTO otp_tracking (phone_number) VALUES ($1)', [phone_number]);
+      } catch (err) {
+        console.error('Failed to log OTP track:', err);
+      }
+
+      return res.json({
+        message: 'OTP sent successfully',
+        session_id: response.data.Details,
+        requiresOtp: true
+      });
+    } else {
+      return res.status(400).json({ error: 'Failed to send OTP. Please try again later.' });
+    }
+  } catch (error) {
+    console.error('Request Login error:', error.message || error);
+    return res.status(500).json({ error: 'Internal server error while processing login request' });
+  }
+});
+
 router.post('/verify-otp', async (req, res) => {
   try {
-    const { phone_number, otp, session_id, fcm_token } = req.body;
+    const { phone_number, otp, session_id, fcm_token, deviceId, platform, appVersion, deviceName } = req.body;
     const normalizedFcmToken = normalizeFcmToken(fcm_token);
 
     if (!phone_number || !otp || !session_id) {
@@ -404,6 +490,21 @@ router.post('/verify-otp', async (req, res) => {
     }
 
     await User.verifyUser(user.user_id);
+
+    // ===================== SAVE TRUSTED DEVICE =====================
+    if (deviceId) {
+      try {
+        await TrustedDevice.addOrUpdate({
+          user_id: user.user_id,
+          device_id: deviceId,
+          platform: platform || 'unknown',
+          device_name: deviceName || 'Unknown Device',
+          app_version: appVersion || 'unknown'
+        });
+      } catch (err) {
+        console.error('Failed to save trusted device:', err);
+      }
+    }
 
     // ===================== JWT =====================
     const jwtToken = jwt.sign(

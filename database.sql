@@ -99,6 +99,22 @@ CREATE TABLE IF NOT EXISTS otp_verification (
 CREATE INDEX idx_otp_phone ON otp_verification(phone_number, is_verified);
 
 -- ============================================
+-- TRUSTED DEVICES TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS trusted_devices (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
+    device_id VARCHAR(255) NOT NULL,
+    platform VARCHAR(50),
+    device_name VARCHAR(255),
+    app_version VARCHAR(50),
+    is_trusted BOOLEAN DEFAULT TRUE,
+    first_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, device_id)
+);
+
+-- ============================================
 -- LANGUAGE PREFERENCES TABLE
 -- ============================================
 CREATE TABLE IF NOT EXISTS user_languages (
