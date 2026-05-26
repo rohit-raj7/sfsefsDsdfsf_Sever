@@ -62,8 +62,10 @@ pool.on('error', (err, client) => {
 // DEVICE-TIME FIX: Force all database sessions to UTC so CURRENT_TIMESTAMP
 // always stores UTC values. This prevents timezone ambiguity with
 // TIMESTAMP WITHOUT TIMEZONE columns regardless of server location.
-pool.on('connect', (client) => {
-  client.query("SET timezone = 'UTC'");
+// NOTE: async callback + await — pg-pool waits for the promise before returning
+// the client to the caller, preventing the "client already executing a query" warning.
+pool.on('connect', async (client) => {
+  await client.query("SET timezone = 'UTC'");
 });
 
 // Test the database connection
