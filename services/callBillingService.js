@@ -8,15 +8,9 @@ const calculateSlabPayout = (minutes, basePayoutRate, slabs = []) => {
     return roundMoney(minutes * Number(basePayoutRate || 0));
   }
 
-  const maxSlabEnd = Math.max(...slabs.map(s => Number(s.end_duration ?? s.endDuration ?? 0)));
   let totalEarn = 0;
 
   for (let m = 1; m <= minutes; m++) {
-    if (m > maxSlabEnd) {
-      // Stop calculation after last slab
-      continue;
-    }
-
     const matchingSlab = slabs.find(
       s => Number(s.start_duration ?? s.startDuration ?? 0) <= m && m <= Number(s.end_duration ?? s.endDuration ?? 0)
     );
