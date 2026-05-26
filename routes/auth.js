@@ -2,6 +2,7 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import axios from 'axios';
 import { OAuth2Client } from 'google-auth-library';
+import crypto from 'crypto';
 
 import User from '../models/User.js';
 import Listener from '../models/Listener.js';
@@ -242,9 +243,16 @@ router.post('/social-login', async (req, res) => {
     await User.verifyUser(user.user_id);
 
     // ===================== JWT =====================
+    const sessionId = crypto.randomUUID();
+    await pool.query(
+      'UPDATE users SET active_session_id = $1 WHERE user_id = $2',
+      [sessionId, user.user_id]
+    );
+
     const jwtToken = jwt.sign(
       {
         user_id: user.user_id,
+        session_id: sessionId,
         provider,
         email: user.email,
       },
@@ -399,8 +407,14 @@ router.post('/trusted-login', async (req, res) => {
 
       await User.verifyUser(user.user_id);
 
+      const sessionId = crypto.randomUUID();
+      await pool.query(
+        'UPDATE users SET active_session_id = $1 WHERE user_id = $2',
+        [sessionId, user.user_id]
+      );
+
       const jwtToken = jwt.sign(
-        { user_id: user.user_id, provider: 'phone' },
+        { user_id: user.user_id, session_id: sessionId, provider: 'phone' },
         process.env.JWT_SECRET,
         { expiresIn: '30d' }
       );
@@ -605,9 +619,16 @@ router.post('/verify-otp', async (req, res) => {
     }
 
     // ===================== JWT =====================
+    const sessionId = crypto.randomUUID();
+    await pool.query(
+      'UPDATE users SET active_session_id = $1 WHERE user_id = $2',
+      [sessionId, user.user_id]
+    );
+
     const jwtToken = jwt.sign(
       {
         user_id: user.user_id,
+        session_id: sessionId,
         provider: 'phone',
       },
       process.env.JWT_SECRET,

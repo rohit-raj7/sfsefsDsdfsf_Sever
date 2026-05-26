@@ -151,7 +151,8 @@ async function ensureSchema() {
         last_seen TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_login TIMESTAMP
+        last_login TIMESTAMP,
+        active_session_id VARCHAR(255)
       );
     `);
     console.log('✓ Ensured users table exists');
@@ -652,6 +653,7 @@ async function ensureSchema() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS offer_flat_price DECIMAL(10, 2);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_balance DECIMAL(10, 2) DEFAULT 0.0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS unlimited_expires_at TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS active_session_id VARCHAR(255);
       
       -- Add listener table columns if they don't exist
       ALTER TABLE listeners ADD COLUMN IF NOT EXISTS original_name VARCHAR(100);

@@ -25,6 +25,14 @@ const authenticate = async (req, res, next) => {
       return res.status(401).json({ error: 'User not found or inactive' });
     }
 
+    // Check if session has been revoked by another login
+    if (user.active_session_id && decoded.session_id !== user.active_session_id) {
+      return res.status(401).json({
+        error: 'SESSION_REVOKED_OTHER_DEVICE',
+        code: 'SESSION_REVOKED_OTHER_DEVICE'
+      });
+    }
+
     // Attach user info to request
     req.userId = user.user_id;
     req.user = user;

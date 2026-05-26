@@ -117,7 +117,7 @@ class User {
       SELECT user_id, phone_number, email, auth_provider, google_id, facebook_id, full_name, display_name, gender,
              date_of_birth, city, country, avatar_url, bio, mobile_number, is_verified,
              is_active, account_type, is_first_time_user, offer_used, offer_minutes_limit, offer_flat_price,
-             created_at, updated_at
+             created_at, updated_at, active_session_id
       FROM users 
       WHERE user_id = $1
     `;
