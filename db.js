@@ -29,9 +29,15 @@ pgTypes.setTypeParser(1114, function parseTimestampAsUTC(val) {
 
 // Configure the PostgreSQL connection pool
 // Increased limits and timeouts to handle connection instability and high traffic
+// Dynamically select internal vs public connection string to avoid public proxy timeouts in production
+const isProduction = process.env.NODE_ENV === 'production' || !!process.env.RAILWAY_ENVIRONMENT_NAME;
+const connectionString = (isProduction && process.env.DATABASE_URL)
+  ? process.env.DATABASE_URL
+  : (process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL);
+
 const poolConfig = {
-  ...(process.env.DATABASE_PUBLIC_URL
-    ? { connectionString: process.env.DATABASE_PUBLIC_URL }
+  ...(connectionString
+    ? { connectionString }
     : {
         host: process.env.DB_HOST,
         port: process.env.DB_PORT || 5432,
@@ -42,6 +48,8 @@ const poolConfig = {
   max: 20, // Increased from 5 to 20
   idleTimeoutMillis: 30000, // Increased from 10s to 30s
   connectionTimeoutMillis: 30000, // Increased from 10s to 30s
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000, // Send keepalive signals every 10s to prevent firewalls from dropping connections
 };
 
 // Only enforce SSL if explicitly told to via environment variables 
