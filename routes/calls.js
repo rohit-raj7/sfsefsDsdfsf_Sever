@@ -12,6 +12,9 @@ import { pool } from '../db.js';
 import { resolveRateForListener } from '../services/rateSettingsService.js';
 
 const resolveDurationSeconds = (call, durationSeconds) => {
+  if (durationSeconds !== undefined && durationSeconds !== null && Number(durationSeconds) > 0) {
+    return Math.max(0, Number(durationSeconds) || 0);
+  }
   const endedAt = new Date();
   if (call.started_at) {
     return Math.max(
@@ -24,9 +27,6 @@ const resolveDurationSeconds = (call, durationSeconds) => {
       0,
       Math.round((endedAt.getTime() - new Date(call.created_at).getTime()) / 1000)
     );
-  }
-  if (durationSeconds !== undefined) {
-    return Math.max(0, Number(durationSeconds) || 0);
   }
   return 0;
 };
