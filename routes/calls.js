@@ -69,7 +69,7 @@ router.post('/', authenticate, async (req, res) => {
 
     // BUSY CHECK: Block calls to listeners already in an active call
     const busyMap = req.app.get('busyUsers');
-    if (listener.is_busy || (busyMap && busyMap.has(listener.user_id))) {
+    if (listener.is_busy || (busyMap && busyMap.has(String(listener.user_id)))) {
       console.log(`[CALLS] Experts ${listener.listener_id} is BUSY â€” rejecting call`);
       return res.status(409).json({
         error: 'Experts is busy',
@@ -79,7 +79,7 @@ router.post('/', authenticate, async (req, res) => {
     }
 
     // CALLER BUSY CHECK: Block calls if the caller is already in an active call
-    if (busyMap && busyMap.has(req.userId)) {
+    if (busyMap && busyMap.has(String(req.userId))) {
       console.log(`[CALLS] Caller ${req.userId} is BUSY â€” rejecting call`);
       return res.status(409).json({
         error: 'You are busy',
@@ -143,8 +143,11 @@ router.post('/', authenticate, async (req, res) => {
           } catch(e) {}
 
           [req.userId, listenerUserId].forEach(uid => {
-            if (uid && busyMap && busyMap.has(uid)) {
-              busyMap.delete(uid);
+            if (uid) {
+              uid = String(uid); // Enforce type safety
+              if (busyMap && busyMap.has(uid)) {
+                busyMap.delete(uid);
+              }
               if (io) {
                 io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
               }
@@ -198,7 +201,7 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
 
     // BUSY CHECK: Block if listener is already busy
     const reqBusyMap = req.app.get('busyUsers');
-    if (listener.is_busy || (reqBusyMap && reqBusyMap.has(req.userId))) {
+    if (listener.is_busy || (reqBusyMap && reqBusyMap.has(String(req.userId)))) {
       return res.status(409).json({
         error: 'You are busy',
         status: 'busy',
@@ -207,7 +210,7 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
     }
 
     // BUSY CHECK: Block if user is already in an active call
-    if (reqBusyMap && reqBusyMap.has(target_user_id)) {
+    if (reqBusyMap && reqBusyMap.has(String(target_user_id))) {
       return res.status(409).json({
         error: 'User is busy',
         status: 'busy',
@@ -266,8 +269,11 @@ router.post('/listener-initiate', authenticate, async (req, res) => {
           const busyMap = req.app.get('busyUsers');
           const io = req.app.get('io');
           [target_user_id, req.userId].forEach(uid => {
-            if (uid && busyMap && busyMap.has(uid)) {
-              busyMap.delete(uid);
+            if (uid) {
+              uid = String(uid); // Enforce type safety
+              if (busyMap && busyMap.has(uid)) {
+                busyMap.delete(uid);
+              }
               if (io) {
                 io.emit('listener_busy_status', { listenerUserId: uid, busy: false });
               }
@@ -379,6 +385,7 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
 
       [call.caller_id, listenerUserId].forEach(uid => {
         if (uid) {
+          uid = String(uid); // Enforce type safety
           if (busyMap && busyMap.has(uid)) {
             busyMap.delete(uid);
           }
@@ -424,6 +431,7 @@ router.put('/:call_id/status', authenticate, async (req, res) => {
 
       [call.caller_id, listenerUserId].forEach(uid => {
         if (uid) {
+          uid = String(uid); // Enforce type safety
           if (busyMap && busyMap.has(uid)) {
             busyMap.delete(uid);
           }
@@ -499,6 +507,7 @@ router.post('/end', authenticate, async (req, res) => {
 
     [call.caller_id, listenerUserId].forEach(uid => {
       if (uid) {
+        uid = String(uid); // Enforce type safety
         if (busyMap && busyMap.has(uid)) {
           busyMap.delete(uid);
         }
@@ -782,7 +791,7 @@ router.post('/random', authenticate, async (req, res) => {
 
     // BUSY CHECK: getRandomAvailable already filters busy, but guard against race condition
     const busyMap = req.app.get('busyUsers');
-    if (listener.is_busy || (busyMap && busyMap.has(listener.user_id))) {
+    if (listener.is_busy || (busyMap && busyMap.has(String(listener.user_id)))) {
       console.log(`[CALLS] Random listener ${listener.listener_id} is BUSY â€” rejecting`);
       return res.status(409).json({
         error: 'Listener is busy',
@@ -792,7 +801,7 @@ router.post('/random', authenticate, async (req, res) => {
     }
 
     // CALLER BUSY CHECK: Block calls if the caller is already in an active call
-    if (busyMap && busyMap.has(req.userId)) {
+    if (busyMap && busyMap.has(String(req.userId))) {
       console.log(`[CALLS] Caller ${req.userId} is BUSY â€” rejecting random call`);
       return res.status(409).json({
         error: 'You are busy',

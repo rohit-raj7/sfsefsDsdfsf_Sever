@@ -159,6 +159,8 @@ const busyUsers = new Map(); // Map of listenerUserId -> callId (in-memory busy 
 app.set('busyUsers', busyUsers);
 const pendingCalls = new Map(); // Map of callId -> { callerId, listenerId, listenerSocketId, createdAt } (tracks pre-answer calls for cancel routing)
 const activeCallTimers = new Map(); // Map of callId -> { timerId, callerId, listenerUserId, channelName, startedAt, maxAllowedSeconds }
+const activeCallDropTimeouts = new Map(); // Map of callId -> timeoutId for graceful disconnects
+const pendingCallDropTimeouts = new Map(); // Map of callId -> timeoutId for graceful disconnects
 const processingCalls = new Set(); // Dedup guard: callIds currently being set up in call:joined handler
 const LISTENER_TO_USER_RING_TIMEOUT_MS = 32000;
 
@@ -167,8 +169,25 @@ const clearPendingCall = (callId) => {
   if (pending?.timeoutId) {
     clearTimeout(pending.timeoutId);
   }
+  if (pendingCallDropTimeouts.has(callId)) {
+    clearTimeout(pendingCallDropTimeouts.get(callId));
+    pendingCallDropTimeouts.delete(callId);
+  }
   pendingCalls.delete(callId);
   return pending;
+};
+
+const clearActiveCallTimer = (callId) => {
+  const timerData = activeCallTimers.get(callId);
+  if (timerData && timerData.timerId) {
+    clearTimeout(timerData.timerId);
+  }
+  activeCallTimers.delete(callId);
+  
+  if (activeCallDropTimeouts.has(callId)) {
+    clearTimeout(activeCallDropTimeouts.get(callId));
+    activeCallDropTimeouts.delete(callId);
+  }
 };
 
 // Ã¢â€â‚¬Ã¢â€â‚¬ Random User-to-User Match Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -209,8 +228,7 @@ setInterval(() => {
     const maxWithGrace = timer.maxAllowedSeconds + 60;
     if (elapsed > maxWithGrace) {
       console.log(`[SOCKET] Stale activeCallTimer ${callId} removed (elapsed: ${Math.round(elapsed)}s > max: ${maxWithGrace}s)`);
-      clearTimeout(timer.timerId);
-      activeCallTimers.delete(callId);
+      clearActiveCallTimer(callId);
       // Trigger billing as safety net
       (async () => {
         try {
@@ -234,8 +252,9 @@ io.on('connection', (socket) => {
 
   // Helper: Clear busy status for a user (checks both parties)
   function _clearBusyForCall(userId1, userId2) {
-    for (const uid of [userId1, userId2]) {
+    for (let uid of [userId1, userId2]) {
       if (uid) {
+        uid = String(uid); // Enforce type safety
         if (busyUsers.has(uid)) {
           busyUsers.delete(uid);
         }
@@ -753,9 +772,9 @@ io.on('connection', (socket) => {
         io.to(sid).emit('incoming-call', callData);
       }
     }
-    console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
+    console.log(`[SOCKET] call:initiate: ✅ Forwarded to listener ${listenerId} (sockets: ${listenerSocketIds ? Array.from(listenerSocketIds).join(',') : 'NONE'})`);
 
-    // THEN verify in background Ã¢â‚¬â€ if not approved, cancel the call
+    // THEN verify in background — if not approved, cancel the call
     try {
       const listener = await Listener.findByUserId(listenerId);
       if (listener) {
@@ -769,12 +788,14 @@ io.on('connection', (socket) => {
             message: 'Listener not approved yet'
           });
           // Also cancel the incoming call on the listener side
-          if (listenerSocketId) {
-            io.to(listenerSocketId).emit('call:ended', {
-              callId: callData.callId,
-              reason: 'cancelled',
-              code: 'VERIFICATION_FAILED'
-            });
+          if (listenerSocketIds) {
+            for (const sid of listenerSocketIds) {
+              io.to(sid).emit('call:ended', {
+                callId: callData.callId,
+                reason: 'cancelled',
+                code: 'VERIFICATION_FAILED'
+              });
+            }
           }
           return;
         }
@@ -1037,6 +1058,7 @@ io.on('connection', (socket) => {
     // BUSY: Mark BOTH parties as busy in memory.
     [listenerUserId, callerId].forEach(uid => {
       if (!uid) return;
+      uid = String(uid); // Enforce type safety
       busyUsers.set(uid, callId);
       io.emit('listener_busy_status', {
         listenerUserId: uid,
@@ -1185,7 +1207,7 @@ io.on('connection', (socket) => {
             const timerMs = (maxAllowedSeconds + 3) * 1000;
             const timerId = setTimeout(async () => {
               console.log(`[SOCKET] Call ${callId}: max duration reached (${maxAllowedSeconds}s), auto-ending`);
-              activeCallTimers.delete(callId);
+              clearActiveCallTimer(callId);
 
               // Notify both parties to disconnect
               channelUsers.forEach(uid => {
@@ -1274,8 +1296,7 @@ io.on('connection', (socket) => {
     let endTimerData = null;
     if (callId && activeCallTimers.has(callId)) {
       endTimerData = activeCallTimers.get(callId);
-      clearTimeout(endTimerData.timerId);
-      activeCallTimers.delete(callId);
+      clearActiveCallTimer(callId);
       console.log(`[SOCKET] call:end: Cleared auto-disconnect timer for call ${callId}`);
     }
 
@@ -1498,6 +1519,40 @@ io.on('connection', (socket) => {
       }
       if (!wasForeground) {
         io.emit('user:online', { userId, timestamp: Date.now() });
+      }
+
+      // Clear any call drop timeouts since the user is back
+      for (const [callId, timerData] of activeCallTimers.entries()) {
+        const isCaller = String(timerData.callerId) === String(userId);
+        const isListener = timerData.listenerUserId && String(timerData.listenerUserId) === String(userId);
+        if (isCaller || isListener) {
+          if (activeCallDropTimeouts.has(callId)) {
+            clearTimeout(activeCallDropTimeouts.get(callId));
+            activeCallDropTimeouts.delete(callId);
+            console.log(`[SOCKET] User ${userId} reconnected. Cleared grace period for active call ${callId}`);
+            
+            // Notify peer that connection is restored
+            const otherPeerId = isCaller ? timerData.listenerUserId : timerData.callerId;
+            if (otherPeerId) {
+              const otherSockets = connectedUsers.get(otherPeerId) || listenerSockets.get(otherPeerId);
+              if (otherSockets) {
+                _emitToTargetSockets(otherSockets, 'call:reconnected', { callId, userId });
+              }
+            }
+          }
+        }
+      }
+
+      for (const [callId, pending] of pendingCalls.entries()) {
+        const isCaller = String(pending.initiatorUserId) === String(userId);
+        const isCallee = String(pending.calleeUserId) === String(userId);
+        if (isCaller || isCallee) {
+          if (pendingCallDropTimeouts.has(callId)) {
+            clearTimeout(pendingCallDropTimeouts.get(callId));
+            pendingCallDropTimeouts.delete(callId);
+            console.log(`[SOCKET] User ${userId} reconnected. Cleared pending drop for call ${callId}`);
+          }
+        }
       }
     }
 
@@ -1745,44 +1800,65 @@ io.on('connection', (socket) => {
 
     console.log(`[SOCKET] Disconnected: ${socket.id} (User: ${userId}, Listener: ${listenerUserId})`);
 
-    // Clear any active call timers for this user's calls (matches both caller and listener)
+    // Handle graceful drop timeouts for active calls
     for (const [callId, timerData] of activeCallTimers.entries()) {
       const isCaller = String(timerData.callerId) === String(userId);
       const isListener = timerData.listenerUserId && String(timerData.listenerUserId) === String(userId);
       if (isCaller || isListener) {
-        clearTimeout(timerData.timerId);
-        activeCallTimers.delete(callId);
-        console.log(`[SOCKET] disconnect: Cleared timer for call ${callId} (${isCaller ? 'caller' : 'listener'} disconnected)`);
-
-        // Notify the other peer that their partner disconnected during ongoing call
+        console.log(`[SOCKET] User ${userId} disconnected during active call ${callId}. Starting 45s grace period.`);
+        
+        // Notify the other peer that their partner disconnected temporarily
         const otherPeerId = isCaller ? timerData.listenerUserId : timerData.callerId;
         if (otherPeerId) {
           const otherSockets = connectedUsers.get(otherPeerId) || listenerSockets.get(otherPeerId);
           if (otherSockets) {
-            _emitToTargetSockets(otherSockets, 'call:ended', {
+            _emitToTargetSockets(otherSockets, 'call:reconnecting', {
               callId,
-              endedBy: userId,
-              reason: 'peer_disconnected',
+              userId: userId,
+              message: 'Peer lost connection, waiting to reconnect...'
             });
           }
         }
 
-        // Clear busy status for both participants in memory & DB
-        _clearBusyForCall(timerData.callerId, timerData.listenerUserId);
-
-        // Trigger billing safety net for disconnected calls
-        (async () => {
-          try {
-            const elapsed = Math.max(0, Math.round((Date.now() - timerData.startedAt) / 1000));
-            const billDuration = Math.min(elapsed, timerData.maxAllowedSeconds);
-            if (billDuration > 0) {
-              await billingFinalize({ callId, durationSeconds: billDuration });
-              console.log(`[SOCKET] disconnect: Safety billing for call ${callId} (${billDuration}s)`);
+        if (!activeCallDropTimeouts.has(callId)) {
+          const dropTimer = setTimeout(() => {
+            console.log(`[SOCKET] Grace period expired for call ${callId}. Dropping call.`);
+            activeCallDropTimeouts.delete(callId);
+            
+            if (activeCallTimers.has(callId)) {
+              const currentTimerData = activeCallTimers.get(callId);
+              clearTimeout(currentTimerData.timerId);
+              activeCallTimers.delete(callId);
+              
+              const peerToNotify = isCaller ? currentTimerData.listenerUserId : currentTimerData.callerId;
+              if (peerToNotify) {
+                const peerSockets = connectedUsers.get(peerToNotify) || listenerSockets.get(peerToNotify);
+                if (peerSockets) {
+                  _emitToTargetSockets(peerSockets, 'call:ended', {
+                    callId,
+                    endedBy: userId,
+                    reason: 'network_drop',
+                  });
+                }
+              }
+              _clearBusyForCall(currentTimerData.callerId, currentTimerData.listenerUserId);
+              
+              (async () => {
+                try {
+                  const elapsed = Math.max(0, Math.round((Date.now() - currentTimerData.startedAt) / 1000));
+                  const billDuration = Math.min(elapsed, currentTimerData.maxAllowedSeconds);
+                  if (billDuration > 0) {
+                    await billingFinalize({ callId, durationSeconds: billDuration });
+                    console.log(`[SOCKET] disconnect: Safety billing for call ${callId} (${billDuration}s)`);
+                  }
+                } catch (e) {
+                  console.error(`[SOCKET] disconnect: Safety billing error for call ${callId}:`, e.message);
+                }
+              })();
             }
-          } catch (e) {
-            console.error(`[SOCKET] disconnect: Safety billing error for call ${callId}:`, e.message);
-          }
-        })();
+          }, 45000);
+          activeCallDropTimeouts.set(callId, dropTimer);
+        }
       }
     }
 
@@ -1818,21 +1894,30 @@ io.on('connection', (socket) => {
         const isCaller = String(pending.initiatorUserId) === String(userId);
         const isCallee = String(pending.calleeUserId) === String(userId);
         if (isCaller || isCallee) {
-          console.log(`[SOCKET] ${isCaller ? 'Caller' : 'Callee'} ${userId} disconnected during pending call ${callId}, notifying peer`);
+          console.log(`[SOCKET] ${isCaller ? 'Caller' : 'Callee'} ${userId} disconnected during pending call ${callId}. Starting 15s grace period.`);
 
-          const peerId = isCaller ? pending.calleeUserId : pending.initiatorUserId;
-          if (peerId) {
-            const peerSockets = connectedUsers.get(peerId) || listenerSockets.get(peerId);
-            if (peerSockets) {
-              _emitToTargetSockets(peerSockets, 'call:ended', {
-                callId,
-                endedBy: userId,
-                reason: isCaller ? 'caller_disconnected' : 'callee_disconnected',
-              });
-            }
+          if (!pendingCallDropTimeouts.has(callId)) {
+            const dropTimer = setTimeout(() => {
+              if (pendingCalls.has(callId)) {
+                console.log(`[SOCKET] Grace period expired for pending call ${callId}. Dropping.`);
+                pendingCallDropTimeouts.delete(callId);
+                const peerId = isCaller ? pending.calleeUserId : pending.initiatorUserId;
+                if (peerId) {
+                  const peerSockets = connectedUsers.get(peerId) || listenerSockets.get(peerId);
+                  if (peerSockets) {
+                    _emitToTargetSockets(peerSockets, 'call:ended', {
+                      callId,
+                      endedBy: userId,
+                      reason: isCaller ? 'caller_disconnected' : 'callee_disconnected',
+                    });
+                  }
+                }
+                clearPendingCall(callId);
+                _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
+              }
+            }, 15000);
+            pendingCallDropTimeouts.set(callId, dropTimer);
           }
-          clearPendingCall(callId);
-          _clearBusyForCall(pending.initiatorUserId, pending.calleeUserId);
         }
       }
 
