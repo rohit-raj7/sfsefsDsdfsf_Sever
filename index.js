@@ -1801,9 +1801,11 @@ io.on('connection', (socket) => {
     console.log(`[SOCKET] Disconnected: ${socket.id} (User: ${userId}, Listener: ${listenerUserId})`);
 
     // Handle graceful drop timeouts for active calls
+    // Use both userId and listenerUserId to match — listener sockets may have a null userId
+    const effectiveDisconnectId = userId || listenerUserId;
     for (const [callId, timerData] of activeCallTimers.entries()) {
-      const isCaller = String(timerData.callerId) === String(userId);
-      const isListener = timerData.listenerUserId && String(timerData.listenerUserId) === String(userId);
+      const isCaller = effectiveDisconnectId && String(timerData.callerId) === String(effectiveDisconnectId);
+      const isListener = effectiveDisconnectId && timerData.listenerUserId && String(timerData.listenerUserId) === String(effectiveDisconnectId);
       if (isCaller || isListener) {
         console.log(`[SOCKET] User ${userId} disconnected during active call ${callId}. Starting 45s grace period.`);
         
@@ -1862,15 +1864,20 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Handle listener cleanup
+    // Handle listener cleanup — only clear busy if NOT in a grace period call
     if (listenerUserId) {
       const listenerWentOffline = _markListenerOffline(listenerUserId, 'disconnect');
       if (listenerWentOffline) {
         console.log(`[SOCKET] Listener marked offline: ${listenerUserId}`);
       }
 
-      // BUSY: Clear busy on disconnect (safety net)
-      if (busyUsers.has(listenerUserId)) {
+      // BUSY: Only clear busy on disconnect if there is NO active grace period for this listener.
+      // If there's a grace period, the call is still live — keep the busy flag until grace period expires.
+      const hasActiveGracePeriod = [...activeCallDropTimeouts.keys()].some(callId => {
+        const timer = activeCallTimers.get(callId);
+        return timer && String(timer.listenerUserId) === String(listenerUserId);
+      });
+      if (!hasActiveGracePeriod && busyUsers.has(listenerUserId)) {
         busyUsers.delete(listenerUserId);
         io.emit('listener_busy_status', { listenerUserId, busy: false });
         console.log(`[SOCKET] Listener ${listenerUserId} busy cleared on disconnect`);
@@ -1881,7 +1888,12 @@ io.on('connection', (socket) => {
     // Handle user cleanup and active calls
     if (userId) {
       // BUSY: Clear busy if this userId is a busy listener (covers both listenerUserId and userId)
-      if (busyUsers.has(userId)) {
+      // Only clear if no active grace period is running for this user's call.
+      const userHasActiveGracePeriod = [...activeCallDropTimeouts.keys()].some(callId => {
+        const timer = activeCallTimers.get(callId);
+        return timer && (String(timer.callerId) === String(userId) || String(timer.listenerUserId) === String(userId));
+      });
+      if (!userHasActiveGracePeriod && busyUsers.has(userId)) {
         busyUsers.delete(userId);
         io.emit('listener_busy_status', { listenerUserId: userId, busy: false });
         console.log(`[SOCKET] User ${userId} busy cleared on disconnect (userId path)`);
@@ -1922,6 +1934,8 @@ io.on('connection', (socket) => {
       }
 
       // Notify others in active channels
+      // NOTE: activeChannels is used by the random-match flow, not the listener call flow.
+      // Listener calls use activeCallTimers + pendingCalls, so this block is safe to keep instant.
       for (const [channelName, users] of activeChannels.entries()) {
         if (users.has(userId)) {
           users.forEach(otherUid => {
