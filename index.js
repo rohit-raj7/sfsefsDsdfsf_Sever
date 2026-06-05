@@ -274,7 +274,8 @@ io.on('connection', (socket) => {
       const activeCheck = await pool.query(
         `SELECT call_id FROM calls 
          WHERE (caller_id = $1 OR listener_id = (SELECT listener_id FROM listeners WHERE user_id = $1))
-           AND status IN ('pending', 'ringing', 'initiated', 'ongoing')
+           AND status = 'ongoing'
+           AND created_at >= NOW() - INTERVAL '2 hours'
          LIMIT 1`,
         [userId]
       );
@@ -325,7 +326,9 @@ io.on('connection', (socket) => {
     console.log(`[SOCKET] User ${userId} marked offline (${reason})`);
 
     // Clear busy flag on complete offline
-    _clearBusyForCall(userId);
+    if (reason !== 'disconnect') {
+      _clearBusyForCall(userId);
+    }
 
     return true;
   }
@@ -351,7 +354,9 @@ io.on('connection', (socket) => {
     console.log(`[SOCKET] Listener ${listenerUserId} marked offline (${reason})`);
 
     // Clear busy flag on complete offline
-    _clearBusyForCall(listenerUserId);
+    if (reason !== 'disconnect') {
+      _clearBusyForCall(listenerUserId);
+    }
 
     return true;
   }
