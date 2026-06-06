@@ -1,6 +1,7 @@
 import pkg from 'pg';
 const { Pool } = pkg;
 import dotenv from 'dotenv';
+import bcrypt from 'bcryptjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -95,6 +96,10 @@ async function testConnection(retries = 3) {
 // Ensure required columns exist on startup (non-destructive)
 async function ensureSchema() {
   try {
+    const adminSeedEmail = String(process.env.ADMIN_SEED_EMAIL || '').trim().toLowerCase();
+    const adminSeedPassword = String(process.env.ADMIN_SEED_PASSWORD || '');
+    const adminSeedFullName = String(process.env.ADMIN_SEED_FULL_NAME || 'Admin User').trim();
+
     // Ensure UUID function is available
     await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto;');
 
@@ -120,6 +125,22 @@ async function ensureSchema() {
     `;
     await pool.query(createAdminsSql);
     console.log('✓ Ensured admins table exists');
+
+    if (adminSeedEmail && adminSeedPassword) {
+      const hashedPassword = await bcrypt.hash(adminSeedPassword, 10);
+      await pool.query(
+        `
+          INSERT INTO admins (email, password_hash, full_name)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (email) DO UPDATE
+          SET password_hash = EXCLUDED.password_hash,
+              full_name = EXCLUDED.full_name,
+              is_active = TRUE
+        `,
+        [adminSeedEmail, hashedPassword, adminSeedFullName]
+      );
+      console.log('Ensured default admin credentials are in sync');
+    }
 
     // Create core tables BEFORE any table that references them
     await pool.query(`

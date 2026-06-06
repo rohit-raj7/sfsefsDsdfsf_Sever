@@ -77,6 +77,8 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
+    await Admin.ensureSeedAdmin(email);
+
     const admin = await Admin.findByEmail(email);
     if (!admin) {
       return res.status(401).json({ error: 'Invalid email or password' });
