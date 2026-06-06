@@ -34,10 +34,7 @@ const ADMIN_GOOGLE_CLIENT_ID =
   process.env.admin_google_client_id ||
   '21566908692-dbjt8f2fvdir69nv559vaod9hkshuidq.apps.googleusercontent.com';
 const googleClient = new OAuth2Client(ADMIN_GOOGLE_CLIENT_ID);
-const allowedAdminEmails = (
-  process.env.ADMIN_ALLOWED_EMAILS ||
-  'calltoofficials@gmail.com,appdostofficial@gmail.com,rohitraj70615@gmail.com'
-)
+const allowedAdminEmails = String(process.env.ADMIN_ALLOWED_EMAILS || '')
   .split(',')
   .map((email) => String(email || '').trim().toLowerCase())
   .filter(Boolean);

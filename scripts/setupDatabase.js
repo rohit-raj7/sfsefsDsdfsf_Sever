@@ -6,6 +6,9 @@ import bcrypt from 'bcryptjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const adminSeedEmail = String(process.env.ADMIN_SEED_EMAIL || 'admin@example.com').trim().toLowerCase();
+const adminSeedPassword = String(process.env.ADMIN_SEED_PASSWORD || 'ChangeMe123!');
+const adminSeedFullName = String(process.env.ADMIN_SEED_FULL_NAME || 'Admin User').trim();
 
 async function setupDatabase() {
   try {
@@ -36,15 +39,18 @@ async function setupDatabase() {
 
     // Hash the password
     const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash('admin123', saltRounds);
+    const hashedPassword = await bcrypt.hash(adminSeedPassword, saltRounds);
 
     // Insert default admin
     const insertAdminQuery = `
       INSERT INTO admins (email, password_hash, full_name)
       VALUES ($1, $2, $3)
-      ON CONFLICT (email) DO NOTHING
+      ON CONFLICT (email) DO UPDATE
+      SET password_hash = EXCLUDED.password_hash,
+          full_name = EXCLUDED.full_name,
+          is_active = TRUE
     `;
-    await pool.query(insertAdminQuery, ['rohitraj70615@gmail.com', hashedPassword, 'Admin User']);
+    await pool.query(insertAdminQuery, [adminSeedEmail, hashedPassword, adminSeedFullName]);
 
     console.log('🎉 Database setup completed successfully!');
   } catch (error) {
