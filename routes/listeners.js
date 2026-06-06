@@ -1360,6 +1360,269 @@ router.get('/me/withdrawals/summary', authenticate, async (req, res) => {
   }
 });
 
+// GET /api/listeners/me/gift-earnings/summary
+router.get('/me/gift-earnings/summary', authenticate, async (req, res) => {
+  try {
+    const listener = await Listener.findByUserId(req.userId);
+    if (!listener) {
+      return res.status(404).json({ error: 'Listener profile not found' });
+    }
+
+    // Call Earnings (standard call earnings)
+    const callEarningsResult = await pool.query(
+      `SELECT COALESCE(SUM(cr.listener_earn), 0)::numeric AS total_call_earnings
+       FROM call_records cr
+       WHERE cr.listener_id = $1`,
+      [listener.listener_id]
+    );
+    const totalCallEarnings = Number(callEarningsResult.rows[0]?.total_call_earnings || 0);
+
+    // Gift Wallet (Available Balance, Pending Balance, etc.)
+    const giftWalletResult = await pool.query(
+      `SELECT total_earnings, available_balance, pending_withdrawals, total_withdrawn
+       FROM listener_gift_wallets
+       WHERE listener_id = $1`,
+      [listener.listener_id]
+    );
+    
+    let totalGiftEarnings = 0;
+    let availableGiftBalance = 0;
+    let pendingGiftBalance = 0;
+    let totalWithdrawnGifts = 0;
+
+    if (giftWalletResult.rows.length > 0) {
+      const w = giftWalletResult.rows[0];
+      totalGiftEarnings = Number(w.total_earnings);
+      availableGiftBalance = Number(w.available_balance);
+      pendingGiftBalance = Number(w.pending_withdrawals);
+      totalWithdrawnGifts = Number(w.total_withdrawn);
+    }
+
+    // Gift revenue (gross sum coin_amount of all gifts sent to them)
+    const giftRevenueResult = await pool.query(
+      `SELECT COALESCE(SUM(coin_amount), 0)::numeric AS total_gift_revenue
+       FROM call_gifts
+       WHERE listener_id = $1`,
+      [listener.listener_id]
+    );
+    const totalGiftRevenue = Number(giftRevenueResult.rows[0]?.total_gift_revenue || 0);
+
+    // Top Gift Received
+    const topGiftResult = await pool.query(
+      `SELECT gift_name, COUNT(*)::int AS count
+       FROM call_gifts
+       WHERE listener_id = $1
+       GROUP BY gift_name
+       ORDER BY count DESC, gift_name ASC
+       LIMIT 1`,
+      [listener.listener_id]
+    );
+    const topGiftReceived = topGiftResult.rows[0]?.gift_name || null;
+
+    // Monthly Gift Earnings (grouped by year-month)
+    const monthlyResult = await pool.query(
+      `SELECT TO_CHAR(created_at, 'YYYY-MM') AS month,
+              COALESCE(SUM(listener_earning), 0)::numeric AS earnings
+       FROM call_gifts
+       WHERE listener_id = $1
+       GROUP BY TO_CHAR(created_at, 'YYYY-MM')
+       ORDER BY month DESC
+       LIMIT 6`,
+      [listener.listener_id]
+    );
+    const monthlyGiftEarnings = monthlyResult.rows.map(r => ({
+      month: r.month,
+      earnings: Number(r.earnings)
+    })).reverse();
+
+    // Total count of gifts received
+    const totalGiftsCountResult = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM call_gifts WHERE listener_id = $1`,
+      [listener.listener_id]
+    );
+    const totalGiftsReceived = totalGiftsCountResult.rows[0]?.count || 0;
+
+    return res.json({
+      success: true,
+      totalCallEarnings,
+      totalGiftEarnings,
+      availableGiftBalance,
+      pendingGiftBalance,
+      totalGiftRevenue,
+      totalWithdrawnGifts,
+      topGiftReceived,
+      totalGiftsReceived,
+      monthlyGiftEarnings
+    });
+  } catch (error) {
+    console.error('Get gift earnings summary error:', error);
+    return res.status(500).json({ error: 'Failed to fetch gift earnings summary' });
+  }
+});
+
+// GET /api/listeners/me/gift-earnings/history
+router.get('/me/gift-earnings/history', authenticate, async (req, res) => {
+  try {
+    const listener = await Listener.findByUserId(req.userId);
+    if (!listener) {
+      return res.status(404).json({ error: 'Listener profile not found' });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+    const result = await pool.query(
+      `SELECT sender_display_name AS sender_name,
+              gift_name,
+              coin_amount AS gift_amount,
+              listener_share_percent,
+              listener_earning,
+              created_at
+       FROM call_gifts
+       WHERE listener_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [listener.listener_id, limit, offset]
+    );
+
+    return res.json({
+      success: true,
+      history: result.rows.map(r => ({
+        senderName: r.sender_name || 'User',
+        giftName: r.gift_name,
+        giftAmount: Number(r.gift_amount),
+        listenerSharePercent: Number(r.listener_share_percent),
+        listenerEarning: Number(r.listener_earning),
+        createdAt: r.created_at
+      }))
+    });
+  } catch (error) {
+    console.error('Get gift earnings history error:', error);
+    return res.status(500).json({ error: 'Failed to fetch gift earnings history' });
+  }
+});
+
+// GET /api/listeners/me/gift-withdrawals/history
+router.get('/me/gift-withdrawals/history', authenticate, async (req, res) => {
+  try {
+    const listener = await Listener.findByUserId(req.userId);
+    if (!listener) {
+      return res.status(404).json({ error: 'Listener profile not found' });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
+
+    const result = await pool.query(
+      `SELECT request_id, amount, status, remarks, created_at, updated_at
+       FROM listener_gift_withdrawal_requests
+       WHERE listener_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [listener.listener_id, limit]
+    );
+
+    return res.json({
+      success: true,
+      withdrawals: result.rows.map(r => ({
+        requestId: r.request_id,
+        amount: Number(r.amount),
+        status: r.status,
+        remarks: r.remarks,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at
+      }))
+    });
+  } catch (error) {
+    console.error('Get gift withdrawals history error:', error);
+    return res.status(500).json({ error: 'Failed to fetch gift withdrawals history' });
+  }
+});
+
+// POST /api/listeners/me/gift-withdrawals
+router.post('/me/gift-withdrawals', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const listener = await Listener.findByUserId(req.userId);
+    if (!listener) {
+      return res.status(404).json({ error: 'Listener profile not found' });
+    }
+
+    const amount = Number(req.body?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Withdrawal amount must be greater than 0' });
+    }
+
+    await client.query('BEGIN');
+
+    // Ensure listener gift wallet exists
+    await client.query(
+      `INSERT INTO listener_gift_wallets (listener_id, total_earnings, available_balance, pending_withdrawals, total_withdrawn)
+       VALUES ($1, 0.0, 0.0, 0.0, 0.0)
+       ON CONFLICT (listener_id) DO NOTHING`,
+      [listener.listener_id]
+    );
+
+    // Lock listener gift wallet for update
+    const walletResult = await client.query(
+      `SELECT available_balance
+       FROM listener_gift_wallets
+       WHERE listener_id = $1
+       FOR UPDATE`,
+      [listener.listener_id]
+    );
+
+    const availableBalance = Number(walletResult.rows[0]?.available_balance || 0);
+    if (amount > availableBalance) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Withdrawal amount exceeds available balance' });
+    }
+
+    // Deduct available, credit pending
+    await client.query(
+      `UPDATE listener_gift_wallets
+       SET available_balance = available_balance - $2,
+           pending_withdrawals = pending_withdrawals + $2,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE listener_id = $1`,
+      [listener.listener_id, amount]
+    );
+
+    // Insert withdrawal request
+    const requestResult = await client.query(
+      `INSERT INTO listener_gift_withdrawal_requests (listener_id, amount, status)
+       VALUES ($1, $2, 'pending')
+       RETURNING request_id, amount, status, created_at`,
+      [listener.listener_id, amount]
+    );
+
+    // Record transaction entry
+    await client.query(
+      `INSERT INTO transactions (user_id, transaction_type, amount, currency, description, status)
+       VALUES ($1, 'withdrawal', $2, 'INR', 'Gift Earnings Payout Request', 'pending')`,
+      [req.userId, amount]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      message: 'Gift earnings withdrawal request submitted successfully',
+      request: {
+        requestId: requestResult.rows[0].request_id,
+        amount: Number(requestResult.rows[0].amount),
+        status: requestResult.rows[0].status,
+        createdAt: requestResult.rows[0].created_at
+      }
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Request gift withdrawal error:', error);
+    return res.status(500).json({ error: 'Failed to request withdrawal' });
+  } finally {
+    client.release();
+  }
+});
+
 // GET /api/listeners/me/withdrawals
 router.get('/me/withdrawals', authenticate, async (req, res) => {
   try {

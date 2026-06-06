@@ -359,6 +359,148 @@ CREATE TABLE IF NOT EXISTS wallets (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS call_gifts (
+    gift_event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    call_id UUID NOT NULL REFERENCES calls(call_id) ON DELETE CASCADE,
+    sender_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    listener_id UUID REFERENCES listeners(listener_id) ON DELETE SET NULL,
+    listener_user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    client_request_id VARCHAR(120) NOT NULL,
+    gift_id VARCHAR(64) NOT NULL,
+    gift_name VARCHAR(120) NOT NULL,
+    asset_key VARCHAR(120) NOT NULL,
+    gift_category VARCHAR(64) NOT NULL,
+    rarity VARCHAR(32) NOT NULL,
+    original_coin_amount DECIMAL(10, 2),
+    coin_amount DECIMAL(10, 2) NOT NULL CHECK (coin_amount > 0),
+    gift_description TEXT,
+    sender_display_name VARCHAR(120),
+    sender_avatar_url TEXT,
+    listener_share_percent DECIMAL(5, 2) DEFAULT 50.00,
+    listener_earning DECIMAL(10, 2) DEFAULT 0.00,
+    platform_commission DECIMAL(10, 2) DEFAULT 0.00,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_call_gifts_sender_request
+ON call_gifts(sender_id, client_request_id);
+
+CREATE INDEX IF NOT EXISTS idx_call_gifts_call_created
+ON call_gifts(call_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_call_gifts_listener_created
+ON call_gifts(listener_user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS call_gift_audit_logs (
+    audit_log_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    gift_event_id UUID REFERENCES call_gifts(gift_event_id) ON DELETE SET NULL,
+    sender_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    listener_id UUID REFERENCES listeners(listener_id) ON DELETE SET NULL,
+    listener_user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    call_id UUID REFERENCES calls(call_id) ON DELETE SET NULL,
+    gift_id VARCHAR(64),
+    client_request_id VARCHAR(120),
+    status VARCHAR(20) NOT NULL CHECK (status IN ('completed', 'duplicate', 'failed')),
+    reason TEXT,
+    request_payload JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_gift_audit_call_created
+ON call_gift_audit_logs(call_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_call_gift_audit_sender_created
+ON call_gift_audit_logs(sender_id, created_at DESC);
+
+-- ============================================
+-- GIFT CATALOG / REVENUE / WITHDRAWALS
+-- ============================================
+CREATE TABLE IF NOT EXISTS gifts (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(120) NOT NULL,
+    original_coin_amount DECIMAL(10, 2),
+    coin_amount DECIMAL(10, 2) NOT NULL CHECK (coin_amount >= 0),
+    category VARCHAR(64) NOT NULL,
+    priority INTEGER DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    icon_url TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS gift_settings (
+    singleton_key BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton_key = TRUE),
+    listener_gift_share_percent NUMERIC(5, 2) NOT NULL DEFAULT 50.00,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS listener_gift_wallets (
+    listener_id UUID PRIMARY KEY REFERENCES listeners(listener_id) ON DELETE CASCADE,
+    total_earnings DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+    available_balance DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+    pending_withdrawals DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+    total_withdrawn DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS listener_gift_earnings_ledger (
+    ledger_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    listener_id UUID NOT NULL REFERENCES listeners(listener_id) ON DELETE CASCADE,
+    gift_event_id UUID UNIQUE REFERENCES call_gifts(gift_event_id) ON DELETE CASCADE,
+    transaction_id UUID REFERENCES transactions(transaction_id) ON DELETE SET NULL,
+    amount DECIMAL(10, 2) NOT NULL CHECK (amount >= 0),
+    status VARCHAR(20) NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'withdrawn', 'reversed')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_listener_gift_ledger_listener_created
+ON listener_gift_earnings_ledger(listener_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS listener_gift_withdrawal_requests (
+    request_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    listener_id UUID NOT NULL REFERENCES listeners(listener_id) ON DELETE CASCADE,
+    amount DECIMAL(10, 2) NOT NULL CHECK (amount > 0),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'processed')),
+    remarks TEXT,
+    approved_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_listener_gift_withdrawals_listener
+ON listener_gift_withdrawal_requests(listener_id);
+
+INSERT INTO gift_settings (listener_gift_share_percent)
+SELECT 50.00
+WHERE NOT EXISTS (SELECT 1 FROM gift_settings);
+
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'coffee', 'Coffee', 'A warm caffeine boost for an easy, cozy moment.', 29.00, 29.00, 'trending', 10, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'coffee');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'rose', 'Rose', 'A timeless red rose that says you made my day.', 39.00, 39.00, 'romantic', 20, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'rose');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'chocolate', 'Chocolate', 'A sweet premium treat to make the call feel warmer.', 49.00, 49.00, 'romantic', 30, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'chocolate');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'teddy_bear', 'Teddy Bear', 'A soft plush surprise for comfort, cuteness, and charm.', 99.00, 99.00, 'romantic', 40, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'teddy_bear');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'cake', 'Cake', 'A celebratory cake for birthdays, wins, and sweet moments.', 129.00, 129.00, 'celebration', 50, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'cake');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'bouquet', 'Bouquet', 'A lush bouquet for elegant appreciation and admiration.', 159.00, 159.00, 'romantic', 60, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'bouquet');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'perfume', 'Perfume', 'A designer fragrance drop with polished premium energy.', 299.00, 299.00, 'luxury', 70, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'perfume');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'diamond_ring', 'Diamond Ring', 'A sparkling symbol of deep admiration and standout attention.', 399.00, 399.00, 'luxury', 80, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'diamond_ring');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'luxury_watch', 'Luxury Watch', 'A refined timepiece that feels exclusive, bold, and sharp.', 499.00, 499.00, 'luxury', 90, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'luxury_watch');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'sports_car', 'Sports Car', 'A blazing supercar gift for unforgettable grand entrances.', 899.00, 899.00, 'luxury', 100, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'sports_car');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'private_jet', 'Private Jet', 'A sky-high flex that turns the moment instantly premium.', 1199.00, 1199.00, 'luxury', 110, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'private_jet');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'golden_crown', 'Golden Crown', 'A royal tribute for listeners who made the call exceptional.', 1499.00, 1499.00, 'luxury', 120, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'golden_crown');
+INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+SELECT 'palace', 'Palace', 'A majestic palace gift reserved for truly iconic moments.', 1999.00, 1999.00, 'luxury', 130, TRUE, NULL WHERE NOT EXISTS (SELECT 1 FROM gifts WHERE id = 'palace');
+
 -- ============================================
 -- LISTENER PAYMENT DETAILS TABLE
 -- ============================================
@@ -628,3 +770,4 @@ CREATE INDEX idx_listener_payout_slabs_start ON listener_payout_slabs(start_dura
 -- ============================================
 -- END OF SCHEMA
 -- ============================================
+

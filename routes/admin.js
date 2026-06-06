@@ -1,6 +1,7 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import axios from 'axios';
+import { randomBytes } from 'crypto';
 import { OAuth2Client } from 'google-auth-library';
 import Admin from '../models/Admin.js';
 import Listener from '../models/Listener.js';
@@ -9,6 +10,8 @@ import ChatChargeConfig from '../models/ChatChargeConfig.js';
 import config from '../config/config.js';
 import { pool } from '../db.js';
 import { authenticateAdmin } from '../middleware/auth.js';
+import multer from 'multer';
+import { uploadToMinio } from '../utils/minioUpload.js';
 import {
   validateGlobalRateInput,
   validateRuleInput,
@@ -40,6 +43,44 @@ const allowedAdminEmails = String(process.env.ADMIN_ALLOWED_EMAILS || '')
   .filter(Boolean);
 
 const isAllowedAdminEmail = (email = '') => allowedAdminEmails.includes(String(email).trim().toLowerCase());
+
+const normalizeGiftId = (value = '') =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+const buildGiftIdBase = (name = '') => normalizeGiftId(name) || 'gift';
+
+const ensureUniqueGiftId = async (preferredId) => {
+  const baseId = normalizeGiftId(preferredId) || 'gift';
+  let candidate = baseId;
+  let suffix = 2;
+
+  for (let attempts = 0; attempts < 50; attempts += 1) {
+    const existing = await pool.query('SELECT 1 FROM gifts WHERE id = $1 LIMIT 1', [candidate]);
+    if (existing.rows.length === 0) {
+      return candidate;
+    }
+    candidate = `${baseId}_${suffix}`;
+    suffix += 1;
+  }
+
+  const fallback = `${baseId}_${randomBytes(3).toString('hex')}`;
+  const existing = await pool.query('SELECT 1 FROM gifts WHERE id = $1 LIMIT 1', [fallback]);
+  if (existing.rows.length === 0) {
+    return fallback;
+  }
+
+  throw new Error('Unable to generate a unique gift ID');
+};
+
+const parseGiftAmount = (value) => {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount : NaN;
+};
 
 const defaultOfferBannerConfig = {
   offerId: null,
@@ -1322,6 +1363,416 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
   } catch (error) {
     console.error('Fetch dashboard stats error:', error);
     res.status(500).json({ error: 'Failed to fetch dashboard stats' });
+  }
+});
+
+// Admin Gift Management Module
+const giftIconUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only JPEG, PNG, WEBP, and GIF images are allowed for gift icons'), false);
+    }
+  }
+});
+
+// POST /api/admin/gifts/upload-icon
+router.post('/gifts/upload-icon', authenticateAdmin, giftIconUpload.single('iconFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    const result = await uploadToMinio(req.file.buffer, req.file.originalname, req.file.mimetype, 'gifts');
+    res.json({ secure_url: result.secure_url });
+  } catch (error) {
+    console.error('Gift icon upload error:', error);
+    res.status(500).json({ error: error.message || 'Failed to upload gift icon' });
+  }
+});
+
+// GET /api/admin/gift-settings
+router.get('/gift-settings', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT listener_gift_share_percent FROM gift_settings LIMIT 1');
+    const listenerGiftSharePercent = Number(result.rows[0]?.listener_gift_share_percent ?? 50);
+    res.json({ listenerGiftSharePercent });
+  } catch (error) {
+    console.error('Get gift settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch gift settings' });
+  }
+});
+
+// PUT /api/admin/gift-settings
+router.put('/gift-settings', authenticateAdmin, async (req, res) => {
+  try {
+    const { listenerGiftSharePercent } = req.body;
+    const sharePercent = Number(listenerGiftSharePercent);
+    if (!Number.isFinite(sharePercent) || sharePercent < 0 || sharePercent > 100) {
+      return res.status(400).json({ error: 'Listener share percent must be between 0 and 100' });
+    }
+    await pool.query(
+      `INSERT INTO gift_settings (singleton_key, listener_gift_share_percent, updated_at)
+       VALUES (TRUE, $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (singleton_key) DO UPDATE
+       SET listener_gift_share_percent = EXCLUDED.listener_gift_share_percent,
+           updated_at = CURRENT_TIMESTAMP`,
+      [sharePercent]
+    );
+    res.json({ message: 'Gift share percentage updated successfully', listenerGiftSharePercent: sharePercent });
+  } catch (error) {
+    console.error('Update gift settings error:', error);
+    res.status(500).json({ error: 'Failed to update gift settings' });
+  }
+});
+
+// GET /api/admin/gifts
+router.get('/gifts', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, COALESCE(original_coin_amount, coin_amount) AS original_coin_amount,
+              coin_amount, category, priority, is_active, icon_url, created_at, updated_at
+       FROM gifts
+       ORDER BY priority ASC, name ASC`
+    );
+    res.json({ gifts: result.rows });
+  } catch (error) {
+    console.error('Get admin gifts error:', error);
+    res.status(500).json({ error: 'Failed to fetch gifts' });
+  }
+});
+
+// POST /api/admin/gifts
+router.post('/gifts', authenticateAdmin, async (req, res) => {
+  try {
+    const { id, name, category, priority, is_active, icon_url } = req.body;
+    const coinAmount = parseGiftAmount(req.body?.coin_amount ?? req.body?.price ?? req.body?.coinAmount);
+    const originalCoinAmount = parseGiftAmount(
+      req.body?.original_coin_amount ??
+      req.body?.original_price ??
+      req.body?.originalPrice ??
+      coinAmount
+    );
+
+    if (!name || !category) {
+      return res.status(400).json({ error: 'Gift Name and Category are required' });
+    }
+    if (!Number.isFinite(coinAmount) || coinAmount <= 0) {
+      return res.status(400).json({ error: 'Gift price must be a positive rupee amount' });
+    }
+    if (!Number.isFinite(originalCoinAmount) || originalCoinAmount <= 0) {
+      return res.status(400).json({ error: 'Original gift price must be a positive rupee amount' });
+    }
+    if (originalCoinAmount < coinAmount) {
+      return res.status(400).json({ error: 'Original price must be greater than or equal to the price' });
+    }
+
+    const providedGiftId = normalizeGiftId(id);
+    const giftId = await ensureUniqueGiftId(providedGiftId || buildGiftIdBase(name));
+
+    const result = await pool.query(
+      `INSERT INTO gifts (id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url, created_at, updated_at`,
+      [giftId, name, originalCoinAmount, coinAmount, category, Number(priority || 0), is_active !== false, icon_url || null]
+    );
+    res.status(201).json({ message: 'Gift created successfully', gift: result.rows[0] });
+  } catch (error) {
+    console.error('Create gift error:', error);
+    res.status(500).json({ error: 'Failed to create gift' });
+  }
+});
+
+// PUT /api/admin/gifts/:id
+router.put('/gifts/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { name, category, priority, is_active, icon_url } = req.body;
+    const { id } = req.params;
+    const coinAmount = parseGiftAmount(req.body?.coin_amount ?? req.body?.price ?? req.body?.coinAmount);
+    const originalCoinAmount = parseGiftAmount(
+      req.body?.original_coin_amount ??
+      req.body?.original_price ??
+      req.body?.originalPrice ??
+      coinAmount
+    );
+    if (!name || !category) {
+      return res.status(400).json({ error: 'Name and Category are required' });
+    }
+    if (!Number.isFinite(coinAmount) || coinAmount <= 0) {
+      return res.status(400).json({ error: 'Gift price must be a positive rupee amount' });
+    }
+    if (!Number.isFinite(originalCoinAmount) || originalCoinAmount <= 0) {
+      return res.status(400).json({ error: 'Original gift price must be a positive rupee amount' });
+    }
+    if (originalCoinAmount < coinAmount) {
+      return res.status(400).json({ error: 'Original price must be greater than or equal to the price' });
+    }
+
+    const result = await pool.query(
+      `UPDATE gifts
+       SET name = $1, original_coin_amount = $2, coin_amount = $3, category = $4, priority = $5, is_active = $6, icon_url = $7, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $8
+       RETURNING id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url, created_at, updated_at`,
+      [name, originalCoinAmount, coinAmount, category, Number(priority || 0), is_active !== false, icon_url || null, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Gift not found' });
+    }
+    res.json({ message: 'Gift updated successfully', gift: result.rows[0] });
+  } catch (error) {
+    console.error('Update gift error:', error);
+    res.status(500).json({ error: 'Failed to update gift' });
+  }
+});
+
+// DELETE /api/admin/gifts/:id
+router.delete('/gifts/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM gifts WHERE id = $1 RETURNING id', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Gift not found' });
+    }
+    res.json({ message: 'Gift deleted successfully', id });
+  } catch (error) {
+    console.error('Delete gift error:', error);
+    res.status(500).json({ error: 'Failed to delete gift' });
+  }
+});
+
+// PUT /api/admin/gifts/:id/status
+router.put('/gifts/:id/status', authenticateAdmin, async (req, res) => {
+  try {
+    const { is_active } = req.body;
+    const { id } = req.params;
+    const result = await pool.query(
+      `UPDATE gifts SET is_active = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`,
+      [is_active === true, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Gift not found' });
+    }
+    res.json({ message: 'Gift status updated successfully', gift: result.rows[0] });
+  } catch (error) {
+    console.error('Toggle gift status error:', error);
+    res.status(500).json({ error: 'Failed to toggle gift status' });
+  }
+});
+
+// GET /api/admin/gift-withdrawals
+router.get('/gift-withdrawals', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT gwr.request_id, gwr.amount, gwr.status, gwr.remarks, gwr.approved_by, gwr.created_at, gwr.updated_at,
+              l.professional_name,
+              lpd.payment_method, lpd.upi_id, lpd.account_number, lpd.ifsc_code, lpd.bank_name, lpd.account_holder_name
+       FROM listener_gift_withdrawal_requests gwr
+       JOIN listeners l ON gwr.listener_id = l.listener_id
+       LEFT JOIN listener_payment_details lpd ON lpd.listener_id = l.listener_id
+       ORDER BY gwr.created_at DESC`
+    );
+    res.json({ withdrawals: result.rows });
+  } catch (error) {
+    console.error('Get admin gift withdrawals error:', error);
+    res.status(500).json({ error: 'Failed to fetch gift withdrawals' });
+  }
+});
+
+// PUT /api/admin/gift-withdrawals/:id/status
+router.put('/gift-withdrawals/:id/status', authenticateAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { status, remarks } = req.body;
+    const { id } = req.params;
+    if (!['approved', 'rejected', 'processed'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid withdrawal status' });
+    }
+
+    await client.query('BEGIN');
+
+    // Get current request details
+    const requestRes = await client.query(
+      `SELECT listener_id, amount, status FROM listener_gift_withdrawal_requests WHERE request_id = $1 FOR UPDATE`,
+      [id]
+    );
+
+    if (requestRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Gift withdrawal request not found' });
+    }
+
+    const request = requestRes.rows[0];
+    if (request.status === status) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Withdrawal request is already ${status}` });
+    }
+    if (request.status === 'processed' || request.status === 'rejected') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Cannot change status of a request that is already ${request.status}` });
+    }
+    if (request.status === 'approved' && status !== 'processed') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Approved requests can only be marked as processed' });
+    }
+
+    // Process state changes
+    if (status === 'rejected') {
+      await client.query(
+        `UPDATE listener_gift_wallets
+         SET pending_withdrawals = pending_withdrawals - $2,
+             available_balance = available_balance + $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE listener_id = $1`,
+        [request.listener_id, Number(request.amount)]
+      );
+
+      const userRes = await client.query(
+        `SELECT user_id FROM listeners WHERE listener_id = $1`,
+        [request.listener_id]
+      );
+      const userId = userRes.rows[0]?.user_id;
+
+      if (userId) {
+        await client.query(
+          `INSERT INTO transactions (user_id, transaction_type, amount, currency, description, status)
+           VALUES ($1, 'refund', $2, 'INR', 'Gift Payout Rejected & Refunded', 'completed')`,
+          [userId, Number(request.amount)]
+        );
+      }
+    } else if (status === 'processed') {
+      await client.query(
+        `UPDATE listener_gift_wallets
+         SET pending_withdrawals = pending_withdrawals - $2,
+             total_withdrawn = total_withdrawn + $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE listener_id = $1`,
+        [request.listener_id, Number(request.amount)]
+      );
+
+      const userRes = await client.query(
+        `SELECT user_id FROM listeners WHERE listener_id = $1`,
+        [request.listener_id]
+      );
+      const userId = userRes.rows[0]?.user_id;
+
+      if (userId) {
+        await client.query(
+          `INSERT INTO transactions (user_id, transaction_type, amount, currency, description, status)
+           VALUES ($1, 'withdrawal', $2, 'INR', 'Gift Payout Completed', 'completed')`,
+          [userId, Number(request.amount)]
+        );
+      }
+    }
+
+    const updated = await client.query(
+      `UPDATE listener_gift_withdrawal_requests
+       SET status = $1,
+           remarks = COALESCE($3, remarks),
+           approved_by = CASE
+             WHEN $1 IN ('approved', 'processed') THEN $4
+             ELSE approved_by
+           END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE request_id = $2
+       RETURNING *`,
+      [status, id, remarks || null, req.adminId || null]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: `Withdrawal request successfully marked as ${status}`, withdrawal: updated.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Update gift withdrawal status error:', error);
+    res.status(500).json({ error: 'Failed to update withdrawal status' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/admin/gift-reports
+router.get('/gift-reports', authenticateAdmin, async (req, res) => {
+  try {
+    const summaryRes = await pool.query(
+      `SELECT
+         COUNT(*)::int AS total_gifts_sent,
+         COALESCE(SUM(coin_amount), 0)::numeric AS total_gift_revenue,
+         COALESCE(SUM(platform_commission), 0)::numeric AS total_platform_commission,
+         COALESCE(SUM(listener_earning), 0)::numeric AS total_listener_payout
+       FROM call_gifts`
+    );
+
+    const topSendersRes = await pool.query(
+      `SELECT sender_id, sender_display_name AS name,
+              COUNT(*)::int AS count,
+              COALESCE(SUM(coin_amount), 0)::numeric AS total_value
+       FROM call_gifts
+       GROUP BY sender_id, sender_display_name
+       ORDER BY total_value DESC
+       LIMIT 10`
+    );
+
+    const topReceiversRes = await pool.query(
+      `SELECT listener_id, listener_user_id,
+              (SELECT professional_name FROM listeners WHERE listener_id = call_gifts.listener_id) AS name,
+              COUNT(*)::int AS count,
+              COALESCE(SUM(listener_earning), 0)::numeric AS total_earned
+       FROM call_gifts
+       GROUP BY listener_id, listener_user_id
+       ORDER BY total_earned DESC
+       LIMIT 10`
+    );
+
+    const dailyRes = await pool.query(
+      `SELECT TO_CHAR(created_at, 'YYYY-MM-DD') AS date,
+              COALESCE(SUM(coin_amount), 0)::numeric AS revenue,
+              COALESCE(SUM(platform_commission), 0)::numeric AS commission,
+              COALESCE(SUM(listener_earning), 0)::numeric AS payout
+       FROM call_gifts
+       WHERE created_at >= CURRENT_DATE - INTERVAL '30 days'
+       GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD')
+       ORDER BY date ASC`
+    );
+
+    const monthlyRes = await pool.query(
+      `SELECT TO_CHAR(created_at, 'YYYY-MM') AS month,
+              COALESCE(SUM(coin_amount), 0)::numeric AS revenue,
+              COALESCE(SUM(platform_commission), 0)::numeric AS commission,
+              COALESCE(SUM(listener_earning), 0)::numeric AS payout
+       FROM call_gifts
+       WHERE created_at >= CURRENT_DATE - INTERVAL '12 months'
+       GROUP BY TO_CHAR(created_at, 'YYYY-MM')
+       ORDER BY month ASC`
+    );
+
+    res.json({
+      summary: {
+        totalGiftsSent: parseInt(summaryRes.rows[0].total_gifts_sent) || 0,
+        totalGiftRevenue: parseFloat(summaryRes.rows[0].total_gift_revenue) || 0,
+        totalPlatformCommission: parseFloat(summaryRes.rows[0].total_platform_commission) || 0,
+        totalListenerPayout: parseFloat(summaryRes.rows[0].total_listener_payout) || 0
+      },
+      topSenders: topSendersRes.rows.map(r => ({ ...r, total_value: parseFloat(r.total_value) })),
+      topReceivers: topReceiversRes.rows.map(r => ({ ...r, total_earned: parseFloat(r.total_earned) })),
+      dailyRevenue: dailyRes.rows.map(r => ({
+        date: r.date,
+        revenue: parseFloat(r.revenue),
+        commission: parseFloat(r.commission),
+        payout: parseFloat(r.payout)
+      })),
+      monthlyRevenue: monthlyRes.rows.map(r => ({
+        month: r.month,
+        revenue: parseFloat(r.revenue),
+        commission: parseFloat(r.commission),
+        payout: parseFloat(r.payout)
+      }))
+    });
+  } catch (error) {
+    console.error('Fetch gift reports error:', error);
+    res.status(500).json({ error: 'Failed to fetch gift reports' });
   }
 });
 
