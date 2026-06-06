@@ -4,6 +4,28 @@ const DUPLICATE_REQUEST_CONSTRAINT = 'uq_call_gifts_sender_request';
 
 const toMoney = (value) => Number(Number(value || 0).toFixed(2));
 
+let giftPricingSchemaPromise = null;
+
+const ensureGiftPricingSchema = () => {
+  if (!giftPricingSchemaPromise) {
+    giftPricingSchemaPromise = pool.query(`
+      ALTER TABLE gifts ADD COLUMN IF NOT EXISTS original_coin_amount DECIMAL(10, 2);
+      UPDATE gifts
+      SET original_coin_amount = COALESCE(original_coin_amount, coin_amount)
+      WHERE original_coin_amount IS NULL;
+
+      ALTER TABLE call_gifts ADD COLUMN IF NOT EXISTS original_coin_amount DECIMAL(10, 2);
+      UPDATE call_gifts
+      SET original_coin_amount = COALESCE(original_coin_amount, coin_amount)
+      WHERE original_coin_amount IS NULL;
+    `).catch((error) => {
+      giftPricingSchemaPromise = null;
+      throw error;
+    });
+  }
+  return giftPricingSchemaPromise;
+};
+
 const normalizeLimit = (value, fallback = 30) => {
   const parsed = Number.parseInt(String(value ?? fallback), 10);
   if (!Number.isFinite(parsed)) return fallback;
@@ -84,6 +106,8 @@ const logAudit = async ({
 
 class CallGift {
   static async getCatalog() {
+    await ensureGiftPricingSchema();
+
     const result = await pool.query(
       `SELECT id, name, original_coin_amount, coin_amount, category, priority, is_active, icon_url
        FROM gifts
@@ -123,6 +147,8 @@ class CallGift {
     since = null,
     limit = 30,
   }) {
+    await ensureGiftPricingSchema();
+
     const normalizedLimit = normalizeLimit(limit);
     const sinceDate = parseSinceDate(since);
 
@@ -205,6 +231,8 @@ class CallGift {
     giftId,
     clientRequestId,
   }) {
+    await ensureGiftPricingSchema();
+
     const giftResult = await pool.query(
       `SELECT id, name, original_coin_amount, coin_amount, category, is_active, icon_url
        FROM gifts
@@ -382,7 +410,7 @@ class CallGift {
         [senderId, senderBalance],
       );
 
-      const listenerTransactionResult = await client.query(
+      await client.query(
         `INSERT INTO transactions (
            user_id,
            transaction_type,
@@ -424,7 +452,7 @@ class CallGift {
         [call.listener_id, listenerEarning]
       );
 
-      await client.query(
+      const listenerTransactionResult = await client.query(
         `INSERT INTO transactions (
            user_id,
            transaction_type,
@@ -468,8 +496,8 @@ class CallGift {
          VALUES (
            $1, $2, $3, $4, $5,
            $6, $7, $8, $9, $10,
-           $11, $12, $13, $14, $15,
-           $16, $17, $18
+           $11, $12, $13, $14,
+           $15, $16, $17
          )
          RETURNING
            gift_event_id,
