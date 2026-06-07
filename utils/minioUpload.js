@@ -189,4 +189,25 @@ export const deleteFromMinioByUrl = async (fileUrl) => {
   return true;
 };
 
+export const deleteFromMinioByKey = async (objectKey) => {
+  const key = String(objectKey || '').replace(/^\/+/, '').trim();
+  if (!key) {
+    return false;
+  }
+
+  ensureR2Config();
+
+  await s3Client.send(new DeleteObjectCommand({
+    Bucket: BUCKET_NAME,
+    Key: key,
+  }));
+
+  console.log('[R2_DELETE] Deleted object', {
+    key,
+    config: sanitizeR2ConfigForLogs(),
+  });
+
+  return true;
+};
+
 export default s3Client;

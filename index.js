@@ -43,6 +43,7 @@ import Listener from './models/Listener.js'; // Import for verification checks
 import Call from './models/Call.js';
 import { markCallStarted, calculateMaxCallDuration, finalizeCallBilling as billingFinalize } from './services/callBillingService.js';
 import { Chat, Message } from './models/Chat.js';
+import { deleteFromMinioByKey, deleteFromMinioByUrl } from './utils/minioUpload.js';
 import ChatChargeConfig from './models/ChatChargeConfig.js';
 import {
   bootstrapScheduledNotifications,
@@ -257,6 +258,7 @@ setInterval(async () => {
 
 // WhatsApp-style chat state tracking
 const userChatState = new Map(); // Map of userId -> { activelyViewingChatId, appState: 'foreground'|'background' }
+io.userChatState = userChatState;
 
 // Socket.IO connection handler
 io.on('connection', (socket) => {
@@ -1465,7 +1467,7 @@ io.on('connection', (socket) => {
 
     // Fetch and send chat history
     try {
-      const messages = await Message.getChatMessages(chatId, 50, 0);
+      const messages = await Message.getChatMessages(chatId, 50, 0, socket.userId);
       // FIX: Ensure all message timestamps are UTC ISO strings for consistent client parsing
       const normalizedMessages = messages.map(msg => ({
         ...msg,
@@ -1575,6 +1577,14 @@ io.on('connection', (socket) => {
       return;
     }
 
+    if (messageType !== 'text' || mediaUrl) {
+      socket.emit('chat:error', {
+        error: 'Use secure upload to send files.',
+        code: 'SECURE_UPLOAD_REQUIRED',
+      });
+      return;
+    }
+
     try {
       const chat = await Chat.findById(chatId);
       if (!chat) {
@@ -1658,6 +1668,21 @@ io.on('connection', (socket) => {
       // Broadcast message to all users in the chat room IMMEDIATELY (real-time UI update)
       console.log(`[SOCKET] chat:send timestamp debug: raw=${message.created_at}, type=${typeof message.created_at}, isDate=${message.created_at instanceof Date}, final=${messageData.message.created_at}`);
       io.to(`chat_${chatId}`).emit('chat:message', messageData);
+
+      const receiverSockets = io.sockets.adapter.rooms.get(`user_${otherUserId}`);
+      if (receiverSockets && receiverSockets.size > 0) {
+        Message.markDelivered(message.message_id)
+          .then((updated) => {
+            if (!updated?.sender_id) return;
+            io.to(`user_${updated.sender_id}`).emit('message_status_updated', {
+              chatId,
+              messageIds: [updated.message_id],
+              status: 'delivered',
+              deliveredTo: otherUserId,
+            });
+          })
+          .catch((err) => console.error('[SOCKET] markDelivered error:', err.message));
+      }
 
       // Send notification to offline/non-viewing users asynchronously (don't block)
       Promise.resolve(chat).then(chatData => {
@@ -1750,21 +1775,32 @@ io.on('connection', (socket) => {
     }
   });
 
-  // WhatsApp-style: Delete message for everyone
-  // This permanently deletes from DB and broadcasts to both users
-  // Backend does NOT store placeholder text - that's client-side only
+  // WhatsApp-style: Delete message for everyone.
+  // Soft-deletes the DB row so history shows a placeholder, and removes any
+  // attached Cloudflare R2 object from the backend only.
   socket.on('delete_message', async (data) => {
-    const { messageId, chatId, senderId, receiverId } = data || {};
+    const { messageId, chatId } = data || {};
+    const senderId = socket.userId;
 
-    if (!messageId || !senderId) {
+    if (!messageId || !chatId || !senderId) {
       console.log(`[SOCKET] delete_message failed - missing messageId or senderId`);
       socket.emit('chat:error', { error: 'Missing required fields for delete' });
       return;
     }
 
     try {
-      // Delete message from database (validates sender ownership)
-      const result = await Message.delete(messageId, senderId);
+      const chat = await Chat.findById(chatId);
+      if (!chat) {
+        socket.emit('chat:error', { error: 'Chat not found' });
+        return;
+      }
+
+      if (chat.user1_id !== senderId && chat.user2_id !== senderId) {
+        socket.emit('chat:error', { error: 'Forbidden' });
+        return;
+      }
+
+      const result = await Message.deleteForEveryone(messageId, senderId, chatId);
 
       if (!result.success) {
         console.log(`[SOCKET] delete_message failed: ${result.error}`);
@@ -1772,23 +1808,35 @@ io.on('connection', (socket) => {
         return;
       }
 
-      console.log(`[SOCKET] Message ${messageId} deleted from DB by ${senderId}`);
+      const original = result.originalMessage || {};
+      if (original.file_key || original.file_url || original.media_url) {
+        try {
+          if (original.file_key) {
+            await deleteFromMinioByKey(original.file_key);
+          } else {
+            await deleteFromMinioByUrl(original.file_url || original.media_url);
+          }
+        } catch (fileDeleteError) {
+          console.error('[SOCKET] Failed to delete chat file from R2:', {
+            messageId,
+            fileKey: original.file_key,
+            fileUrl: original.file_url || original.media_url,
+            error: fileDeleteError.message,
+          });
+        }
+      }
 
-      // Broadcast delete event to all users in the chat room
-      // Both sender and receiver will save this locally and show placeholder
       const deleteData = {
         messageId,
         chatId: result.chatId || chatId,
-        deletedBy: senderId
+        deletedBy: senderId,
+        message: result.deletedMessage,
       };
 
-      // Emit to chat room (for users currently in the chat)
       io.to(`chat_${chatId}`).emit('message:deleted', deleteData);
-
-      // Also emit to both users' personal rooms (in case they're not in chat room)
       io.to(`user_${senderId}`).emit('message:deleted', deleteData);
-      if (receiverId) {
-        io.to(`user_${receiverId}`).emit('message:deleted', deleteData);
+      if (result.receiverId) {
+        io.to(`user_${result.receiverId}`).emit('message:deleted', deleteData);
       }
 
       console.log(`[SOCKET] Delete event broadcast for message ${messageId}`);

@@ -600,6 +600,17 @@ async function ensureSchema() {
         message_type VARCHAR(20) DEFAULT 'text',
         message_content TEXT NOT NULL,
         media_url TEXT,
+        file_url TEXT,
+        file_key TEXT,
+        file_name TEXT,
+        file_type VARCHAR(120),
+        file_size BIGINT,
+        uploaded_at TIMESTAMP,
+        receiver_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+        deleted_for UUID[] DEFAULT '{}',
+        is_deleted_for_everyone BOOLEAN DEFAULT FALSE,
+        deleted_at TIMESTAMP,
+        deleted_by UUID REFERENCES users(user_id) ON DELETE SET NULL,
         is_read BOOLEAN DEFAULT FALSE,
         read_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -975,6 +986,17 @@ async function ensureSchema() {
     // Add WhatsApp-style message status column (sent/delivered/seen) for tick UI
     await pool.query(`
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'sent';
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_key TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_type VARCHAR(120);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size BIGINT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMP;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_id UUID REFERENCES users(user_id) ON DELETE SET NULL;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_for UUID[] DEFAULT '{}';
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_deleted_for_everyone BOOLEAN DEFAULT FALSE;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_by UUID REFERENCES users(user_id) ON DELETE SET NULL;
     `);
     // Backfill existing is_read=TRUE messages to status='seen'
     await pool.query(`

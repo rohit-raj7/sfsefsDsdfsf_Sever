@@ -66,7 +66,9 @@ class Chat {
              (SELECT COUNT(*) FROM messages 
               WHERE chat_id = c.chat_id 
                 AND sender_id != $1 
-                AND is_read = FALSE) as unread_count
+                AND is_read = FALSE
+                AND COALESCE(is_deleted_for_everyone, FALSE) = FALSE
+                AND NOT ($1::uuid = ANY(COALESCE(deleted_for, '{}')))) as unread_count
       FROM chats c
       JOIN users u1 ON c.user1_id = u1.user_id
       JOIN users u2 ON c.user2_id = u2.user_id
@@ -106,6 +108,36 @@ class Chat {
     return result.rows[0];
   }
 
+  static async refreshLastMessage(chat_id) {
+    const query = `
+      UPDATE chats
+      SET last_message = latest.message_content,
+          last_message_at = latest.created_at
+      FROM (
+        SELECT message_content, created_at
+        FROM messages
+        WHERE chat_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) latest
+      WHERE chats.chat_id = $1
+      RETURNING chats.*
+    `;
+    const result = await pool.query(query, [chat_id]);
+    if (result.rows.length > 0) {
+      return result.rows[0];
+    }
+
+    const clearQuery = `
+      UPDATE chats
+      SET last_message = NULL, last_message_at = NULL
+      WHERE chat_id = $1
+      RETURNING *
+    `;
+    const clearResult = await pool.query(clearQuery, [chat_id]);
+    return clearResult.rows[0];
+  }
+
   // Delete/deactivate chat
   static async deactivate(chat_id) {
     const query = 'UPDATE chats SET is_active = FALSE WHERE chat_id = $1';
@@ -136,18 +168,41 @@ class Message {
       sender_id,
       message_type = 'text',
       message_content,
-      media_url = null
+      media_url = null,
+      file_url = null,
+      file_key = null,
+      file_name = null,
+      file_type = null,
+      file_size = null,
+      uploaded_at = null,
+      receiver_id = null
     } = messageData;
 
     // Try inserting with status column; fall back gracefully if column doesn't exist yet
     let result;
     try {
       const query = `
-        INSERT INTO messages (chat_id, sender_id, message_type, message_content, media_url, status)
-        VALUES ($1, $2, $3, $4, $5, 'sent')
+        INSERT INTO messages (
+          chat_id, sender_id, receiver_id, message_type, message_content,
+          media_url, file_url, file_key, file_name, file_type, file_size, uploaded_at, status
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, CURRENT_TIMESTAMP), 'sent')
         RETURNING *
       `;
-      result = await pool.query(query, [chat_id, sender_id, message_type, message_content, media_url]);
+      result = await pool.query(query, [
+        chat_id,
+        sender_id,
+        receiver_id,
+        message_type,
+        message_content,
+        media_url,
+        file_url,
+        file_key,
+        file_name,
+        file_type,
+        file_size,
+        uploaded_at,
+      ]);
     } catch (err) {
       if (err.code === '42703') {
         // 'status' column does not exist yet — fall back to old schema
@@ -168,8 +223,54 @@ class Message {
     return result.rows[0];
   }
 
+  static async markDelivered(messageId) {
+    try {
+      const query = `
+        UPDATE messages
+        SET status = 'delivered'
+        WHERE message_id = $1
+          AND COALESCE(is_read, FALSE) = FALSE
+          AND COALESCE(status, 'sent') = 'sent'
+        RETURNING message_id, sender_id
+      `;
+      const result = await pool.query(query, [messageId]);
+      return result.rows[0] || null;
+    } catch (err) {
+      if (err.code === '42703') {
+        return null;
+      }
+      throw err;
+    }
+  }
+
   // Get messages for a chat
-  static async getChatMessages(chat_id, limit = 50, offset = 0) {
+  static normalizeDeletedMessage(message) {
+    if (!message || message.is_deleted_for_everyone !== true) {
+      return message;
+    }
+
+    return {
+      ...message,
+      message_type: 'text',
+      message_content: 'This message was deleted',
+      media_url: null,
+      file_url: null,
+      file_key: null,
+      file_name: null,
+      file_type: null,
+      file_size: null,
+      uploaded_at: null,
+    };
+  }
+
+  static async getChatMessages(chat_id, limit = 50, offset = 0, viewer_id = null) {
+    const params = [chat_id, limit, offset];
+    let deletedForFilter = '';
+    if (viewer_id) {
+      params.push(viewer_id);
+      deletedForFilter = `AND NOT ($4::uuid = ANY(COALESCE(m.deleted_for, '{}')))`;
+    }
+
     const query = `
       SELECT m.*, 
              COALESCE(l.professional_name, u.display_name) as sender_name, 
@@ -178,11 +279,12 @@ class Message {
       JOIN users u ON m.sender_id = u.user_id
       LEFT JOIN listeners l ON m.sender_id = l.user_id
       WHERE m.chat_id = $1
+        ${deletedForFilter}
       ORDER BY m.created_at DESC
       LIMIT $2 OFFSET $3
     `;
-    const result = await pool.query(query, [chat_id, limit, offset]);
-    return result.rows.reverse(); // Return in chronological order
+    const result = await pool.query(query, params);
+    return result.rows.reverse().map(Message.normalizeDeletedMessage); // Return in chronological order
   }
 
   // Mark messages as read (seen) — returns {messageId, senderId} pairs so the
@@ -196,6 +298,8 @@ class Message {
         WHERE chat_id = $1
           AND sender_id != $2
           AND is_read = FALSE
+          AND COALESCE(is_deleted_for_everyone, FALSE) = FALSE
+          AND NOT ($2::uuid = ANY(COALESCE(deleted_for, '{}')))
         RETURNING message_id, sender_id
       `;
       const result = await pool.query(query, [chat_id, user_id]);
@@ -209,6 +313,7 @@ class Message {
           WHERE chat_id = $1
             AND sender_id != $2
             AND is_read = FALSE
+            AND NOT ($2::uuid = ANY(COALESCE(deleted_for, '{}')))
           RETURNING message_id, sender_id
         `;
         const result = await pool.query(query, [chat_id, user_id]);
@@ -227,15 +332,105 @@ class Message {
       WHERE (c.user1_id = $1 OR c.user2_id = $1)
         AND m.sender_id != $1
         AND m.is_read = FALSE
+        AND COALESCE(m.is_deleted_for_everyone, FALSE) = FALSE
+        AND NOT ($1::uuid = ANY(COALESCE(m.deleted_for, '{}')))
     `;
     const result = await pool.query(query, [user_id]);
     return result.rows[0].unread_count;
   }
 
-  // Delete a message permanently (WhatsApp-style delete for everyone)
-  // Backend never stores placeholder text - that's handled client-side only
-  static async delete(messageId, senderId) {
-    // First verify the sender owns this message
+  static async deleteForMe(messageId, userId, chatId = null) {
+    const verifyQuery = `
+      SELECT m.message_id, m.chat_id, c.user1_id, c.user2_id
+      FROM messages m
+      JOIN chats c ON c.chat_id = m.chat_id
+      WHERE m.message_id = $1
+    `;
+    const verifyResult = await pool.query(verifyQuery, [messageId]);
+
+    if (verifyResult.rows.length === 0) {
+      return { success: false, error: 'Message not found' };
+    }
+
+    const message = verifyResult.rows[0];
+    if (chatId && String(message.chat_id) !== String(chatId)) {
+      return { success: false, error: 'Message not found in this chat' };
+    }
+    if (message.user1_id !== userId && message.user2_id !== userId) {
+      return { success: false, error: 'Forbidden' };
+    }
+
+    const query = `
+      UPDATE messages
+      SET deleted_for = CASE
+        WHEN $2::uuid = ANY(COALESCE(deleted_for, '{}')) THEN deleted_for
+        ELSE array_append(COALESCE(deleted_for, '{}'), $2::uuid)
+      END
+      WHERE message_id = $1
+      RETURNING *
+    `;
+    const result = await pool.query(query, [messageId, userId]);
+
+    return {
+      success: true,
+      message: result.rows[0],
+      chatId: message.chat_id,
+    };
+  }
+
+  static async deleteForEveryone(messageId, senderId, chatId = null) {
+    const verifyQuery = `
+      SELECT m.*, c.user1_id, c.user2_id
+      FROM messages m
+      JOIN chats c ON c.chat_id = m.chat_id
+      WHERE m.message_id = $1
+    `;
+    const verifyResult = await pool.query(verifyQuery, [messageId]);
+
+    if (verifyResult.rows.length === 0) {
+      return { success: false, error: 'Message not found' };
+    }
+
+    const message = verifyResult.rows[0];
+    if (chatId && String(message.chat_id) !== String(chatId)) {
+      return { success: false, error: 'Message not found in this chat' };
+    }
+    if (message.sender_id !== senderId) {
+      return { success: false, error: 'Not authorized to delete this message' };
+    }
+
+    const updateQuery = `
+      UPDATE messages
+      SET is_deleted_for_everyone = TRUE,
+          deleted_at = CURRENT_TIMESTAMP,
+          deleted_by = $2,
+          message_type = 'text',
+          message_content = 'This message was deleted',
+          media_url = NULL,
+          file_url = NULL,
+          file_key = NULL,
+          file_name = NULL,
+          file_type = NULL,
+          file_size = NULL,
+          uploaded_at = NULL,
+          is_read = TRUE,
+          status = 'seen'
+      WHERE message_id = $1
+      RETURNING *
+    `;
+    const updateResult = await pool.query(updateQuery, [messageId, senderId]);
+    await Chat.refreshLastMessage(message.chat_id);
+
+    return {
+      success: true,
+      deletedMessage: Message.normalizeDeletedMessage(updateResult.rows[0]),
+      originalMessage: message,
+      chatId: message.chat_id,
+      receiverId: message.user1_id === senderId ? message.user2_id : message.user1_id,
+    };
+  }
+
+  static async hardDelete(messageId, senderId) {
     const verifyQuery = `SELECT sender_id, chat_id FROM messages WHERE message_id = $1`;
     const verifyResult = await pool.query(verifyQuery, [messageId]);
 
@@ -248,9 +443,9 @@ class Message {
       return { success: false, error: 'Not authorized to delete this message' };
     }
 
-    // Permanently delete the message
     const deleteQuery = `DELETE FROM messages WHERE message_id = $1 RETURNING *`;
     const deleteResult = await pool.query(deleteQuery, [messageId]);
+    await Chat.refreshLastMessage(message.chat_id);
 
     return {
       success: true,

@@ -39,6 +39,26 @@ const voiceUpload = multer({
   },
 });
 
+// Multer memory storage for avatar uploads
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB size limit as per requirements
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'image/gif'
+    ];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      console.warn(`[UPLOAD_AVATAR] Rejected file with MIME type: ${file.mimetype}`);
+      cb(new Error(`Unsupported image type: ${file.mimetype}. Only JPEG, PNG, WEBP, and GIF are allowed.`), false);
+    }
+  },
+});
+
 const summarizeListenerProfilePayload = (payload = {}) => ({
   professional_name: payload.professional_name,
   has_original_name: Boolean(payload.original_name),
@@ -1274,6 +1294,108 @@ router.post('/upload-voice', authenticate, voiceUpload.single('voiceFile'), asyn
     res.status(error.statusCode || 500).json({
       error: error.message || 'Failed to upload voice to Cloudflare R2',
       code: error.code || error.Code || 'VOICE_UPLOAD_FAILED',
+    });
+  }
+});
+
+// POST /api/listeners/upload-avatar
+// Upload avatar image to Cloudflare R2 and update listener profile (returns secure_url)
+router.post('/upload-avatar', authenticate, (req, res, next) => {
+  avatarUpload.single('avatarFile')(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'Image size must be less than 2 MB' });
+      }
+      return res.status(400).json({ error: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: 'No image file provided. Send as multipart field "avatarFile".',
+        code: 'AVATAR_FILE_MISSING',
+      });
+    }
+
+    console.log('[UPLOAD_AVATAR] Incoming request', {
+      userId: req.userId,
+      originalName: req.file.originalname,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+    });
+
+    // Upload buffer to Cloudflare R2
+    const result = await uploadToMinio(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      'avatars'
+    );
+
+    console.log('[UPLOAD_AVATAR] R2 upload success', {
+      userId: req.userId,
+      secureUrl: result.secure_url,
+      publicId: result.public_id,
+    });
+
+    // Fetch the listener to get the old profile image URL
+    const getQuery = `
+      SELECT profile_image
+      FROM listeners
+      WHERE id = $1
+    `;
+    const getResult = await db.query(getQuery, [req.userId]);
+
+    if (getResult.rows.length === 0) {
+       return res.status(404).json({ error: 'Listener profile not found' });
+    }
+
+    const oldImageUrl = getResult.rows[0].profile_image;
+
+    // Save the URL to the listeners table
+    const updateQuery = `
+      UPDATE listeners
+      SET profile_image = $1
+      WHERE id = $2
+      RETURNING profile_image
+    `;
+    const dbResult = await db.query(updateQuery, [result.secure_url, req.userId]);
+
+    // Delete the old image from R2 if it exists and is different from the new one
+    // Only delete if it belongs to our Cloudflare R2 bucket (deleteFromMinioByUrl handles this check typically)
+    if (oldImageUrl && oldImageUrl !== result.secure_url) {
+      try {
+        await deleteFromMinioByUrl(oldImageUrl);
+        console.log(`[UPLOAD_AVATAR] Old avatar deleted successfully: ${oldImageUrl}`);
+      } catch (deleteError) {
+        console.error(`[UPLOAD_AVATAR] Failed to delete old avatar: ${oldImageUrl}`, deleteError);
+      }
+    }
+
+    res.json({
+      message: 'Avatar uploaded successfully',
+      secure_url: result.secure_url,
+      public_id: result.public_id,
+      format: result.format,
+    });
+  } catch (error) {
+    console.error('[UPLOAD_AVATAR] Error', {
+      userId: req.userId,
+      message: error.message,
+      code: error.code || error.Code || 'AVATAR_UPLOAD_FAILED',
+    });
+    // Check if error is from multer limits
+    if (error.message && error.message.includes('large')) {
+        return res.status(413).json({
+          error: 'Image size must be less than 2 MB',
+          code: 'FILE_TOO_LARGE',
+        });
+    }
+    res.status(error.statusCode || 500).json({
+      error: error.message || 'Failed to upload avatar to Cloudflare R2',
+      code: error.code || error.Code || 'AVATAR_UPLOAD_FAILED',
     });
   }
 });
