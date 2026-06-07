@@ -6,36 +6,33 @@ import { authenticate } from '../middleware/auth.js';
 import { deleteFromMinioByUrl, uploadToMinio } from '../utils/minioUpload.js';
 import { pool } from '../db.js';
 
-const CHAT_FILE_MAX_BYTES = Number(process.env.CHAT_FILE_MAX_BYTES || 25 * 1024 * 1024);
-const CHAT_FILE_SHARING_REQUIRES_PREMIUM = String(
-  process.env.CHAT_FILE_SHARING_REQUIRES_PREMIUM || 'true'
-).toLowerCase() === 'true';
+const CHAT_FILE_HARD_MAX_BYTES = 5 * 1024 * 1024;
+const configuredChatFileMaxBytes = Number(
+  process.env.CHAT_FILE_MAX_BYTES || CHAT_FILE_HARD_MAX_BYTES
+);
+const CHAT_FILE_MAX_BYTES =
+  Number.isFinite(configuredChatFileMaxBytes) && configuredChatFileMaxBytes > 0
+    ? Math.min(configuredChatFileMaxBytes, CHAT_FILE_HARD_MAX_BYTES)
+    : CHAT_FILE_HARD_MAX_BYTES;
 
 const defaultAllowedMimeTypes = [
   'image/jpeg',
   'image/png',
   'image/webp',
   'image/gif',
-  'video/mp4',
-  'video/quicktime',
   'audio/mpeg',
   'audio/mp4',
   'audio/aac',
   'audio/wav',
-  'application/pdf',
-  'text/plain',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/vnd.ms-powerpoint',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'audio/x-wav',
+  'audio/wave',
 ];
 
 const allowedMimeTypes = new Set(
   (process.env.CHAT_FILE_ALLOWED_MIME_TYPES || defaultAllowedMimeTypes.join(','))
     .split(',')
     .map((type) => type.trim().toLowerCase())
+    .filter((type) => defaultAllowedMimeTypes.includes(type))
     .filter(Boolean)
 );
 
@@ -85,7 +82,6 @@ function normalizeMessage(message) {
 function resolveMessageType(mimeType) {
   const type = String(mimeType || '').toLowerCase();
   if (type.startsWith('image/')) return 'image';
-  if (type.startsWith('video/')) return 'video';
   if (type.startsWith('audio/')) return 'audio';
   return 'file';
 }
@@ -105,45 +101,6 @@ async function getSenderInfo(userId) {
     console.error('[CHATS] Sender info lookup failed:', error.message);
     return {};
   }
-}
-
-async function assertFileSharingAllowed(userId) {
-  if (!CHAT_FILE_SHARING_REQUIRES_PREMIUM) return true;
-
-  const result = await pool.query(
-    `SELECT u.gender, u.account_type,
-            EXISTS(
-              SELECT 1 FROM listeners l WHERE l.user_id = u.user_id
-            ) as is_listener,
-            EXISTS(
-              SELECT 1
-              FROM subscriptions s
-              WHERE s.user_id = u.user_id
-                AND s.is_active = TRUE
-                AND s.expires_at > CURRENT_TIMESTAMP
-            ) as is_premium
-     FROM users u
-     WHERE u.user_id = $1`,
-    [userId]
-  );
-
-  const user = result.rows[0];
-  if (!user) {
-    const error = new Error('User not found');
-    error.statusCode = 404;
-    throw error;
-  }
-
-  const isListener = user.account_type === 'listener' || user.is_listener === true;
-  const isFemale = String(user.gender || '').toLowerCase() === 'female';
-  if (isListener || isFemale || user.is_premium === true) {
-    return true;
-  }
-
-  const error = new Error('Premium is required to send files.');
-  error.statusCode = 402;
-  error.code = 'PREMIUM_REQUIRED';
-  throw error;
 }
 
 function emitDeliveredIfOnline(io, otherUserId, message, chatId) {
@@ -425,8 +382,6 @@ router.post('/:chat_id/files', authenticate, handleChatFileUpload, async (req, r
       });
     }
 
-    await assertFileSharingAllowed(req.userId);
-
     const otherUserId = chat.user1_id === req.userId ? chat.user2_id : chat.user1_id;
 
     const uploadResult = await uploadToMinio(
@@ -544,13 +499,6 @@ router.post('/:chat_id/files', authenticate, handleChatFileUpload, async (req, r
       return res.status(400).json({
         error: `File is too large. Maximum size is ${Math.round(CHAT_FILE_MAX_BYTES / (1024 * 1024))} MB.`,
         code: 'FILE_TOO_LARGE',
-      });
-    }
-
-    if (error?.code === 'PREMIUM_REQUIRED') {
-      return res.status(error.statusCode || 402).json({
-        error: error.message,
-        code: error.code,
       });
     }
 
