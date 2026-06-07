@@ -195,6 +195,9 @@ router.post('/languages', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Language is required' });
     }
 
+    // Delete existing language records for this user to update their primary native language
+    await pool.query('DELETE FROM user_languages WHERE user_id = $1', [req.userId]);
+
     const query = `
       INSERT INTO user_languages (user_id, language, proficiency_level)
       VALUES ($1, $2, $3)
