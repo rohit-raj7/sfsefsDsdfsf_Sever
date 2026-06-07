@@ -1384,7 +1384,7 @@ router.get('/me/gift-earnings/summary', authenticate, async (req, res) => {
        WHERE listener_id = $1`,
       [listener.listener_id]
     );
-    
+
     let totalGiftEarnings = 0;
     let availableGiftBalance = 0;
     let pendingGiftBalance = 0;
@@ -1477,7 +1477,8 @@ router.get('/me/gift-earnings/history', authenticate, async (req, res) => {
               coin_amount AS gift_amount,
               listener_share_percent,
               listener_earning,
-              created_at
+              created_at,
+              asset_key
        FROM call_gifts
        WHERE listener_id = $1
        ORDER BY created_at DESC
@@ -1493,7 +1494,8 @@ router.get('/me/gift-earnings/history', authenticate, async (req, res) => {
         giftAmount: Number(r.gift_amount),
         listenerSharePercent: Number(r.listener_share_percent),
         listenerEarning: Number(r.listener_earning),
-        createdAt: r.created_at
+        createdAt: r.created_at,
+        assetKey: r.asset_key
       }))
     });
   } catch (error) {
