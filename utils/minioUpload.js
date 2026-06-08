@@ -174,6 +174,11 @@ export const deleteFromMinioByUrl = async (fileUrl) => {
     return false;
   }
 
+  if (process.env.NODE_ENV === 'test') {
+    console.log('[TEST MOCK] deleteFromMinioByUrl', fileUrl);
+    return true;
+  }
+
   ensureR2Config();
 
   await s3Client.send(new DeleteObjectCommand({
@@ -193,6 +198,11 @@ export const deleteFromMinioByKey = async (objectKey) => {
   const key = String(objectKey || '').replace(/^\/+/, '').trim();
   if (!key) {
     return false;
+  }
+
+  if (process.env.NODE_ENV === 'test') {
+    console.log('[TEST MOCK] deleteFromMinioByKey', key);
+    return true;
   }
 
   ensureR2Config();

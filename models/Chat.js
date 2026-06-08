@@ -1,4 +1,6 @@
 import { pool } from '../db.js';
+import { deleteFromMinioByKey, deleteFromMinioByUrl } from '../utils/minioUpload.js';
+
 
 class Chat {
   // Create or get existing chat between two users
@@ -157,6 +159,69 @@ class Chat {
     `;
     const result = await pool.query(query, [chat_id]);
     return result.rows[0];
+  }
+
+  // Delete chat and all messages and files for all participants permanently
+  static async deleteForAll(chat_id) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Fetch all messages with attachments to delete from Cloudflare/Minio R2
+      const filesResult = await client.query(
+        `SELECT file_key, file_url, media_url FROM messages 
+         WHERE chat_id = $1 
+           AND (file_key IS NOT NULL OR file_url IS NOT NULL OR media_url IS NOT NULL)`,
+        [chat_id]
+      );
+
+      // 2. Delete all messages for this chat
+      await client.query('DELETE FROM messages WHERE chat_id = $1', [chat_id]);
+
+      // 3. Delete the chat itself
+      await client.query('DELETE FROM chats WHERE chat_id = $1', [chat_id]);
+
+      // 4. Delete files from Cloudflare/Minio R2 with a retry loop
+      const files = filesResult.rows;
+      for (const file of files) {
+        const fileKey = file.file_key;
+        const fileUrl = file.file_url || file.media_url;
+
+        if (fileKey || fileUrl) {
+          let deleted = false;
+          let lastError = null;
+          // Try up to 3 times
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              if (fileKey) {
+                await deleteFromMinioByKey(fileKey);
+              } else {
+                await deleteFromMinioByUrl(fileUrl);
+              }
+              deleted = true;
+              break;
+            } catch (err) {
+              lastError = err;
+              console.error(`[R2_DELETE_RETRY] Attempt ${attempt} failed for chat_id=${chat_id}: ${err.message}`);
+              if (attempt < 3) {
+                await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+              }
+            }
+          }
+          if (!deleted) {
+            console.error(`[R2_DELETE_FAILED] Failed to delete file key=${fileKey} url=${fileUrl}:`, lastError);
+            throw new Error(`Failed to delete Cloudflare-stored files: ${lastError?.message || 'Unknown error'}`);
+          }
+        }
+      }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }
 

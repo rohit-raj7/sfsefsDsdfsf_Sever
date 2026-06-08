@@ -649,6 +649,42 @@ router.get('/unread/count', authenticate, async (req, res) => {
   }
 });
 
+// DELETE /api/chats/:chat_id/delete-for-all
+// Delete a chat permanently for all participants
+router.delete('/:chat_id/delete-for-all', authenticate, async (req, res) => {
+  try {
+    const chatId = req.params.chat_id;
+    const userId = req.userId;
+
+    // Verify chat exists
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+
+    // Verify user is part of the chat
+    if (chat.user1_id !== userId && chat.user2_id !== userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Perform permanent delete (messages, files, chat record)
+    await Chat.deleteForAll(chatId);
+
+    // Real-time notification via sockets
+    if (io) {
+      const payload = { chatId, deletedBy: userId };
+      io.to(`chat_${chatId}`).emit('chat:deleted_for_all', payload);
+      io.to(`user_${chat.user1_id}`).emit('chat:deleted_for_all', payload);
+      io.to(`user_${chat.user2_id}`).emit('chat:deleted_for_all', payload);
+    }
+
+    res.json({ message: 'Conversation deleted for both participants successfully' });
+  } catch (error) {
+    console.error('Delete chat for all error:', error);
+    res.status(500).json({ error: 'Failed to delete conversation for all' });
+  }
+});
+
 // DELETE /api/chats/:chat_id
 // Delete/deactivate a chat
 router.delete('/:chat_id', authenticate, async (req, res) => {
