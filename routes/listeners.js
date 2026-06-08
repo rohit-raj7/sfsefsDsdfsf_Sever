@@ -1351,9 +1351,9 @@ router.post('/upload-avatar', authenticate, (req, res, next) => {
     const getQuery = `
       SELECT profile_image
       FROM listeners
-      WHERE id = $1
+      WHERE user_id = $1
     `;
-    const getResult = await db.query(getQuery, [req.userId]);
+    const getResult = await pool.query(getQuery, [req.userId]);
 
     if (getResult.rows.length === 0) {
        return res.status(404).json({ error: 'Listener profile not found' });
@@ -1365,10 +1365,10 @@ router.post('/upload-avatar', authenticate, (req, res, next) => {
     const updateQuery = `
       UPDATE listeners
       SET profile_image = $1
-      WHERE id = $2
+      WHERE user_id = $2
       RETURNING profile_image
     `;
-    const dbResult = await db.query(updateQuery, [result.secure_url, req.userId]);
+    const dbResult = await pool.query(updateQuery, [result.secure_url, req.userId]);
 
     // Delete the old image from R2 if it exists and is different from the new one
     // Only delete if it belongs to our Cloudflare R2 bucket (deleteFromMinioByUrl handles this check typically)
