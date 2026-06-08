@@ -108,6 +108,177 @@ const mapOfferBannerRow = (row) => ({
   updatedAt: row.updated_at,
 });
 
+const LISTENER_WITHDRAWAL_WITHDRAWN_STATUSES = ['approved', 'processed', 'completed'];
+const LISTENER_WITHDRAWAL_ALLOWED_STATUSES = ['pending', 'approved', 'processed', 'rejected'];
+
+const isUuid = (value = '') =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || '').trim());
+
+const parsePositiveInt = (value, fallback, { min = 1, max = 100 } = {}) => {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+};
+
+const toMoney = (value) => Number(Number(value || 0).toFixed(2));
+
+const ensureListenerWithdrawalSchema = async (db = pool) => {
+  await db.query(`
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    CREATE TABLE IF NOT EXISTS listener_withdrawal_requests (
+      request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      listener_id UUID NOT NULL REFERENCES listeners(listener_id) ON DELETE CASCADE,
+      payout_method VARCHAR(20) NOT NULL CHECK (payout_method IN ('upi', 'bank')),
+      upi_id VARCHAR(255),
+      account_number VARCHAR(32),
+      ifsc_code VARCHAR(20),
+      bank_name VARCHAR(120),
+      account_holder_name VARCHAR(120),
+      withdrawal_amount NUMERIC(12,2) NOT NULL CHECK (withdrawal_amount > 0),
+      tds_amount NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (tds_amount >= 0),
+      transaction_fee NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (transaction_fee >= 0),
+      final_credit_amount NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (final_credit_amount >= 0),
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      transaction_id VARCHAR(120),
+      remarks TEXT,
+      approved_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL,
+      approved_at TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS transaction_id VARCHAR(120);
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL;
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP;
+    CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_requests_listener_created
+      ON listener_withdrawal_requests(listener_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_requests_status
+      ON listener_withdrawal_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_requests_created
+      ON listener_withdrawal_requests(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS listener_withdrawal_audit_logs (
+      audit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      request_id UUID REFERENCES listener_withdrawal_requests(request_id) ON DELETE SET NULL,
+      listener_id UUID REFERENCES listeners(listener_id) ON DELETE SET NULL,
+      admin_id UUID REFERENCES admins(admin_id) ON DELETE SET NULL,
+      previous_status VARCHAR(20),
+      new_status VARCHAR(20) NOT NULL,
+      remarks TEXT,
+      request_payload JSONB,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_audit_request
+      ON listener_withdrawal_audit_logs(request_id, created_at DESC);
+  `);
+};
+
+const buildListenerWithdrawalFilters = (query = {}) => {
+  const where = [];
+  const params = [];
+  const requestFilters = [];
+
+  const addParam = (value) => {
+    params.push(value);
+    return `$${params.length + 1}`;
+  };
+
+  const name = String(query.name || query.search_name || '').trim();
+  if (name) {
+    where.push(`COALESCE(l.professional_name, u.display_name, u.full_name, '') ILIKE ${addParam(`%${name}%`)}`);
+  }
+
+  const emailMobile = String(query.email_mobile || query.search_login || query.login_identifier || '').trim();
+  if (emailMobile) {
+    where.push(`COALESCE(u.email, u.phone_number, u.mobile_number, l.mobile_number, '') ILIKE ${addParam(`%${emailMobile}%`)}`);
+  }
+
+  const listenerId = String(query.listener_id || query.search_listener_id || '').trim();
+  if (listenerId) {
+    where.push(`l.listener_id::text ILIKE ${addParam(`%${listenerId}%`)}`);
+  }
+
+  const mobile = String(query.mobile || query.mobile_number || query.search_mobile || '').trim();
+  if (mobile) {
+    where.push(`COALESCE(l.mobile_number, u.mobile_number, u.phone_number, '') ILIKE ${addParam(`%${mobile}%`)}`);
+  }
+
+  const status = String(query.status || 'all').trim().toLowerCase();
+  if (status && status !== 'all') {
+    if (!LISTENER_WITHDRAWAL_ALLOWED_STATUSES.includes(status)) {
+      const error = new Error('Invalid withdrawal status filter');
+      error.statusCode = 400;
+      throw error;
+    }
+    requestFilters.push(`wr_filter.status = ${addParam(status)}`);
+  }
+
+  const startDate = String(query.start_date || query.from || '').trim();
+  if (startDate) {
+    requestFilters.push(`wr_filter.created_at >= ${addParam(startDate)}`);
+  }
+
+  const endDate = String(query.end_date || query.to || '').trim();
+  if (endDate) {
+    requestFilters.push(`wr_filter.created_at < (${addParam(endDate)}::date + INTERVAL '1 day')`);
+  }
+
+  if (requestFilters.length > 0) {
+    where.push(`EXISTS (
+      SELECT 1
+      FROM listener_withdrawal_requests wr_filter
+      WHERE wr_filter.listener_id = l.listener_id
+        AND ${requestFilters.join(' AND ')}
+    )`);
+  }
+
+  return {
+    whereSql: where.length > 0 ? `WHERE ${where.join(' AND ')}` : '',
+    params,
+  };
+};
+
+const listenerWithdrawalSummarySelect = `
+  WITH call_earnings AS (
+    SELECT listener_id, COALESCE(SUM(listener_earn), 0)::numeric AS call_earnings
+    FROM call_records
+    WHERE listener_id IS NOT NULL
+    GROUP BY listener_id
+  ),
+  withdrawal_totals AS (
+    SELECT
+      listener_id,
+      COALESCE(SUM(CASE WHEN status = 'pending' THEN withdrawal_amount ELSE 0 END), 0)::numeric AS pending_withdrawal_amount,
+      COALESCE(SUM(CASE WHEN status = ANY($1::text[]) THEN withdrawal_amount ELSE 0 END), 0)::numeric AS total_withdrawn,
+      COUNT(*)::int AS total_withdrawal_requests,
+      MAX(created_at) AS last_withdrawal_date
+    FROM listener_withdrawal_requests
+    GROUP BY listener_id
+  ),
+  listener_finance AS (
+    SELECT
+      l.listener_id,
+      l.user_id,
+      COALESCE(l.professional_name, u.display_name, u.full_name, 'Listener') AS listener_name,
+      COALESCE(l.mobile_number, u.mobile_number, u.phone_number) AS mobile_number,
+      COALESCE(NULLIF(u.email, ''), NULLIF(u.phone_number, ''), NULLIF(u.mobile_number, ''), NULLIF(l.mobile_number, '')) AS login_identifier,
+      l.created_at AS joining_date,
+      GREATEST(
+        COALESCE(ce.call_earnings, 0),
+        COALESCE(l.total_earning, 0),
+        COALESCE(l.wallet_balance, 0),
+        0
+      )::numeric AS total_earnings,
+      COALESCE(wt.total_withdrawn, 0)::numeric AS total_withdrawn,
+      COALESCE(wt.pending_withdrawal_amount, 0)::numeric AS pending_withdrawal_amount,
+      COALESCE(wt.total_withdrawal_requests, 0)::int AS total_withdrawal_requests,
+      wt.last_withdrawal_date
+    FROM listeners l
+    JOIN users u ON u.user_id = l.user_id
+    LEFT JOIN call_earnings ce ON ce.listener_id = l.listener_id
+    LEFT JOIN withdrawal_totals wt ON wt.listener_id = l.listener_id
+`;
+
 // Admin email/password login
 router.post('/login', async (req, res) => {
   try {
@@ -253,6 +424,309 @@ router.get('/listeners', authenticateAdmin, async (req, res) => {
   } catch (error) {
     console.error('Get admin listeners error:', error);
     res.status(500).json({ error: 'Failed to fetch listeners' });
+  }
+});
+
+// GET /api/admin/withdrawals/listeners
+// Listener-wise withdrawal overview for the admin panel.
+router.get('/withdrawals/listeners', authenticateAdmin, async (req, res) => {
+  try {
+    await ensureListenerWithdrawalSchema();
+
+    const page = parsePositiveInt(req.query.page, 1, { min: 1, max: 100000 });
+    const limit = parsePositiveInt(req.query.limit, 10, { min: 1, max: 100 });
+    const offset = (page - 1) * limit;
+    const { whereSql, params } = buildListenerWithdrawalFilters(req.query);
+    const baseParams = [LISTENER_WITHDRAWAL_WITHDRAWN_STATUSES, ...params];
+    const baseQuery = `${listenerWithdrawalSummarySelect}
+      ${whereSql}
+    )`;
+
+    const countResult = await pool.query(
+      `${baseQuery}
+       SELECT COUNT(*)::int AS total_items
+       FROM listener_finance`,
+      baseParams
+    );
+
+    const limitParam = `$${baseParams.length + 1}`;
+    const offsetParam = `$${baseParams.length + 2}`;
+    const listResult = await pool.query(
+      `${baseQuery}
+       SELECT
+         listener_id,
+         listener_name,
+         mobile_number,
+         login_identifier,
+         total_earnings,
+         total_withdrawn,
+         GREATEST(total_earnings - total_withdrawn - pending_withdrawal_amount, 0)::numeric AS current_wallet_balance,
+         pending_withdrawal_amount,
+         total_withdrawal_requests,
+         last_withdrawal_date
+       FROM listener_finance
+       ORDER BY listener_name ASC, listener_id ASC
+       LIMIT ${limitParam} OFFSET ${offsetParam}`,
+      [...baseParams, limit, offset]
+    );
+
+    const totalItems = Number(countResult.rows[0]?.total_items || 0);
+    return res.json({
+      success: true,
+      listeners: listResult.rows.map((row) => ({
+        listener_id: row.listener_id,
+        listener_name: row.listener_name,
+        mobile_number: row.mobile_number,
+        login_identifier: row.login_identifier,
+        total_earnings: toMoney(row.total_earnings),
+        total_withdrawn: toMoney(row.total_withdrawn),
+        current_wallet_balance: toMoney(row.current_wallet_balance),
+        pending_withdrawal_amount: toMoney(row.pending_withdrawal_amount),
+        total_withdrawal_requests: Number(row.total_withdrawal_requests || 0),
+        last_withdrawal_date: row.last_withdrawal_date,
+      })),
+      pagination: {
+        page,
+        limit,
+        totalItems,
+        totalPages: Math.ceil(totalItems / limit),
+      },
+    });
+  } catch (error) {
+    console.error('Get listener withdrawal overview error:', error);
+    return res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : 'Failed to fetch listener withdrawals',
+    });
+  }
+});
+
+// GET /api/admin/withdrawals/listeners/:listener_id
+// Listener withdrawal details for admin review.
+router.get('/withdrawals/listeners/:listener_id', authenticateAdmin, async (req, res) => {
+  try {
+    await ensureListenerWithdrawalSchema();
+
+    const listenerId = String(req.params.listener_id || '').trim();
+    if (!isUuid(listenerId)) {
+      return res.status(400).json({ error: 'Invalid listener id' });
+    }
+
+    const detailsQuery = `${listenerWithdrawalSummarySelect}
+      WHERE l.listener_id = $2
+    )
+    SELECT
+      listener_id,
+      user_id,
+      listener_name,
+      mobile_number,
+      login_identifier,
+      joining_date,
+      total_earnings,
+      total_withdrawn,
+      GREATEST(total_earnings - total_withdrawn - pending_withdrawal_amount, 0)::numeric AS current_wallet_balance,
+      pending_withdrawal_amount,
+      total_withdrawal_requests,
+      last_withdrawal_date
+    FROM listener_finance`;
+
+    const detailsResult = await pool.query(detailsQuery, [
+      LISTENER_WITHDRAWAL_WITHDRAWN_STATUSES,
+      listenerId,
+    ]);
+
+    if (detailsResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Listener not found' });
+    }
+
+    const historyResult = await pool.query(
+      `SELECT
+         request_id,
+         created_at AS request_date,
+         withdrawal_amount AS amount,
+         status,
+         transaction_id,
+         CASE
+           WHEN approved_at IS NOT NULL THEN approved_at
+           WHEN status = ANY($2::text[]) THEN updated_at
+           ELSE NULL
+         END AS approval_date,
+         payout_method,
+         upi_id,
+         account_number,
+         ifsc_code,
+         bank_name,
+         account_holder_name,
+         remarks
+       FROM listener_withdrawal_requests
+       WHERE listener_id = $1
+       ORDER BY created_at DESC`,
+      [listenerId, LISTENER_WITHDRAWAL_WITHDRAWN_STATUSES]
+    );
+
+    const paymentResult = await pool.query(
+      `SELECT
+         payment_method,
+         mobile_number,
+         upi_id,
+         account_number,
+         ifsc_code,
+         bank_name,
+         account_holder_name,
+         name_as_per_pan,
+         pan_number,
+         is_verified
+       FROM listener_payment_details
+       WHERE listener_id = $1`,
+      [listenerId]
+    );
+
+    const row = detailsResult.rows[0];
+    return res.json({
+      success: true,
+      listener: {
+        listener_id: row.listener_id,
+        user_id: row.user_id,
+        listener_name: row.listener_name,
+        mobile_number: row.mobile_number,
+        login_identifier: row.login_identifier,
+        joining_date: row.joining_date,
+        total_earnings: toMoney(row.total_earnings),
+        total_withdrawn: toMoney(row.total_withdrawn),
+        current_wallet_balance: toMoney(row.current_wallet_balance),
+        pending_withdrawal_amount: toMoney(row.pending_withdrawal_amount),
+        total_withdrawal_requests: Number(row.total_withdrawal_requests || 0),
+        last_withdrawal_date: row.last_withdrawal_date,
+      },
+      withdrawalHistory: historyResult.rows.map((item) => ({
+        request_id: item.request_id,
+        request_date: item.request_date,
+        amount: toMoney(item.amount),
+        status: item.status,
+        transaction_id: item.transaction_id,
+        approval_date: item.approval_date,
+        payout_method: item.payout_method,
+        upi_id: item.upi_id,
+        account_number: item.account_number,
+        ifsc_code: item.ifsc_code,
+        bank_name: item.bank_name,
+        account_holder_name: item.account_holder_name,
+        remarks: item.remarks,
+      })),
+      paymentInformation: paymentResult.rows[0] || null,
+    });
+  } catch (error) {
+    console.error('Get listener withdrawal details error:', error);
+    return res.status(500).json({ error: 'Failed to fetch listener withdrawal details' });
+  }
+});
+
+// PUT /api/admin/withdrawals/standard/:id/status
+// Process a standard listener withdrawal request with audit logging.
+router.put('/withdrawals/standard/:id/status', authenticateAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await ensureListenerWithdrawalSchema(client);
+
+    const requestId = String(req.params.id || '').trim();
+    const status = String(req.body?.status || '').trim().toLowerCase();
+    const remarks = String(req.body?.remarks || '').trim() || null;
+    const transferReference = String(req.body?.transaction_id || req.body?.transactionId || '').trim() || null;
+
+    if (!isUuid(requestId)) {
+      return res.status(400).json({ error: 'Invalid withdrawal request id' });
+    }
+    if (!LISTENER_WITHDRAWAL_ALLOWED_STATUSES.includes(status) || status === 'pending') {
+      return res.status(400).json({ error: 'Status must be approved, processed, or rejected' });
+    }
+
+    await client.query('BEGIN');
+
+    const requestResult = await client.query(
+      `SELECT wr.*, l.user_id
+       FROM listener_withdrawal_requests wr
+       JOIN listeners l ON l.listener_id = wr.listener_id
+       WHERE wr.request_id = $1
+       FOR UPDATE`,
+      [requestId]
+    );
+
+    if (requestResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Withdrawal request not found' });
+    }
+
+    const request = requestResult.rows[0];
+    if (['rejected', 'processed'].includes(request.status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Cannot update a request that is already ${request.status}` });
+    }
+
+    let transactionReference = transferReference || request.transaction_id || null;
+    const becomesWithdrawn =
+      LISTENER_WITHDRAWAL_WITHDRAWN_STATUSES.includes(status) &&
+      !LISTENER_WITHDRAWAL_WITHDRAWN_STATUSES.includes(request.status);
+
+    if (becomesWithdrawn && request.user_id) {
+      const txResult = await client.query(
+        `INSERT INTO transactions (user_id, transaction_type, amount, currency, description, status)
+         VALUES ($1, 'withdrawal', $2, 'INR', 'Listener Withdrawal Approved', 'completed')
+         RETURNING transaction_id`,
+        [request.user_id, request.withdrawal_amount]
+      );
+      transactionReference = transactionReference || txResult.rows[0]?.transaction_id || null;
+    }
+
+    const updatedResult = await client.query(
+      `UPDATE listener_withdrawal_requests
+       SET status = $1,
+           remarks = COALESCE($2, remarks),
+           transaction_id = COALESCE($3, transaction_id),
+           approved_by = CASE WHEN $1 = ANY($5::text[]) THEN $6 ELSE approved_by END,
+           approved_at = CASE WHEN $1 = ANY($5::text[]) THEN COALESCE(approved_at, CURRENT_TIMESTAMP) ELSE approved_at END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE request_id = $4
+       RETURNING *`,
+      [
+        status,
+        remarks,
+        transactionReference,
+        requestId,
+        LISTENER_WITHDRAWAL_WITHDRAWN_STATUSES,
+        req.adminId || null,
+      ]
+    );
+
+    await client.query(
+      `INSERT INTO listener_withdrawal_audit_logs (
+         request_id, listener_id, admin_id, previous_status, new_status, remarks, request_payload
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [
+        requestId,
+        request.listener_id,
+        req.adminId || null,
+        request.status,
+        status,
+        remarks,
+        JSON.stringify({
+          transferReference,
+          previousTransactionId: request.transaction_id || null,
+        }),
+      ]
+    );
+
+    await client.query('COMMIT');
+    return res.json({
+      success: true,
+      message: `Withdrawal request marked as ${status}`,
+      withdrawal: updatedResult.rows[0],
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Update standard listener withdrawal status error:', error);
+    return res.status(500).json({ error: 'Failed to update withdrawal status' });
+  } finally {
+    client.release();
   }
 });
 

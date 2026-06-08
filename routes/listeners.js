@@ -113,13 +113,18 @@ const ensureWithdrawalRequestsTable = async (db = pool) => {
       transaction_fee NUMERIC(12,2) NOT NULL CHECK (transaction_fee >= 0),
       final_credit_amount NUMERIC(12,2) NOT NULL CHECK (final_credit_amount >= 0),
       status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      transaction_id VARCHAR(120),
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS remarks TEXT;
     ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL;
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP;
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS transaction_id VARCHAR(120);
     CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_requests_listener_created
       ON listener_withdrawal_requests(listener_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_requests_status
+      ON listener_withdrawal_requests(status);
   `);
 };
 
