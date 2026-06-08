@@ -116,6 +116,8 @@ const ensureWithdrawalRequestsTable = async (db = pool) => {
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE listener_withdrawal_requests ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES admins(admin_id) ON DELETE SET NULL;
     CREATE INDEX IF NOT EXISTS idx_listener_withdrawal_requests_listener_created
       ON listener_withdrawal_requests(listener_id, created_at DESC);
   `);

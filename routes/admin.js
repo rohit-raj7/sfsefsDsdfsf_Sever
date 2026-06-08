@@ -1344,7 +1344,7 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
     try {
       const otpRes = await pool.query(`SELECT COUNT(*) as total FROM otp_tracking`);
       totalOtps = parseInt(otpRes.rows[0].total) || 0;
-    } catch(e) {
+    } catch (e) {
       // Ignored if table doesn't exist yet
     }
 
@@ -1771,7 +1771,7 @@ router.get('/gift-reports', authenticateAdmin, async (req, res) => {
       }))
     });
   } catch (error) {
-    console.error('Fetch gift reports error:', error);
+    console.error('Get gift reports error:', error);
     res.status(500).json({ error: 'Failed to fetch gift reports' });
   }
 });
