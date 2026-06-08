@@ -579,9 +579,8 @@ io.on('connection', (socket) => {
       }
 
       const eligibility = eligibilityResult.rows[0];
-      const isListenerAccount = eligibility.account_type === 'listener';
       const isExpert = eligibility.is_expert === true;
-      if (isListenerAccount || isExpert) {
+      if (isExpert) {
         socket.emit('random:join_rejected', {
           reason: 'experts_not_allowed',
           message: 'Random call is only available for normal users.',

@@ -1356,7 +1356,7 @@ router.post('/upload-avatar', authenticate, (req, res, next) => {
     const getResult = await pool.query(getQuery, [req.userId]);
 
     if (getResult.rows.length === 0) {
-       return res.status(404).json({ error: 'Listener profile not found' });
+      return res.status(404).json({ error: 'Listener profile not found' });
     }
 
     const oldImageUrl = getResult.rows[0].profile_image;
@@ -1395,10 +1395,10 @@ router.post('/upload-avatar', authenticate, (req, res, next) => {
     });
     // Check if error is from multer limits
     if (error.message && error.message.includes('large')) {
-        return res.status(413).json({
-          error: 'Image size must be less than 2 MB',
-          code: 'FILE_TOO_LARGE',
-        });
+      return res.status(413).json({
+        error: 'Image size must be less than 2 MB',
+        code: 'FILE_TOO_LARGE',
+      });
     }
     res.status(error.statusCode || 500).json({
       error: error.message || 'Failed to upload avatar to Cloudflare R2',
