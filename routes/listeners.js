@@ -413,6 +413,21 @@ router.post('/heartbeat', authenticate, async (req, res) => {
   }
 });
 
+// GET /api/listeners/payout-slabs/public
+// Fetch the list of payout slabs for public/verified listener info banner
+router.get('/payout-slabs/public', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT start_duration, end_duration, payout_per_minute FROM listener_payout_slabs ORDER BY start_duration ASC'
+    );
+    res.json({ success: true, slabs: result.rows });
+  } catch (error) {
+    console.error('Fetch public payout slabs error:', error);
+    res.status(500).json({ error: 'Failed to fetch payout slabs' });
+  }
+});
+
+
 // GET /api/listeners/stats/leaderboard
 // Get the top listeners using persisted backend call and rating data
 router.get('/stats/leaderboard', authenticate, async (req, res) => {
