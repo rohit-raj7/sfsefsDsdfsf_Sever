@@ -1782,7 +1782,7 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
 
     // 3. Live Active Calls
     const activeCallsRes = await pool.query(
-      `SELECT COUNT(*) as active_calls FROM calls WHERE status IN ('ongoing', 'ringing', 'pending')`
+      `SELECT COUNT(*) as active_calls FROM calls WHERE status = 'in-progress'`
     );
 
     // 4. Conversion Rate (Recharged vs Total)
@@ -2376,17 +2376,26 @@ router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
     const listenerSummaryRes = await pool.query(listenerSummaryQuery, listenerSummaryParams);
     
     // 5. Calculate summary metrics
-    const paymentsList = paymentsRes.rows.map(row => ({
-      ...row,
-      amount: parseFloat(row.amount)
-    }));
+    const paymentsList = paymentsRes.rows.map(row => {
+      const amount = parseFloat(row.amount);
+      const match = row.description ? row.description.match(/\+\s*₹\s*(\d+(?:\.\d+)?)\s*extra\s*bonus/i) : null;
+      const extraBonus = match ? parseFloat(match[1]) : 0;
+      return {
+        ...row,
+        amount: amount,
+        extra_bonus: extraBonus
+      };
+    });
     
     const payoutsList = payoutsRes.rows.map(row => ({
       ...row,
       amount: parseFloat(row.amount)
     }));
     
-    const totalRevenue = paymentsList.reduce((sum, p) => sum + p.amount, 0);
+    const totalRawRevenue = paymentsList.reduce((sum, p) => sum + p.amount, 0);
+    const totalExtraBonus = paymentsList.reduce((sum, p) => sum + p.extra_bonus, 0);
+    const totalRevenue = totalRawRevenue - totalExtraBonus;
+    
     const totalPayout = payoutsList
       .filter(p => ['approved', 'processed', 'completed'].includes(p.status))
       .reduce((sum, p) => sum + p.amount, 0);
@@ -2397,6 +2406,7 @@ router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
       success: true,
       summary: {
         totalRevenue: toMoney(totalRevenue),
+        totalExtraBonus: toMoney(totalExtraBonus),
         totalPayout: toMoney(totalPayout),
         netRevenue: toMoney(netRevenue),
         period: {
