@@ -236,7 +236,7 @@ class Listener {
     `;
     const result = await pool.query(query, [user_id]);
     const listener = (await attachResolvedRates(result.rows))[0];
-    
+
     if (listener) {
       // Structure payment info
       if (listener.payment_method) {
@@ -256,7 +256,7 @@ class Listener {
           payout_currency: listener.currency || 'INR'
         };
       }
-      
+
       // Clean up individual payment fields
       delete listener.payment_method;
       delete listener.payment_mobile_number;
@@ -271,7 +271,7 @@ class Listener {
       delete listener.pan_aadhaar_bank;
       delete listener.payment_verified;
     }
-    
+
     return listener;
   }
 
@@ -294,7 +294,7 @@ class Listener {
     `;
     const result = await pool.query(query, [listener_id]);
     const listener = (await attachResolvedRates(result.rows))[0];
-    
+
     if (listener) {
       // Structure payment info
       if (listener.payment_method) {
@@ -314,7 +314,7 @@ class Listener {
           payout_currency: listener.currency || 'INR'
         };
       }
-      
+
       // Clean up individual fields
       delete listener.payment_method;
       delete listener.payment_mobile_number;
@@ -329,7 +329,7 @@ class Listener {
       delete listener.pan_aadhaar_bank;
       delete listener.payment_verified;
     }
-    
+
     return listener;
   }
 
@@ -434,13 +434,13 @@ class Listener {
     const sortBy = filters.sort_by || 'rating';
     const needsResolvedPriceSort = sortBy === 'price_low' || sortBy === 'price_high';
     let orderClause = ' ORDER BY online_sort DESC';
-    
+
     if (sortBy === 'rating') {
       orderClause += ', l.average_rating DESC, l.total_ratings DESC';
     } else if (sortBy === 'recent') {
       orderClause += ', l.created_at DESC';
     }
-    
+
     query += orderClause;
 
     const limit = filters.limit || 20;
@@ -530,9 +530,9 @@ class Listener {
       ORDER BY online_sort DESC, l.average_rating DESC
       LIMIT 20
     `;
-    
+
     const result = await pool.query(query, [`%${searchTerm}%`]);
-    
+
     return attachResolvedRates(result.rows);
   }
 
@@ -573,6 +573,7 @@ class Listener {
         u.phone_number,
         u.city,
         u.country,
+        u.gender,
         u.is_active as user_active,
         u.created_at as user_created_at,
         COALESCE(r_agg.computed_avg_rating, 0) as computed_avg_rating,
@@ -645,6 +646,7 @@ class Listener {
         mobile_number: row.mobile_number,
         city: row.city,
         country: row.country,
+        gender: row.gender,
         user_active: row.user_active,
         user_created_at: row.user_created_at,
         computed_avg_rating: parseFloat(row.computed_avg_rating) || 0,
@@ -924,7 +926,7 @@ class Listener {
     values.push(limit);
 
     const result = await pool.query(query, values);
-    
+
     return attachResolvedRates(result.rows);
   }
 
@@ -961,7 +963,7 @@ class Listener {
       WHERE listener_id = $4
       RETURNING listener_id, verification_status, is_verified, rejection_reason, reapply_attempts
     `;
-    
+
     const result = await pool.query(query, [status, isVerified, reason, listener_id]);
     return result.rows[0];
   }
@@ -974,17 +976,17 @@ class Listener {
       FROM listeners WHERE listener_id = $1
     `;
     const checkResult = await pool.query(checkQuery, [listener_id]);
-    
+
     if (checkResult.rows.length === 0) {
       throw new Error('Listener not found');
     }
-    
+
     const { verification_status, reapply_attempts } = checkResult.rows[0];
-    
+
     if (verification_status !== 'rejected') {
       throw new Error('Can only reapply when status is rejected');
     }
-    
+
     const MAX_REAPPLY_ATTEMPTS = 3;
     if (reapply_attempts >= MAX_REAPPLY_ATTEMPTS) {
       throw new Error(`Maximum reapply attempts (${MAX_REAPPLY_ATTEMPTS}) reached. Please contact support.`);
@@ -999,7 +1001,7 @@ class Listener {
       WHERE listener_id = $1
       RETURNING listener_id, verification_status, is_verified, rejection_reason, reapply_attempts
     `;
-    
+
     const result = await pool.query(query, [listener_id]);
     return result.rows[0];
   }
