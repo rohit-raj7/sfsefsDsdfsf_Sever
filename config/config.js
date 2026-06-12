@@ -9,6 +9,8 @@ const defaultCorsOrigins = [
   'http://127.0.0.1:5174',
   'http://127.0.0.1:5175',
   'https://dosttalk-api.appdost.com',
+  'https://admindosttalk.appdost.com',
+  'https://dosttalk.appdost.com',
 ];
 
 const envCorsOrigins = (process.env.CORS_ORIGIN || '')
