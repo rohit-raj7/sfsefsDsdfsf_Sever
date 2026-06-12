@@ -602,16 +602,17 @@ router.get('/history/listener', authenticate, async (req, res) => {
 // Get all currently active/ongoing calls in the system (Admin only)
 router.get('/admin/active', authenticateAdmin, async (req, res) => {
   try {
-
     const query = `
       SELECT 
         c.call_id, c.call_type, c.status, c.created_at, c.rate_per_minute, c.duration_seconds,
-        COALESCE(u.display_name, u.full_name) as caller_name, COALESCE(u.mobile_number, u.phone_number) as caller_phone,
-        COALESCE(l.professional_name, 'Unknown') as listener_name, l.total_calls as listener_calls
+        COALESCE(u.display_name, u.full_name, 'Unknown User') as caller_name, 
+        COALESCE(u.mobile_number, u.phone_number, 'N/A') as caller_phone,
+        COALESCE(l.professional_name, 'Unknown Listener') as listener_name, 
+        COALESCE(l.total_calls, 0) as listener_calls
       FROM calls c
-      JOIN users u ON c.caller_id = u.user_id
-      JOIN listeners l ON c.listener_id = l.listener_id
-      WHERE c.status IN ('ongoing', 'initiated', 'ringing')
+      LEFT JOIN users u ON c.caller_id = u.user_id
+      LEFT JOIN listeners l ON c.listener_id = l.listener_id
+      WHERE c.status IN ('ongoing', 'ringing', 'pending')
       ORDER BY c.created_at DESC
     `;
 

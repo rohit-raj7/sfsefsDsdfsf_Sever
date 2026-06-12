@@ -1782,7 +1782,7 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
 
     // 3. Live Active Calls
     const activeCallsRes = await pool.query(
-      `SELECT COUNT(*) as active_calls FROM calls WHERE status = 'in-progress'`
+      `SELECT COUNT(*) as active_calls FROM calls WHERE status IN ('ongoing', 'ringing', 'pending')`
     );
 
     // 4. Conversion Rate (Recharged vs Total)
@@ -2247,6 +2247,181 @@ router.get('/gift-reports', authenticateAdmin, async (req, res) => {
   } catch (error) {
     console.error('Get gift reports error:', error);
     res.status(500).json({ error: 'Failed to fetch gift reports' });
+  }
+});
+
+// Helper for building date filter conditions
+const buildDateFilter = (columnName, filter, month, year, paramOffset = 0) => {
+  let sql = '1=1';
+  const params = [];
+  
+  if (filter === 'today') {
+    sql = `${columnName} >= CURRENT_DATE`;
+  } else if (filter === 'last7days') {
+    sql = `${columnName} >= CURRENT_DATE - INTERVAL '7 days'`;
+  } else if (filter === 'thisMonth') {
+    sql = `${columnName} >= DATE_TRUNC('month', CURRENT_DATE)`;
+  } else if (filter === 'lastMonth') {
+    sql = `${columnName} >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AND ${columnName} < DATE_TRUNC('month', CURRENT_DATE)`;
+  } else if (filter === 'month' && month) {
+    const y = year || new Date().getFullYear();
+    sql = `EXTRACT(MONTH FROM ${columnName}) = $${paramOffset + 1} AND EXTRACT(YEAR FROM ${columnName}) = $${paramOffset + 2}`;
+    params.push(parseInt(month), parseInt(y));
+  } else if (filter === 'year' && year) {
+    sql = `EXTRACT(YEAR FROM ${columnName}) = $${paramOffset + 1}`;
+    params.push(parseInt(year));
+  } else if (filter === 'monthYear' && month && year) {
+    sql = `EXTRACT(MONTH FROM ${columnName}) = $${paramOffset + 1} AND EXTRACT(YEAR FROM ${columnName}) = $${paramOffset + 2}`;
+    params.push(parseInt(month), parseInt(year));
+  }
+  
+  return { sql, params };
+};
+
+// GET /api/admin/revenue/analytics
+// Fetch revenue analytics including user payments, listener payouts, and net revenue.
+router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
+  try {
+    const { filter = 'thisMonth', month, year } = req.query;
+    
+    // 1. Build date conditions for each query
+    const trFilter = buildDateFilter('t.created_at', filter, month, year, 0);
+    const wrFilter = buildDateFilter('wr.created_at', filter, month, year, 0);
+    
+    // 2. Fetch User Payments (Total and List)
+    const paymentsQuery = `
+      SELECT 
+        t.transaction_id,
+        t.user_id,
+        COALESCE(u.full_name, u.display_name, 'Unknown User') as user_name,
+        COALESCE(u.phone_number, u.mobile_number, 'N/A') as user_phone,
+        t.amount::numeric as amount,
+        t.payment_method,
+        t.status,
+        t.description,
+        t.created_at
+      FROM transactions t
+      LEFT JOIN users u ON t.user_id = u.user_id
+      WHERE t.transaction_type = 'credit' AND t.status = 'completed' AND ${trFilter.sql}
+      ORDER BY t.created_at DESC
+    `;
+    const paymentsRes = await pool.query(paymentsQuery, trFilter.params);
+    
+    // 3. Fetch Listener Payouts (Total and List)
+    const payoutsQuery = `
+      SELECT 
+        wr.request_id,
+        wr.listener_id,
+        COALESCE(l.professional_name, u.display_name, u.full_name, 'Listener') as listener_name,
+        COALESCE(l.mobile_number, u.mobile_number, u.phone_number, 'N/A') as listener_mobile,
+        wr.withdrawal_amount::numeric as amount,
+        wr.status,
+        wr.payout_method,
+        wr.created_at,
+        wr.approved_at,
+        wr.transaction_id
+      FROM listener_withdrawal_requests wr
+      JOIN listeners l ON wr.listener_id = l.listener_id
+      JOIN users u ON l.user_id = u.user_id
+      WHERE ${wrFilter.sql}
+      ORDER BY wr.created_at DESC
+    `;
+    const payoutsRes = await pool.query(payoutsQuery, wrFilter.params);
+    
+    // 4. Fetch Listener-wise payout summary
+    const ceF = buildDateFilter('cr.created_at', filter, month, year, 0);
+    const wrF = buildDateFilter('r.created_at', filter, month, year, ceF.params.length);
+    const listenerSummaryParams = [...ceF.params, ...wrF.params];
+    
+    const listenerSummaryQuery = `
+      WITH call_earnings AS (
+        SELECT cr.listener_id, COALESCE(SUM(cr.listener_earn), 0)::numeric AS earned_in_period
+        FROM call_records cr
+        WHERE ${ceF.sql}
+        GROUP BY cr.listener_id
+      ),
+      withdrawal_totals AS (
+        SELECT
+          r.listener_id,
+          COALESCE(SUM(CASE WHEN r.status IN ('approved', 'processed', 'completed') THEN r.withdrawal_amount ELSE 0 END), 0)::numeric AS paid_in_period,
+          COALESCE(SUM(CASE WHEN r.status = 'pending' THEN r.withdrawal_amount ELSE 0 END), 0)::numeric AS pending_in_period,
+          MAX(r.created_at) AS latest_payout_date,
+          (
+            SELECT status 
+            FROM listener_withdrawal_requests 
+            WHERE listener_id = r.listener_id 
+            ORDER BY created_at DESC LIMIT 1
+          ) AS latest_payout_status
+        FROM listener_withdrawal_requests r
+        WHERE ${wrF.sql}
+        GROUP BY r.listener_id
+      )
+      SELECT
+        l.listener_id,
+        COALESCE(l.professional_name, u.display_name, u.full_name, 'Listener') as listener_name,
+        COALESCE(l.mobile_number, u.mobile_number, u.phone_number, 'N/A') as mobile_number,
+        COALESCE(l.total_earning, 0)::numeric as lifetime_earning,
+        COALESCE(ce.earned_in_period, 0)::numeric as period_earning,
+        COALESCE(wt.paid_in_period, 0)::numeric as period_paid,
+        COALESCE(wt.pending_in_period, 0)::numeric as period_pending,
+        wt.latest_payout_date,
+        wt.latest_payout_status
+      FROM listeners l
+      JOIN users u ON l.user_id = u.user_id
+      LEFT JOIN call_earnings ce ON l.listener_id = ce.listener_id
+      LEFT JOIN withdrawal_totals wt ON l.listener_id = wt.listener_id
+      WHERE l.total_earning > 0 OR ce.earned_in_period > 0 OR wt.paid_in_period > 0 OR wt.pending_in_period > 0
+      ORDER BY lifetime_earning DESC
+    `;
+    const listenerSummaryRes = await pool.query(listenerSummaryQuery, listenerSummaryParams);
+    
+    // 5. Calculate summary metrics
+    const paymentsList = paymentsRes.rows.map(row => ({
+      ...row,
+      amount: parseFloat(row.amount)
+    }));
+    
+    const payoutsList = payoutsRes.rows.map(row => ({
+      ...row,
+      amount: parseFloat(row.amount)
+    }));
+    
+    const totalRevenue = paymentsList.reduce((sum, p) => sum + p.amount, 0);
+    const totalPayout = payoutsList
+      .filter(p => ['approved', 'processed', 'completed'].includes(p.status))
+      .reduce((sum, p) => sum + p.amount, 0);
+      
+    const netRevenue = totalRevenue - totalPayout;
+    
+    res.json({
+      success: true,
+      summary: {
+        totalRevenue: toMoney(totalRevenue),
+        totalPayout: toMoney(totalPayout),
+        netRevenue: toMoney(netRevenue),
+        period: {
+          filter,
+          month: month ? parseInt(month) : null,
+          year: year ? parseInt(year) : null
+        }
+      },
+      payments: paymentsList,
+      payouts: payoutsList,
+      listenerSummary: listenerSummaryRes.rows.map(row => ({
+        listener_id: row.listener_id,
+        listener_name: row.listener_name,
+        mobile_number: row.mobile_number,
+        lifetime_earning: toMoney(row.lifetime_earning),
+        period_earning: toMoney(row.period_earning),
+        period_paid: toMoney(row.period_paid),
+        period_pending: toMoney(row.period_pending),
+        latest_payout_date: row.latest_payout_date,
+        latest_payout_status: row.latest_payout_status
+      }))
+    });
+  } catch (error) {
+    console.error('Fetch revenue analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch revenue analytics' });
   }
 });
 
