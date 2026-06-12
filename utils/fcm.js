@@ -93,6 +93,20 @@ function maskToken(token) {
   return t.length <= 12 ? t : `${t.slice(0, 6)}...${t.slice(-6)}`;
 }
 
+function formatFirebaseErrorMessage(message) {
+  const msg = String(message || '');
+  if (msg.includes('invalid_grant') && msg.includes('JWT Signature')) {
+    return 'Firebase authentication failed: The service account private key is invalid or has been revoked. Please generate a new service account key file in the Firebase Console (Settings > Service Accounts) and update the FIREBASE_SERVICE_ACCOUNT_JSON environment variable.';
+  }
+  if (msg.includes('invalid_grant') && msg.includes('clock')) {
+    return 'Firebase authentication failed: The server system time is out of sync. Please synchronize your server clock with NTP.';
+  }
+  if (msg.includes('Credential implementation') && msg.includes('fetch a valid Google OAuth2 access token')) {
+    return 'Firebase authentication failed: Unable to fetch OAuth2 access token. Please verify that your service account credentials are correct and that the key is active in the Google Cloud Console.';
+  }
+  return msg;
+}
+
 function buildFcmPayload(token, title, body, data = {}) {
   const stringData = {};
   for (const [key, value] of Object.entries(data || {})) {
@@ -168,12 +182,13 @@ async function sendPushFCM(token, title, body, data = {}) {
     throw lastError;
   } catch (error) {
     const invalidToken = isInvalidFcmError(error);
+    const formattedError = formatFirebaseErrorMessage(error?.message);
     console.error(
-      `[FCM] send failed token=${maskToken(normalizedToken)} code=${error?.code || 'unknown'} invalid=${invalidToken} err=${error?.message}`,
+      `[FCM] send failed token=${maskToken(normalizedToken)} code=${error?.code || 'unknown'} invalid=${invalidToken} err=${formattedError}`,
     );
     return {
       success: false,
-      error: error?.message || 'Unknown FCM error',
+      error: formattedError || 'Unknown FCM error',
       code: error?.code || null,
       isInvalidToken: invalidToken,
       tokenPreview: maskToken(normalizedToken),
@@ -183,37 +198,148 @@ async function sendPushFCM(token, title, body, data = {}) {
 
 // ─── Batch FCM Send (parallel with concurrency control) ─────────────
 /**
- * Send FCM notifications in parallel batches.
+ * Send FCM notifications in parallel batches using FCM sendEach API.
  * @param {Array<{userId: string, token: string, title: string, body: string, data: object}>} items
  * @param {object} options
- * @param {number} options.concurrency - max parallel sends (default 50)
+ * @param {number} options.concurrency - (deprecated, kept for compatibility, chunks are 500 by FCM standard)
  * @returns {Promise<Array<{userId: string, token: string, success: boolean, error?: string, isInvalidToken?: boolean}>>}
  */
 async function sendBatchFCM(items, { concurrency = 50 } = {}) {
   if (!items.length) return [];
 
   const results = [];
-  for (let i = 0; i < items.length; i += concurrency) {
-    const batch = items.slice(i, i + concurrency);
-    const settled = await Promise.allSettled(
-      batch.map((item) => sendPushFCM(item.token, item.title, item.body, item.data)),
+  const chunkSize = 500; // FCM sendEach limit is 500 per request
+
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+    
+    // Build initial messages for the chunk
+    const chunkMessages = chunk.map(item => 
+      buildFcmPayload(String(item.token || '').trim(), item.title, item.body, item.data)
     );
-    for (let j = 0; j < settled.length; j++) {
-      const item = batch[j];
-      const result = settled[j];
-      if (result.status === 'fulfilled') {
-        results.push({ userId: item.userId, token: item.token, ...result.value });
+
+    let attempt = 0;
+    let currentChunk = chunk;
+    let currentMessages = chunkMessages;
+    
+    // Retry configuration (matches single send delays)
+    const maxAttempts = 3;
+    const retryDelays = [0, 500, 1500];
+    const chunkResults = new Map();
+
+    try {
+      while (currentChunk.length > 0 && attempt < maxAttempts) {
+        if (retryDelays[attempt] > 0) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
+        }
+
+        try {
+          const response = await admin.messaging().sendEach(currentMessages);
+          
+          const nextChunk = [];
+          const nextMessages = [];
+
+          for (let j = 0; j < currentChunk.length; j++) {
+            const item = currentChunk[j];
+            const res = response.responses[j];
+
+            if (res.success) {
+              chunkResults.set(item.userId, {
+                userId: item.userId,
+                token: item.token,
+                success: true,
+                messageId: res.messageId,
+                tokenPreview: maskToken(item.token),
+              });
+            } else {
+              const error = res.error;
+              const isRetryable = isRetryableFcmError(error);
+              const isInvalidToken = isInvalidFcmError(error);
+
+              if (isRetryable && attempt < maxAttempts - 1) {
+                nextChunk.push(item);
+                nextMessages.push(currentMessages[j]);
+              } else {
+                const formattedError = formatFirebaseErrorMessage(error?.message);
+                chunkResults.set(item.userId, {
+                  userId: item.userId,
+                  token: item.token,
+                  success: false,
+                  error: formattedError || 'FCM delivery failed',
+                  code: error?.code || null,
+                  isInvalidToken,
+                  tokenPreview: maskToken(item.token),
+                });
+              }
+            }
+          }
+
+          currentChunk = nextChunk;
+          currentMessages = nextMessages;
+          attempt++;
+        } catch (error) {
+          console.error(`[FCM] sendEach failed on attempt ${attempt + 1}: ${error.message}`);
+          const formattedError = formatFirebaseErrorMessage(error.message);
+          
+          for (const item of currentChunk) {
+            chunkResults.set(item.userId, {
+              userId: item.userId,
+              token: item.token,
+              success: false,
+              error: formattedError || 'FCM batch send failed',
+              code: error.code || 'messaging/batch-send-failed',
+              isInvalidToken: false,
+              tokenPreview: maskToken(item.token),
+            });
+          }
+          
+          throw error; // Propagate to outer catch for chunk aborting
+        }
+      }
+    } catch (error) {
+      const formattedError = formatFirebaseErrorMessage(error.message);
+      const isAuthError = error.message?.includes('invalid_grant') || error.message?.includes('JWT Signature') || error.message?.includes('credential') || error.code?.includes('invalid-credential');
+
+      // Fill remaining items of this chunk and all subsequent chunks with this error
+      for (let k = i; k < items.length; k++) {
+        const item = items[k];
+        if (!chunkResults.has(item.userId)) {
+          chunkResults.set(item.userId, {
+            userId: item.userId,
+            token: item.token,
+            success: false,
+            error: formattedError || 'FCM batch send failed',
+            code: error.code || 'messaging/batch-send-failed',
+            isInvalidToken: false,
+            tokenPreview: maskToken(item.token),
+          });
+        }
+      }
+
+      if (isAuthError) {
+        break; // Break the chunks loop on structural auth error
+      }
+      continue; // Continue to next chunk on transient chunk error
+    }
+
+    // Append resolved results for this chunk in the original order
+    for (const item of chunk) {
+      const res = chunkResults.get(item.userId);
+      if (res) {
+        results.push(res);
       } else {
         results.push({
           userId: item.userId,
           token: item.token,
           success: false,
-          error: result.reason?.message || 'Unknown error',
-          isInvalidToken: isInvalidFcmError(result.reason),
+          error: 'Unprocessed message in batch',
+          isInvalidToken: false,
+          tokenPreview: maskToken(item.token),
         });
       }
     }
   }
+
   return results;
 }
 
