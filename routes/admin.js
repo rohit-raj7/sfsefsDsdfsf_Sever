@@ -2170,34 +2170,54 @@ router.put('/gift-withdrawals/:id/status', authenticateAdmin, async (req, res) =
 // GET /api/admin/gift-reports
 router.get('/gift-reports', authenticateAdmin, async (req, res) => {
   try {
+    const { filter = 'thisMonth', month, year } = req.query;
+
+    // Build date filters for gift reports
+    const cgFilter = buildDateFilter('created_at', filter, month, year, 0);
+    const senderFilter = buildDateFilter('cg.created_at', filter, month, year, 0);
+    const receiverFilter = buildDateFilter('cg.created_at', filter, month, year, 0);
+
     const summaryRes = await pool.query(
       `SELECT
          COUNT(*)::int AS total_gifts_sent,
          COALESCE(SUM(coin_amount), 0)::numeric AS total_gift_revenue,
          COALESCE(SUM(platform_commission), 0)::numeric AS total_platform_commission,
          COALESCE(SUM(listener_earning), 0)::numeric AS total_listener_payout
-       FROM call_gifts`
+       FROM call_gifts
+       WHERE ${cgFilter.sql}`,
+      cgFilter.params
     );
 
     const topSendersRes = await pool.query(
-      `SELECT sender_id, sender_display_name AS name,
+      `SELECT cg.sender_id, cg.sender_display_name AS name,
+              COALESCE(u.phone_number, u.mobile_number, 'N/A') AS phone,
+              COALESCE(u.email, 'N/A') AS email,
               COUNT(*)::int AS count,
-              COALESCE(SUM(coin_amount), 0)::numeric AS total_value
-       FROM call_gifts
-       GROUP BY sender_id, sender_display_name
+              COALESCE(SUM(cg.coin_amount), 0)::numeric AS total_value
+       FROM call_gifts cg
+       LEFT JOIN users u ON cg.sender_id = u.user_id
+       WHERE ${senderFilter.sql}
+       GROUP BY cg.sender_id, cg.sender_display_name, u.phone_number, u.mobile_number, u.email
        ORDER BY total_value DESC
-       LIMIT 10`
+       LIMIT 10`,
+      senderFilter.params
     );
 
     const topReceiversRes = await pool.query(
-      `SELECT listener_id, listener_user_id,
-              (SELECT professional_name FROM listeners WHERE listener_id = call_gifts.listener_id) AS name,
+      `SELECT cg.listener_id, cg.listener_user_id,
+              COALESCE(l.professional_name, u.display_name, u.full_name, 'Listener') AS name,
+              COALESCE(l.mobile_number, u.mobile_number, u.phone_number, 'N/A') AS phone,
+              COALESCE(u.email, 'N/A') AS email,
               COUNT(*)::int AS count,
-              COALESCE(SUM(listener_earning), 0)::numeric AS total_earned
-       FROM call_gifts
-       GROUP BY listener_id, listener_user_id
+              COALESCE(SUM(cg.listener_earning), 0)::numeric AS total_earned
+       FROM call_gifts cg
+       JOIN listeners l ON cg.listener_id = l.listener_id
+       JOIN users u ON l.user_id = u.user_id
+       WHERE ${receiverFilter.sql}
+       GROUP BY cg.listener_id, cg.listener_user_id, l.professional_name, u.display_name, u.full_name, l.mobile_number, u.mobile_number, u.phone_number, u.email
        ORDER BY total_earned DESC
-       LIMIT 10`
+       LIMIT 10`,
+      receiverFilter.params
     );
 
     const dailyRes = await pool.query(
@@ -2206,9 +2226,10 @@ router.get('/gift-reports', authenticateAdmin, async (req, res) => {
               COALESCE(SUM(platform_commission), 0)::numeric AS commission,
               COALESCE(SUM(listener_earning), 0)::numeric AS payout
        FROM call_gifts
-       WHERE created_at >= CURRENT_DATE - INTERVAL '30 days'
+       WHERE ${cgFilter.sql}
        GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD')
-       ORDER BY date ASC`
+       ORDER BY date ASC`,
+      cgFilter.params
     );
 
     const monthlyRes = await pool.query(
@@ -2227,7 +2248,12 @@ router.get('/gift-reports', authenticateAdmin, async (req, res) => {
         totalGiftsSent: parseInt(summaryRes.rows[0].total_gifts_sent) || 0,
         totalGiftRevenue: parseFloat(summaryRes.rows[0].total_gift_revenue) || 0,
         totalPlatformCommission: parseFloat(summaryRes.rows[0].total_platform_commission) || 0,
-        totalListenerPayout: parseFloat(summaryRes.rows[0].total_listener_payout) || 0
+        totalListenerPayout: parseFloat(summaryRes.rows[0].total_listener_payout) || 0,
+        period: {
+          filter,
+          month: month ? parseInt(month) : null,
+          year: year ? parseInt(year) : null
+        }
       },
       topSenders: topSendersRes.rows.map(r => ({ ...r, total_value: parseFloat(r.total_value) })),
       topReceivers: topReceiversRes.rows.map(r => ({ ...r, total_earned: parseFloat(r.total_earned) })),
@@ -2254,7 +2280,7 @@ router.get('/gift-reports', authenticateAdmin, async (req, res) => {
 const buildDateFilter = (columnName, filter, month, year, paramOffset = 0) => {
   let sql = '1=1';
   const params = [];
-  
+
   if (filter === 'today') {
     sql = `${columnName} >= CURRENT_DATE`;
   } else if (filter === 'last7days') {
@@ -2274,7 +2300,7 @@ const buildDateFilter = (columnName, filter, month, year, paramOffset = 0) => {
     sql = `EXTRACT(MONTH FROM ${columnName}) = $${paramOffset + 1} AND EXTRACT(YEAR FROM ${columnName}) = $${paramOffset + 2}`;
     params.push(parseInt(month), parseInt(year));
   }
-  
+
   return { sql, params };
 };
 
@@ -2283,11 +2309,28 @@ const buildDateFilter = (columnName, filter, month, year, paramOffset = 0) => {
 router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
   try {
     const { filter = 'thisMonth', month, year } = req.query;
-    
+
     // 1. Build date conditions for each query
     const trFilter = buildDateFilter('t.created_at', filter, month, year, 0);
     const wrFilter = buildDateFilter('wr.created_at', filter, month, year, 0);
-    
+    const cgFilter = buildDateFilter('cg.created_at', filter, month, year, 0);
+
+    // 1.5 Fetch Gift Analytics
+    const giftsQuery = `
+      SELECT 
+        COALESCE(SUM(coin_amount), 0)::numeric as total_gift_revenue,
+        COALESCE(SUM(listener_earning), 0)::numeric as total_gift_payout,
+        COALESCE(SUM(platform_commission), 0)::numeric as net_gift_revenue
+      FROM call_gifts cg
+      WHERE ${cgFilter.sql}
+    `;
+    const giftsRes = await pool.query(giftsQuery, cgFilter.params);
+    const giftStats = {
+      totalGiftRevenue: parseFloat(giftsRes.rows[0].total_gift_revenue) || 0,
+      totalGiftPayout: parseFloat(giftsRes.rows[0].total_gift_payout) || 0,
+      netGiftRevenue: parseFloat(giftsRes.rows[0].net_gift_revenue) || 0
+    };
+
     // 2. Fetch User Payments (Total and List)
     const paymentsQuery = `
       SELECT 
@@ -2306,7 +2349,7 @@ router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
       ORDER BY t.created_at DESC
     `;
     const paymentsRes = await pool.query(paymentsQuery, trFilter.params);
-    
+
     // 3. Fetch Listener Payouts (Total and List)
     const payoutsQuery = `
       SELECT 
@@ -2327,12 +2370,12 @@ router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
       ORDER BY wr.created_at DESC
     `;
     const payoutsRes = await pool.query(payoutsQuery, wrFilter.params);
-    
+
     // 4. Fetch Listener-wise payout summary
     const ceF = buildDateFilter('cr.created_at', filter, month, year, 0);
     const wrF = buildDateFilter('r.created_at', filter, month, year, ceF.params.length);
     const listenerSummaryParams = [...ceF.params, ...wrF.params];
-    
+
     const listenerSummaryQuery = `
       WITH call_earnings AS (
         SELECT cr.listener_id, COALESCE(SUM(cr.listener_earn), 0)::numeric AS earned_in_period
@@ -2374,8 +2417,13 @@ router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
       ORDER BY lifetime_earning DESC
     `;
     const listenerSummaryRes = await pool.query(listenerSummaryQuery, listenerSummaryParams);
-    
+
     // 5. Calculate summary metrics
+    const lifetimeEarningRes = await pool.query(
+      `SELECT COALESCE(SUM(total_earning), 0)::numeric AS total FROM listeners`
+    );
+    const totalListenerLifetimeEarnings = parseFloat(lifetimeEarningRes.rows[0].total) || 0;
+
     const paymentsList = paymentsRes.rows.map(row => {
       const amount = parseFloat(row.amount);
       const match = row.description ? row.description.match(/\+\s*₹\s*(\d+(?:\.\d+)?)\s*extra\s*bonus/i) : null;
@@ -2386,29 +2434,33 @@ router.get('/revenue/analytics', authenticateAdmin, async (req, res) => {
         extra_bonus: extraBonus
       };
     });
-    
+
     const payoutsList = payoutsRes.rows.map(row => ({
       ...row,
       amount: parseFloat(row.amount)
     }));
-    
+
     const totalRawRevenue = paymentsList.reduce((sum, p) => sum + p.amount, 0);
     const totalExtraBonus = paymentsList.reduce((sum, p) => sum + p.extra_bonus, 0);
     const totalRevenue = totalRawRevenue - totalExtraBonus;
-    
+
     const totalPayout = payoutsList
       .filter(p => ['approved', 'processed', 'completed'].includes(p.status))
       .reduce((sum, p) => sum + p.amount, 0);
-      
+
     const netRevenue = totalRevenue - totalPayout;
-    
+
     res.json({
       success: true,
       summary: {
         totalRevenue: toMoney(totalRevenue),
         totalExtraBonus: toMoney(totalExtraBonus),
         totalPayout: toMoney(totalPayout),
+        totalListenerLifetimeEarnings: toMoney(totalListenerLifetimeEarnings),
         netRevenue: toMoney(netRevenue),
+        totalGiftRevenue: toMoney(giftStats.totalGiftRevenue),
+        totalGiftPayout: toMoney(giftStats.totalGiftPayout),
+        netGiftRevenue: toMoney(giftStats.netGiftRevenue),
         period: {
           filter,
           month: month ? parseInt(month) : null,
