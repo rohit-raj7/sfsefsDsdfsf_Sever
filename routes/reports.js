@@ -18,6 +18,17 @@ router.post('/', authenticate, async (req, res) => {
             return res.status(400).json({ error: `report_type must be one of: ${validTypes.join(', ')}` });
         }
 
+        // Resolve listener_id if it's actually the listener's user_id
+        let targetListenerId = listener_id;
+        const listenerResult = await pool.query(
+            `SELECT listener_id FROM listeners WHERE listener_id = $1 OR user_id = $1`,
+            [listener_id]
+        );
+        if (listenerResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Listener not found' });
+        }
+        targetListenerId = listenerResult.rows[0].listener_id;
+
         // Check for duplicate report on same call
         if (call_id) {
             const existing = await pool.query(
@@ -34,14 +45,14 @@ router.post('/', authenticate, async (req, res) => {
             `INSERT INTO listener_reports (listener_id, reporter_user_id, call_id, report_type, description)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-            [listener_id, req.userId, call_id || null, report_type, description || null]
+            [targetListenerId, req.userId, call_id || null, report_type, description || null]
         );
 
         // Count total unreviewed reports for this listener in last 30 days
         const countResult = await pool.query(
             `SELECT COUNT(*) as report_count FROM listener_reports
        WHERE listener_id = $1 AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 days'`,
-            [listener_id]
+            [targetListenerId]
         );
         const reportCount = Number(countResult.rows[0].report_count);
 
@@ -57,7 +68,7 @@ router.post('/', authenticate, async (req, res) => {
              updated_at = CURRENT_TIMESTAMP
          WHERE listener_id = $1
          RETURNING strike_count`,
-                [listener_id]
+                [targetListenerId]
             );
 
             const newStrikeCount = strikeResult.rows[0]?.strike_count || 0;
@@ -76,10 +87,10 @@ router.post('/', authenticate, async (req, res) => {
                     `UPDATE listeners SET quality_status = 'banned', is_active = FALSE,
            suspension_reason = 'Permanently banned: 3 strikes from user reports'
            WHERE listener_id = $1`,
-                    [listener_id]
+                    [targetListenerId]
                 );
                 actionTaken = 'banned';
-                console.log(`[STRIKES] Listener ${listener_id} BANNED (3 strikes)`);
+                console.log(`[STRIKES] Listener ${targetListenerId} BANNED (3 strikes)`);
             } else if (newStrikeCount === 2) {
                 // Strike 2 → Hidden 24 hours
                 const suspendedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -88,27 +99,27 @@ router.post('/', authenticate, async (req, res) => {
            suspended_until = $1,
            suspension_reason = 'Suspended 24h: Strike 2 from user reports'
            WHERE listener_id = $2`,
-                    [suspendedUntil.toISOString(), listener_id]
+                    [suspendedUntil.toISOString(), targetListenerId]
                 );
                 actionTaken = 'suspended_24h';
-                console.log(`[STRIKES] Listener ${listener_id} SUSPENDED 24h (strike 2)`);
+                console.log(`[STRIKES] Listener ${targetListenerId} SUSPENDED 24h (strike 2)`);
             } else if (newStrikeCount === 1) {
                 // Strike 1 → Warning
                 await pool.query(
                     `UPDATE listeners SET quality_status = 'warning',
            warning_reason = 'Strike 1: User reports received'
            WHERE listener_id = $1`,
-                    [listener_id]
+                    [targetListenerId]
                 );
                 actionTaken = 'warning';
-                console.log(`[STRIKES] Listener ${listener_id} WARNING (strike 1)`);
+                console.log(`[STRIKES] Listener ${targetListenerId} WARNING (strike 1)`);
             }
 
             // Reset report count for this listener (reports consumed into strike)
             await pool.query(
                 `UPDATE listener_reports SET reviewed = TRUE
          WHERE listener_id = $1 AND reviewed = FALSE`,
-                [listener_id]
+                [targetListenerId]
             );
         }
 
