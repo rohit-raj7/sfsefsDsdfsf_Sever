@@ -233,6 +233,57 @@ router.get('/languages/me', authenticate, async (req, res) => {
   }
 });
 
+// GET /api/users/follows/me
+// Get all listeners followed by the current user
+router.get('/follows/me', authenticate, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        l.listener_id,
+        l.user_id,
+        l.professional_name,
+        l.age,
+        l.specialties,
+        l.languages,
+        l.rate_per_minute,
+        l.user_rate_per_min,
+        l.average_rating,
+        l.total_ratings,
+        l.total_calls,
+        l.total_minutes,
+        l.is_available,
+        l.is_verified,
+        l.verification_status,
+        l.listener_type,
+        l.profile_image,
+        l.voice_verified,
+        l.voice_verification_url,
+        COALESCE(l.is_busy, false) as is_busy,
+        u.city,
+        u.country,
+        u.display_name,
+        CASE 
+          WHEN l.last_active_at IS NOT NULL AND (NOW() - l.last_active_at) <= INTERVAL '2 minutes' 
+          THEN true 
+          ELSE false 
+        END as is_online
+      FROM user_listener_follows ulf
+      JOIN listeners l ON ulf.listener_user_id = l.user_id
+      JOIN users u ON l.user_id = u.user_id
+      WHERE ulf.follower_user_id = $1
+        AND u.is_active = TRUE
+        AND l.is_active = TRUE
+        AND COALESCE(l.verification_status, 'approved') = 'approved'
+      ORDER BY ulf.created_at DESC
+    `;
+    const result = await pool.query(query, [req.userId]);
+    res.json({ followedListeners: result.rows });
+  } catch (error) {
+    console.error('Get followed listeners error:', error);
+    res.status(500).json({ error: 'Failed to fetch followed listeners' });
+  }
+});
+
 // GET /api/users/follows/:target_id/status
 // Get follow status + followers count for a listener target
 router.get('/follows/:target_id/status', authenticate, async (req, res) => {
