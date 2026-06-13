@@ -86,7 +86,7 @@ router.get('/campaigns', authenticateAdmin, async (req, res) => {
     const { page = 1, limit = 50 } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
     const result = await pool.query(
-      `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval,
+      `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, repeat_days, random_enabled, random_start_time, random_end_time,
               status, created_at, delivered_at, retry_count, last_error, delivered_count, language_filter
        FROM notification_outbox
        WHERE target_role = 'USER'
@@ -106,7 +106,17 @@ router.get('/campaigns', authenticateAdmin, async (req, res) => {
 // Send (or schedule) a marketing campaign to newbie users
 router.post('/send-notification', authenticateAdmin, async (req, res) => {
   try {
-    const { title, body, scheduleAt, languageFilter } = req.body;
+    const { 
+      title, 
+      body, 
+      scheduleAt, 
+      languageFilter, 
+      repeatInterval, 
+      repeatDays, 
+      randomEnabled, 
+      randomStartTime, 
+      randomEndTime 
+    } = req.body;
 
     if (!title || !body) {
       return res.status(400).json({ error: 'Title and body are required' });
@@ -120,6 +130,38 @@ router.post('/send-notification', authenticateAdmin, async (req, res) => {
         return res.status(400).json({ error: 'Invalid scheduleAt value' });
       }
       normalizedScheduleAt = parsed.toISOString();
+    }
+
+    // Validate repeatInterval and repeatDays
+    if (repeatInterval) {
+      if (repeatInterval !== 'daily' && repeatInterval !== 'weekly' && repeatInterval !== 'days_wise') {
+        return res.status(400).json({ error: 'Invalid repeatInterval (must be daily, weekly, or days_wise)' });
+      }
+      if (!scheduleAt) {
+        return res.status(400).json({ error: 'scheduleAt is required when repeatInterval is set' });
+      }
+      if (repeatInterval === 'days_wise') {
+        if (!Array.isArray(repeatDays) || repeatDays.length === 0) {
+          return res.status(400).json({ error: 'repeatDays must be a non-empty array when repeatInterval is days_wise' });
+        }
+        for (const day of repeatDays) {
+          const dayNum = Number(day);
+          if (!Number.isInteger(dayNum) || dayNum < 0 || dayNum > 6) {
+            return res.status(400).json({ error: 'repeatDays must contain only integers between 0 (Sunday) and 6 (Saturday)' });
+          }
+        }
+      }
+    }
+
+    // Validate random scheduling options
+    if (randomEnabled) {
+      if (!randomStartTime || !randomEndTime) {
+        return res.status(400).json({ error: 'randomStartTime and randomEndTime are required when random scheduling is enabled' });
+      }
+      const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+      if (!timeRegex.test(randomStartTime) || !timeRegex.test(randomEndTime)) {
+        return res.status(400).json({ error: 'randomStartTime and randomEndTime must be in HH:MM format' });
+      }
     }
 
     // Build audience query with optional language filter
@@ -167,7 +209,11 @@ router.post('/send-notification', authenticateAdmin, async (req, res) => {
       target_role: 'USER',
       target_user_ids: targetUserIds,
       schedule_at: normalizedScheduleAt,
-      repeat_interval: null,
+      repeat_interval: repeatInterval || null,
+      repeat_days: repeatDays || null,
+      random_enabled: randomEnabled || false,
+      random_start_time: randomStartTime || null,
+      random_end_time: randomEndTime || null,
       created_by: req.adminId,
       language_filter: languageFilter || null
     });

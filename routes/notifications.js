@@ -63,7 +63,7 @@ router.get('/outbox', authenticateAdmin, async (req, res) => {
     }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const q = `
-      SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error, delivered_count, language_filter
+      SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, repeat_days, random_enabled, random_start_time, random_end_time, status, created_at, delivered_at, retry_count, last_error, delivered_count, language_filter
       FROM notification_outbox
       ${where}
       ORDER BY created_at DESC
@@ -179,7 +179,7 @@ router.post('/outbox', authenticateAdmin, async (req, res) => {
     if (shouldProcessImmediately(created.schedule_at)) {
       await processNotifications();
       const latest = await pool.query(
-        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error, language_filter
+        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, repeat_days, random_enabled, random_start_time, random_end_time, status, created_at, delivered_at, retry_count, last_error, language_filter
          FROM notification_outbox
          WHERE id = $1`,
         [created.id]
@@ -204,7 +204,7 @@ router.put('/outbox/:id', authenticateAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const exists = await pool.query(
-      `SELECT id, status, schedule_at, repeat_interval, target_role, target_user_ids, language_filter FROM notification_outbox WHERE id = $1`,
+      `SELECT id, status, schedule_at, repeat_interval, repeat_days, random_enabled, random_start_time, random_end_time, target_role, target_user_ids, language_filter FROM notification_outbox WHERE id = $1`,
       [id]
     );
     if (!exists.rows.length) {
@@ -344,14 +344,14 @@ router.put('/outbox/:id', authenticateAdmin, async (req, res) => {
       UPDATE notification_outbox
       SET ${updates.join(', ')}, retry_count = 0, last_error = NULL
       WHERE id = $${idx}
-      RETURNING id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, language_filter
+      RETURNING id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, repeat_days, random_enabled, random_start_time, random_end_time, status, created_at, language_filter
     `;
     const r = await pool.query(q, params);
     let outbox = r.rows[0];
     if (outbox && shouldProcessImmediately(outbox.schedule_at)) {
       await processNotifications();
       const latest = await pool.query(
-        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error, language_filter
+        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, repeat_days, random_enabled, random_start_time, random_end_time, status, created_at, delivered_at, retry_count, last_error, language_filter
          FROM notification_outbox
          WHERE id = $1`,
         [outbox.id]

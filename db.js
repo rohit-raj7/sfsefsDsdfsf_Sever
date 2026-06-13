@@ -799,6 +799,26 @@ async function ensureSchema() {
     // Add language_filter column if missing
     await pool.query(`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS language_filter VARCHAR(50) DEFAULT NULL`);
 
+    // Add repeat_days and random scheduling columns to notification_outbox
+    await pool.query(`
+      ALTER TABLE notification_outbox 
+      ADD COLUMN IF NOT EXISTS repeat_days INTEGER[] DEFAULT NULL,
+      ADD COLUMN IF NOT EXISTS random_enabled BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS random_start_time VARCHAR(10) DEFAULT NULL,
+      ADD COLUMN IF NOT EXISTS random_end_time VARCHAR(10) DEFAULT NULL;
+    `);
+
+    // Modify CHECK constraint on repeat_interval if present
+    await pool.query(`
+      ALTER TABLE notification_outbox 
+      DROP CONSTRAINT IF EXISTS notification_outbox_repeat_interval_check;
+    `);
+    await pool.query(`
+      ALTER TABLE notification_outbox 
+      ADD CONSTRAINT notification_outbox_repeat_interval_check 
+      CHECK (repeat_interval IN ('daily', 'weekly', 'days_wise'));
+    `);
+
     const alterNotificationsSql = `
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS source_outbox_id UUID;
       CREATE INDEX IF NOT EXISTS idx_notifications_source_outbox ON notifications(source_outbox_id);

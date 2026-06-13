@@ -185,6 +185,52 @@ export async function processNotifications() {
   }
 }
 
+// Helper to calculate the next date for "days_wise" scheduling
+function getNextDaysWiseScheduleAt(currentDate, repeatDays) {
+  if (!Array.isArray(repeatDays) || repeatDays.length === 0) {
+    const nextDate = new Date(currentDate.getTime());
+    nextDate.setUTCDate(nextDate.getUTCDate() + 7);
+    return nextDate;
+  }
+
+  const sortedDays = [...repeatDays].sort((a, b) => a - b);
+  const currentUtcDay = currentDate.getUTCDay();
+  
+  let nextDay = sortedDays.find(d => d > currentUtcDay);
+  let daysToAdd = 0;
+  
+  if (nextDay !== undefined) {
+    daysToAdd = nextDay - currentUtcDay;
+  } else {
+    nextDay = sortedDays[0];
+    daysToAdd = (7 - currentUtcDay) + nextDay;
+  }
+  
+  const nextDate = new Date(currentDate.getTime());
+  nextDate.setUTCDate(nextDate.getUTCDate() + daysToAdd);
+  return nextDate;
+}
+
+// Helper to choose a random timestamp between startTimeStr and endTimeStr on a base date (both HH:MM in UTC)
+function getRandomTimeBetween(baseDate, startTimeStr, endTimeStr) {
+  const [startH, startM] = startTimeStr.split(':').map(Number);
+  const [endH, endM] = endTimeStr.split(':').map(Number);
+
+  const startUtc = new Date(Date.UTC(baseDate.getUTCFullYear(), baseDate.getUTCMonth(), baseDate.getUTCDate(), startH, startM, 0, 0));
+  const endUtc = new Date(Date.UTC(baseDate.getUTCFullYear(), baseDate.getUTCMonth(), baseDate.getUTCDate(), endH, endM, 0, 0));
+
+  if (endUtc <= startUtc) {
+    // Crosses UTC midnight, so the end time falls on the next UTC day
+    endUtc.setUTCDate(endUtc.getUTCDate() + 1);
+  }
+
+  const startMs = startUtc.getTime();
+  const endMs = endUtc.getTime();
+  const randomMs = startMs + Math.random() * (endMs - startMs);
+
+  return new Date(randomMs);
+}
+
 // ─── Process Single Outbox Item (Batched) ───────────────────────────
 async function processOutboxItem(outbox) {
   const startTime = Date.now();
@@ -366,21 +412,50 @@ async function processOutboxItem(outbox) {
 
   // ── Step 8: Schedule next recurrence ──────────────────────────────
   if (outbox.repeat_interval && outbox.schedule_at) {
-    const interval = outbox.repeat_interval === 'daily' ? '1 day' : '7 days';
-    const nextOutbox = await pool.query(
-      `INSERT INTO notification_outbox (
-         title, body, target_role, target_user_ids,
-         schedule_at, repeat_interval, created_by, language_filter
-       )
-       VALUES ($1, $2, $3, $4, $5::timestamp + $6::interval, $7, $8, $9)
-       RETURNING id, schedule_at, status`,
-      [
-        outbox.title, outbox.body, outbox.target_role, outbox.target_user_ids,
-        outbox.schedule_at, interval, outbox.repeat_interval, outbox.created_by,
-        outbox.language_filter || null,
-      ],
-    );
-    scheduleOutboxProcessing(nextOutbox.rows[0]);
+    let nextDateBase = null;
+    if (outbox.repeat_interval === 'daily') {
+      const current = new Date(outbox.schedule_at);
+      current.setUTCDate(current.getUTCDate() + 1);
+      nextDateBase = current;
+    } else if (outbox.repeat_interval === 'weekly') {
+      const current = new Date(outbox.schedule_at);
+      current.setUTCDate(current.getUTCDate() + 7);
+      nextDateBase = current;
+    } else if (outbox.repeat_interval === 'days_wise') {
+      const current = new Date(outbox.schedule_at);
+      nextDateBase = getNextDaysWiseScheduleAt(current, outbox.repeat_days);
+    }
+
+    if (nextDateBase) {
+      let nextScheduleAt = nextDateBase.toISOString();
+      if (outbox.random_enabled && outbox.random_start_time && outbox.random_end_time) {
+        nextScheduleAt = getRandomTimeBetween(nextDateBase, outbox.random_start_time, outbox.random_end_time).toISOString();
+      }
+
+      const nextOutbox = await pool.query(
+        `INSERT INTO notification_outbox (
+           title, body, target_role, target_user_ids,
+           schedule_at, repeat_interval, repeat_days, random_enabled, random_start_time, random_end_time, created_by, language_filter
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING id, schedule_at, status`,
+        [
+          outbox.title,
+          outbox.body,
+          outbox.target_role,
+          outbox.target_user_ids,
+          nextScheduleAt,
+          outbox.repeat_interval,
+          outbox.repeat_days || null,
+          outbox.random_enabled || false,
+          outbox.random_start_time || null,
+          outbox.random_end_time || null,
+          outbox.created_by,
+          outbox.language_filter || null,
+        ],
+      );
+      scheduleOutboxProcessing(nextOutbox.rows[0]);
+    }
   }
 
   const elapsed = Date.now() - startTime;
