@@ -810,9 +810,9 @@ io.on('connection', (socket) => {
         io.to(sid).emit('incoming-call', callData);
       }
     }
-    console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ Forwarded to listener ${listenerId} (socket: ${listenerSocketId})`);
+    console.log(`[SOCKET] call:initiate: Forwarded to listener ${listenerId} (socket: ${listenerSocketIds ? Array.from(listenerSocketIds)[0] : 'NONE'})`);
 
-    // THEN verify in background Ã¢â‚¬â€ if not approved, cancel the call
+    // THEN verify in background if not approved, cancel the call
     try {
       const listener = await Listener.findByUserId(listenerId);
       if (listener) {
@@ -879,10 +879,10 @@ io.on('connection', (socket) => {
           }
         }
         if (pushResult?.success) {
+          console.log(`[SOCKET] call:initiate: ✔ FCM Push sent successfully to listener ${listenerId}`);
         }
-        console.log(`[SOCKET] call:initiate: Ã¢Å“â€œ FCM Push sent successfully to listener ${listenerId}`);
       } catch (fcmErr) {
-        console.error(`[SOCKET] call:initiate: Ã¢Å“â€” FCM Push failed:`, fcmErr.message);
+        console.error(`[SOCKET] call:initiate: ✘ FCM Push failed:`, fcmErr.message);
       }
     }
   });
@@ -891,6 +891,21 @@ io.on('connection', (socket) => {
   socket.on('listener_call:initiate', async (data) => {
     const { targetUserId, ...callData } = data || {};
     const listenerUserId = socket.listenerUserId || socket.userId;
+
+    // Fetch listener details from database to ensure up-to-date name and avatar are used
+    let listenerName = 'Experts';
+    let listenerAvatar = '';
+    try {
+      const listenerObj = await Listener.findByUserId(listenerUserId);
+      if (listenerObj) {
+        listenerName = listenerObj.professional_name || listenerObj.full_name || 'Experts';
+        listenerAvatar = listenerObj.profile_image || '';
+      }
+    } catch (e) {
+      console.error('[SOCKET] listener_call:initiate db fetch error:', e.message);
+    }
+    callData.callerName = listenerName || callData.callerName || 'Experts';
+    callData.callerAvatar = listenerAvatar || callData.callerAvatar || '';
 
     // CALLER BUSY CHECK
     if (listenerUserId && busyUsers.has(listenerUserId)) {
