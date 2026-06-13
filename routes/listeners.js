@@ -855,6 +855,24 @@ router.put('/:listener_id', authenticate, async (req, res) => {
       delete incoming.avatar_url;
     }
 
+    // Get current profile image to check if it needs to be deleted
+    const currentProfileResult = await pool.query(
+      'SELECT profile_image FROM listeners WHERE listener_id = $1 LIMIT 1',
+      [req.params.listener_id]
+    );
+    const oldImageUrl = currentProfileResult.rows[0]?.profile_image;
+
+    if (incoming.profile_image !== undefined && incoming.profile_image !== oldImageUrl) {
+      if (oldImageUrl) {
+        try {
+          await deleteFromMinioByUrl(oldImageUrl);
+          console.log(`[UPDATE_PROFILE] Old avatar deleted from Cloudflare: ${oldImageUrl}`);
+        } catch (deleteError) {
+          console.error(`[UPDATE_PROFILE] Failed to delete old avatar: ${oldImageUrl}`, deleteError);
+        }
+      }
+    }
+
     ['specialties', 'languages', 'certifications'].forEach(field => {
       if (incoming[field] && typeof incoming[field] === 'string') {
         incoming[field] = incoming[field]
