@@ -10,6 +10,26 @@ import {
 
 const router = express.Router();
 
+function getLanguageAliases(language) {
+  if (!language) return [];
+  const normalized = String(language).trim().toLowerCase();
+  const aliasMap = {
+    'hindi': ['hi', 'hindi'],
+    'bhogpuri': ['bh', 'bho', 'bhojpuri', 'bhogpuri'],
+    'bhojpuri': ['bh', 'bho', 'bhojpuri', 'bhogpuri'],
+    'bengali': ['bn', 'bangla', 'bengali'],
+    'bangla': ['bn', 'bangla', 'bengali'],
+    'telugu': ['te', 'telugu'],
+    'marathi': ['mr', 'marathi'],
+    'tamil': ['ta', 'tamil'],
+    'gujarati': ['gu', 'gujarati'],
+    'kannada': ['kn', 'kannada'],
+    'malayalam': ['ml', 'malayalam'],
+    'punjabi': ['pa', 'punjabi']
+  };
+  return aliasMap[normalized] || [normalized];
+}
+
 function shouldProcessImmediately(scheduleAt) {
   if (!scheduleAt) return true;
   const parsed = new Date(scheduleAt);
@@ -43,7 +63,7 @@ router.get('/outbox', authenticateAdmin, async (req, res) => {
     }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const q = `
-      SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error, delivered_count
+      SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error, delivered_count, language_filter
       FROM notification_outbox
       ${where}
       ORDER BY created_at DESC
@@ -60,7 +80,7 @@ router.get('/outbox', authenticateAdmin, async (req, res) => {
 
 router.post('/outbox', authenticateAdmin, async (req, res) => {
   try {
-    const { title, body, targetRole, targetUserIds, scheduleAt, repeatInterval } = req.body;
+    const { title, body, targetRole, targetUserIds, scheduleAt, repeatInterval, languageFilter } = req.body;
     if (!title || !body || !targetRole) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -80,6 +100,71 @@ router.post('/outbox', authenticateAdmin, async (req, res) => {
     if (normalizedScheduleAt?.error) {
       return res.status(400).json({ error: normalizedScheduleAt.error });
     }
+
+    // Validation: Check if any users/listeners exist for the selected language
+    if (languageFilter) {
+      const aliases = getLanguageAliases(languageFilter);
+      let count = 0;
+      const hasTargetIds = Array.isArray(targetUserIds) && targetUserIds.length > 0;
+      if (targetRole === 'USER') {
+        let checkQuery = `
+          SELECT COUNT(*)::int AS count
+          FROM users u
+          WHERE u.is_active = TRUE
+            AND u.account_type = 'user'
+            AND (
+              EXISTS (
+                SELECT 1 FROM user_languages ul
+                WHERE ul.user_id = u.user_id
+                  AND LOWER(BTRIM(ul.language)) = ANY($1::text[])
+              ) OR (
+                u.languages IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM unnest(u.languages) AS lang
+                  WHERE LOWER(BTRIM(lang)) = ANY($1::text[])
+                )
+              )
+            )
+        `;
+        const params = [aliases];
+        if (hasTargetIds) {
+          checkQuery += ` AND u.user_id = ANY($2::uuid[])`;
+          params.push(targetUserIds);
+        }
+        const checkRes = await pool.query(checkQuery, params);
+        count = checkRes.rows[0]?.count || 0;
+      } else if (targetRole === 'LISTENER') {
+        let checkQuery = `
+          SELECT COUNT(*)::int AS count
+          FROM users u
+          LEFT JOIN listeners l ON l.user_id = u.user_id
+          WHERE u.is_active = TRUE
+            AND u.account_type = 'listener'
+            AND (
+              EXISTS (
+                SELECT 1 FROM unnest(l.languages) AS lang
+                WHERE LOWER(BTRIM(lang)) = ANY($1::text[])
+              ) OR EXISTS (
+                SELECT 1 FROM user_languages ul
+                WHERE ul.user_id = u.user_id
+                  AND LOWER(BTRIM(ul.language)) = ANY($1::text[])
+              )
+            )
+        `;
+        const params = [aliases];
+        if (hasTargetIds) {
+          checkQuery += ` AND (u.user_id = ANY($2::uuid[]) OR l.listener_id = ANY($2::uuid[]))`;
+          params.push(targetUserIds);
+        }
+        const checkRes = await pool.query(checkQuery, params);
+        count = checkRes.rows[0]?.count || 0;
+      }
+      if (count === 0) {
+        return res.status(400).json({
+          error: `No users found matching the selected language: ${languageFilter}`
+        });
+      }
+    }
+
     const created = await NotificationOutbox.create({
       title,
       body,
@@ -87,13 +172,14 @@ router.post('/outbox', authenticateAdmin, async (req, res) => {
       target_user_ids: Array.isArray(targetUserIds) && targetUserIds.length ? targetUserIds : null,
       schedule_at: normalizedScheduleAt?.value || null,
       repeat_interval: repeatInterval || null,
-      created_by: req.adminId
+      created_by: req.adminId,
+      language_filter: languageFilter || null
     });
     let outbox = created;
     if (shouldProcessImmediately(created.schedule_at)) {
       await processNotifications();
       const latest = await pool.query(
-        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error
+        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error, language_filter
          FROM notification_outbox
          WHERE id = $1`,
         [created.id]
@@ -118,17 +204,88 @@ router.put('/outbox/:id', authenticateAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const exists = await pool.query(
-      `SELECT id, status, schedule_at, repeat_interval FROM notification_outbox WHERE id = $1`,
+      `SELECT id, status, schedule_at, repeat_interval, target_role, target_user_ids, language_filter FROM notification_outbox WHERE id = $1`,
       [id]
     );
     if (!exists.rows.length) {
       return res.status(404).json({ error: 'Outbox item not found' });
     }
-    const { title, body, targetRole, targetUserIds, scheduleAt, repeatInterval } = req.body;
+    const { title, body, targetRole, targetUserIds, scheduleAt, repeatInterval, languageFilter } = req.body;
     const normalizedScheduleAt = scheduleAt !== undefined ? normalizeScheduleAt(scheduleAt) : null;
     if (normalizedScheduleAt?.error) {
       return res.status(400).json({ error: normalizedScheduleAt.error });
     }
+
+    const finalTargetRole = targetRole !== undefined ? targetRole : exists.rows[0].target_role;
+    const finalTargetUserIds = targetUserIds !== undefined
+      ? (Array.isArray(targetUserIds) && targetUserIds.length ? targetUserIds : null)
+      : exists.rows[0].target_user_ids;
+    const finalLanguageFilter = languageFilter !== undefined ? languageFilter : exists.rows[0].language_filter;
+
+    // Validation: Check if any users/listeners exist for the selected language
+    if (finalLanguageFilter) {
+      const aliases = getLanguageAliases(finalLanguageFilter);
+      let count = 0;
+      const hasTargetIds = Array.isArray(finalTargetUserIds) && finalTargetUserIds.length > 0;
+      if (finalTargetRole === 'USER') {
+        let checkQuery = `
+          SELECT COUNT(*)::int AS count
+          FROM users u
+          WHERE u.is_active = TRUE
+            AND u.account_type = 'user'
+            AND (
+              EXISTS (
+                SELECT 1 FROM user_languages ul
+                WHERE ul.user_id = u.user_id
+                  AND LOWER(BTRIM(ul.language)) = ANY($1::text[])
+              ) OR (
+                u.languages IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM unnest(u.languages) AS lang
+                  WHERE LOWER(BTRIM(lang)) = ANY($1::text[])
+                )
+              )
+            )
+        `;
+        const params = [aliases];
+        if (hasTargetIds) {
+          checkQuery += ` AND u.user_id = ANY($2::uuid[])`;
+          params.push(finalTargetUserIds);
+        }
+        const checkRes = await pool.query(checkQuery, params);
+        count = checkRes.rows[0]?.count || 0;
+      } else if (finalTargetRole === 'LISTENER') {
+        let checkQuery = `
+          SELECT COUNT(*)::int AS count
+          FROM users u
+          LEFT JOIN listeners l ON l.user_id = u.user_id
+          WHERE u.is_active = TRUE
+            AND u.account_type = 'listener'
+            AND (
+              EXISTS (
+                SELECT 1 FROM unnest(l.languages) AS lang
+                WHERE LOWER(BTRIM(lang)) = ANY($1::text[])
+              ) OR EXISTS (
+                SELECT 1 FROM user_languages ul
+                WHERE ul.user_id = u.user_id
+                  AND LOWER(BTRIM(ul.language)) = ANY($1::text[])
+              )
+            )
+        `;
+        const params = [aliases];
+        if (hasTargetIds) {
+          checkQuery += ` AND (u.user_id = ANY($2::uuid[]) OR l.listener_id = ANY($2::uuid[]))`;
+          params.push(finalTargetUserIds);
+        }
+        const checkRes = await pool.query(checkQuery, params);
+        count = checkRes.rows[0]?.count || 0;
+      }
+      if (count === 0) {
+        return res.status(400).json({
+          error: `No users found matching the selected language: ${finalLanguageFilter}`
+        });
+      }
+    }
+
     const updates = [];
     const params = [];
     let idx = 1;
@@ -166,6 +323,10 @@ router.put('/outbox/:id', authenticateAdmin, async (req, res) => {
       updates.push(`repeat_interval = $${idx++}`);
       params.push(repeatInterval || null);
     }
+    if (languageFilter !== undefined) {
+      updates.push(`language_filter = $${idx++}`);
+      params.push(languageFilter || null);
+    }
     const nextScheduleAt = scheduleAt !== undefined
       ? (normalizedScheduleAt?.value || null)
       : exists.rows[0].schedule_at ?? null;
@@ -183,14 +344,14 @@ router.put('/outbox/:id', authenticateAdmin, async (req, res) => {
       UPDATE notification_outbox
       SET ${updates.join(', ')}, retry_count = 0, last_error = NULL
       WHERE id = $${idx}
-      RETURNING id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at
+      RETURNING id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, language_filter
     `;
     const r = await pool.query(q, params);
     let outbox = r.rows[0];
     if (outbox && shouldProcessImmediately(outbox.schedule_at)) {
       await processNotifications();
       const latest = await pool.query(
-        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error
+        `SELECT id, title, body, target_role, target_user_ids, schedule_at, repeat_interval, status, created_at, delivered_at, retry_count, last_error, language_filter
          FROM notification_outbox
          WHERE id = $1`,
         [outbox.id]

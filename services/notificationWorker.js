@@ -2,6 +2,26 @@ import { pool } from '../db.js';
 import User from '../models/User.js';
 import { isInvalidFcmError, sendBatchFCM } from '../utils/fcm.js';
 
+function getLanguageAliases(language) {
+  if (!language) return [];
+  const normalized = String(language).trim().toLowerCase();
+  const aliasMap = {
+    'hindi': ['hi', 'hindi'],
+    'bhogpuri': ['bh', 'bho', 'bhojpuri', 'bhogpuri'],
+    'bhojpuri': ['bh', 'bho', 'bhojpuri', 'bhogpuri'],
+    'bengali': ['bn', 'bangla', 'bengali'],
+    'bangla': ['bn', 'bangla', 'bengali'],
+    'telugu': ['te', 'telugu'],
+    'marathi': ['mr', 'marathi'],
+    'tamil': ['ta', 'tamil'],
+    'gujarati': ['gu', 'gujarati'],
+    'kannada': ['kn', 'kannada'],
+    'malayalam': ['ml', 'malayalam'],
+    'punjabi': ['pa', 'punjabi']
+  };
+  return aliasMap[normalized] || [normalized];
+}
+
 // ─── Socket Emitter ─────────────────────────────────────────────────
 let notificationEmitter = null;
 
@@ -350,13 +370,14 @@ async function processOutboxItem(outbox) {
     const nextOutbox = await pool.query(
       `INSERT INTO notification_outbox (
          title, body, target_role, target_user_ids,
-         schedule_at, repeat_interval, created_by
+         schedule_at, repeat_interval, created_by, language_filter
        )
-       VALUES ($1, $2, $3, $4, $5::timestamp + $6::interval, $7, $8)
+       VALUES ($1, $2, $3, $4, $5::timestamp + $6::interval, $7, $8, $9)
        RETURNING id, schedule_at, status`,
       [
         outbox.title, outbox.body, outbox.target_role, outbox.target_user_ids,
         outbox.schedule_at, interval, outbox.repeat_interval, outbox.created_by,
+        outbox.language_filter || null,
       ],
     );
     scheduleOutboxProcessing(nextOutbox.rows[0]);
@@ -372,36 +393,98 @@ async function processOutboxItem(outbox) {
 // ─── DB Helper: Fetch Recipients ────────────────────────────────────
 async function fetchRecipients(outbox) {
   const hasTargetIds = Array.isArray(outbox.target_user_ids) && outbox.target_user_ids.length > 0;
+  const langFilter = outbox.language_filter;
+  const aliases = langFilter ? getLanguageAliases(langFilter) : null;
 
   if (hasTargetIds && outbox.target_role === 'LISTENER') {
-    const result = await pool.query(
-      `SELECT DISTINCT u.user_id, u.account_type, NULLIF(BTRIM(u.fcm_token), '') AS fcm_token
+    let q = `SELECT DISTINCT u.user_id, u.account_type, NULLIF(BTRIM(u.fcm_token), '') AS fcm_token
        FROM users u
        LEFT JOIN listeners l ON l.user_id = u.user_id
        WHERE u.is_active = TRUE
          AND u.account_type = 'listener'
-         AND (u.user_id = ANY($1::uuid[]) OR l.listener_id = ANY($1::uuid[]))`,
-      [outbox.target_user_ids],
-    );
+         AND (u.user_id = ANY($1::uuid[]) OR l.listener_id = ANY($1::uuid[]))`;
+    const params = [outbox.target_user_ids];
+    if (aliases) {
+      q += ` AND (
+        EXISTS (
+          SELECT 1 FROM unnest(l.languages) AS lang
+          WHERE LOWER(BTRIM(lang)) = ANY($2::text[])
+        ) OR EXISTS (
+          SELECT 1 FROM user_languages ul
+          WHERE ul.user_id = u.user_id
+            AND LOWER(BTRIM(ul.language)) = ANY($2::text[])
+        )
+      )`;
+      params.push(aliases);
+    }
+    const result = await pool.query(q, params);
     return result.rows;
   }
 
   if (hasTargetIds) {
-    const result = await pool.query(
-      `SELECT user_id, account_type, NULLIF(BTRIM(fcm_token), '') AS fcm_token
-       FROM users
-       WHERE user_id = ANY($1::uuid[]) AND is_active = TRUE AND account_type = 'user'`,
-      [outbox.target_user_ids],
-    );
+    let q = `SELECT u.user_id, u.account_type, NULLIF(BTRIM(u.fcm_token), '') AS fcm_token
+       FROM users u
+       WHERE u.user_id = ANY($1::uuid[]) AND u.is_active = TRUE AND u.account_type = 'user'`;
+    const params = [outbox.target_user_ids];
+    if (aliases) {
+      q += ` AND (
+        EXISTS (
+          SELECT 1 FROM user_languages ul
+          WHERE ul.user_id = u.user_id
+            AND LOWER(BTRIM(ul.language)) = ANY($2::text[])
+        ) OR (
+          u.languages IS NOT NULL AND EXISTS (
+            SELECT 1 FROM unnest(u.languages) AS lang
+            WHERE LOWER(BTRIM(lang)) = ANY($2::text[])
+          )
+        )
+      )`;
+      params.push(aliases);
+    }
+    const result = await pool.query(q, params);
     return result.rows;
   }
 
-  const result = await pool.query(
-    `SELECT user_id, account_type, NULLIF(BTRIM(fcm_token), '') AS fcm_token
-     FROM users
-     WHERE account_type = $1 AND is_active = TRUE`,
-    [outbox.target_role === 'USER' ? 'user' : 'listener'],
-  );
+  let q = `SELECT u.user_id, u.account_type, NULLIF(BTRIM(u.fcm_token), '') AS fcm_token
+     FROM users u`;
+  const params = [outbox.target_role === 'USER' ? 'user' : 'listener'];
+  
+  if (outbox.target_role === 'LISTENER') {
+    q += ` LEFT JOIN listeners l ON l.user_id = u.user_id`;
+  }
+  
+  q += ` WHERE u.account_type = $1 AND u.is_active = TRUE`;
+  
+  if (aliases) {
+    if (outbox.target_role === 'LISTENER') {
+      q += ` AND (
+        EXISTS (
+          SELECT 1 FROM unnest(l.languages) AS lang
+          WHERE LOWER(BTRIM(lang)) = ANY($2::text[])
+        ) OR EXISTS (
+          SELECT 1 FROM user_languages ul
+          WHERE ul.user_id = u.user_id
+            AND LOWER(BTRIM(ul.language)) = ANY($2::text[])
+        )
+      )`;
+    } else {
+      q += ` AND (
+        EXISTS (
+          SELECT 1 FROM user_languages ul
+          WHERE ul.user_id = u.user_id
+            AND LOWER(BTRIM(ul.language)) = ANY($2::text[])
+        ) OR (
+          u.languages IS NOT NULL AND EXISTS (
+            SELECT 1 FROM unnest(u.languages) AS lang
+            WHERE LOWER(BTRIM(lang)) = ANY($2::text[])
+          )
+        )
+      )`;
+    }
+    params.push(aliases);
+  }
+  
+  const result = await pool.query(q, params);
   return result.rows;
 }
 

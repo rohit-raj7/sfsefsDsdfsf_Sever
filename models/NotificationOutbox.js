@@ -9,12 +9,13 @@ class NotificationOutbox {
       target_user_ids,
       schedule_at,
       repeat_interval,
-      created_by
+      created_by,
+      language_filter
     } = data;
     const q = `
       INSERT INTO notification_outbox
-      (title, body, target_role, target_user_ids, schedule_at, repeat_interval, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      (title, body, target_role, target_user_ids, schedule_at, repeat_interval, created_by, language_filter)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *
     `;
     const res = await pool.query(q, [
@@ -24,7 +25,8 @@ class NotificationOutbox {
       target_user_ids || null,
       schedule_at || null,
       repeat_interval || null,
-      created_by
+      created_by,
+      language_filter || null
     ]);
     return res.rows[0];
   }

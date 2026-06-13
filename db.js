@@ -761,7 +761,8 @@ async function ensureSchema() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         delivered_at TIMESTAMP NULL,
         retry_count INTEGER DEFAULT 0,
-        last_error TEXT
+        last_error TEXT,
+        language_filter VARCHAR(50) DEFAULT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_schedule ON notification_outbox(schedule_at);
       CREATE INDEX IF NOT EXISTS idx_notification_outbox_status ON notification_outbox(status);
@@ -794,6 +795,9 @@ async function ensureSchema() {
 
     // Add delivered_count column (tracks how many users each notification reached)
     await pool.query(`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS delivered_count INTEGER NOT NULL DEFAULT 0`);
+
+    // Add language_filter column if missing
+    await pool.query(`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS language_filter VARCHAR(50) DEFAULT NULL`);
 
     const alterNotificationsSql = `
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS source_outbox_id UUID;
