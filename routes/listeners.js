@@ -1387,6 +1387,9 @@ router.post('/upload-avatar', authenticate, (req, res, next) => {
     next();
   });
 }, async (req, res) => {
+  let oldImageUrl = null;
+  let isOldDeleted = false;
+
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -1402,21 +1405,7 @@ router.post('/upload-avatar', authenticate, (req, res, next) => {
       size: req.file.size,
     });
 
-    // Upload buffer to Cloudflare R2
-    const result = await uploadToMinio(
-      req.file.buffer,
-      req.file.originalname,
-      req.file.mimetype,
-      'avatars'
-    );
-
-    console.log('[UPLOAD_AVATAR] R2 upload success', {
-      userId: req.userId,
-      secureUrl: result.secure_url,
-      publicId: result.public_id,
-    });
-
-    // Fetch the listener to get the old profile image URL
+    // 1. Fetch the listener to get the old profile image URL
     const getQuery = `
       SELECT profile_image
       FROM listeners
@@ -1428,27 +1417,56 @@ router.post('/upload-avatar', authenticate, (req, res, next) => {
       return res.status(404).json({ error: 'Listener profile not found' });
     }
 
-    const oldImageUrl = getResult.rows[0].profile_image;
+    oldImageUrl = getResult.rows[0].profile_image;
 
-    // Save the URL to the listeners table
+    // 2. Delete the old image from Cloudflare FIRST
+    if (oldImageUrl) {
+      try {
+        await deleteFromMinioByUrl(oldImageUrl);
+        console.log(`[UPLOAD_AVATAR] Old avatar deleted successfully: ${oldImageUrl}`);
+        isOldDeleted = true;
+      } catch (deleteError) {
+        console.error(`[UPLOAD_AVATAR] Failed to delete old avatar: ${oldImageUrl}`, deleteError);
+        // Continue anyway so the user can still update their avatar
+      }
+    }
+
+    // 3. Upload the new buffer to Cloudflare R2
+    let result;
+    try {
+      result = await uploadToMinio(
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype,
+        'avatars'
+      );
+      console.log('[UPLOAD_AVATAR] R2 upload success', {
+        userId: req.userId,
+        secureUrl: result.secure_url,
+        publicId: result.public_id,
+      });
+    } catch (uploadError) {
+      // If upload fails but we already deleted the old image, clear it in DB
+      if (isOldDeleted) {
+        const clearQuery = `
+          UPDATE listeners
+          SET profile_image = NULL
+          WHERE user_id = $1
+        `;
+        await pool.query(clearQuery, [req.userId]);
+        console.log('[UPLOAD_AVATAR] Cleared broken old image link in database due to upload failure.');
+      }
+      throw uploadError; // rethrow to be caught by outer catch
+    }
+
+    // 4. Save the new URL to the listeners table
     const updateQuery = `
       UPDATE listeners
       SET profile_image = $1
       WHERE user_id = $2
       RETURNING profile_image
     `;
-    const dbResult = await pool.query(updateQuery, [result.secure_url, req.userId]);
-
-    // Delete the old image from R2 if it exists and is different from the new one
-    // Only delete if it belongs to our Cloudflare R2 bucket (deleteFromMinioByUrl handles this check typically)
-    if (oldImageUrl && oldImageUrl !== result.secure_url) {
-      try {
-        await deleteFromMinioByUrl(oldImageUrl);
-        console.log(`[UPLOAD_AVATAR] Old avatar deleted successfully: ${oldImageUrl}`);
-      } catch (deleteError) {
-        console.error(`[UPLOAD_AVATAR] Failed to delete old avatar: ${oldImageUrl}`, deleteError);
-      }
-    }
+    await pool.query(updateQuery, [result.secure_url, req.userId]);
 
     res.json({
       message: 'Avatar uploaded successfully',
