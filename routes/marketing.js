@@ -80,7 +80,7 @@ router.get('/newbies', authenticateAdmin, async (req, res) => {
 });
 
 // GET /api/marketing/campaigns
-// List scheduled/sent marketing campaigns from notification_outbox
+// List scheduled marketing campaigns (schedule_at IS NOT NULL) from notification_outbox
 router.get('/campaigns', authenticateAdmin, async (req, res) => {
   try {
     const { page = 1, limit = 50 } = req.query;
@@ -90,6 +90,7 @@ router.get('/campaigns', authenticateAdmin, async (req, res) => {
               status, created_at, delivered_at, retry_count, last_error, delivered_count, language_filter
        FROM notification_outbox
        WHERE target_role = 'USER'
+         AND schedule_at IS NOT NULL
        ORDER BY created_at DESC
        LIMIT $1 OFFSET $2`,
       [Number(limit), offset]
