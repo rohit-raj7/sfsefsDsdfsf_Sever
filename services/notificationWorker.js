@@ -41,6 +41,10 @@ function getConnectedRoomSize(roomName) {
 const scheduledOutboxTimers = new Map();
 const MAX_TIMER_MS = 2147483647;
 
+// ─── Processing Lock (prevent duplicate concurrent sends) ────────────
+// Tracks outbox IDs currently being processed to avoid double-delivery
+const processingLock = new Set();
+
 function clearScheduledTimer(outboxId) {
   const existing = scheduledOutboxTimers.get(outboxId);
   if (existing) {
@@ -187,6 +191,13 @@ export async function processNotifications() {
 
 // ─── Process Single Outbox Item (Batched) ───────────────────────────
 async function processOutboxItem(outbox) {
+  // Guard: skip if this outbox item is already being processed in this process
+  if (processingLock.has(outbox.id)) {
+    console.warn(`[NotificationWorker] Skipping duplicate processing for outbox=${outbox.id} (already in progress)`);
+    return;
+  }
+  processingLock.add(outbox.id);
+
   const startTime = Date.now();
   clearScheduledTimer(outbox.id);
 
@@ -215,8 +226,15 @@ async function processOutboxItem(outbox) {
     notifIdMap.set(row.user_id, row);
   }
 
-  // ── Step 3: Socket broadcast to connected users ───────────────────
-  for (const user of users) {
+  // ── Step 3: Socket broadcast — ONLY for users without FCM tokens ──
+  // Users with FCM tokens will receive push notifications in Step 4.
+  // Sending socket events to ALL users causes duplicates for users
+  // who have both an active socket connection AND an FCM token.
+  const usersWithTokens = users.filter((u) => Boolean(u.fcm_token));
+  const usersMissingTokens = users.filter((u) => !u.fcm_token);
+
+  // Emit via socket only to users that have no FCM token (their only real-time channel)
+  for (const user of usersMissingTokens) {
     const notif = notifIdMap.get(user.user_id);
     if (!notif) continue;
     const payload = {
@@ -230,9 +248,6 @@ async function processOutboxItem(outbox) {
   }
 
   // ── Step 4: Batch FCM send ────────────────────────────────────────
-  const usersWithTokens = users.filter((u) => Boolean(u.fcm_token));
-  const usersMissingTokens = users.filter((u) => !u.fcm_token);
-
   const fcmResults = usersWithTokens.length > 0
     ? await sendBatchFCM(
         usersWithTokens.map((u) => ({
@@ -260,7 +275,7 @@ async function processOutboxItem(outbox) {
     failureReasonCounts.set(normalized, (failureReasonCounts.get(normalized) || 0) + 1);
   };
 
-  // Process FCM results
+  // Process FCM results — use socket as fallback only when FCM fails
   const invalidTokenUsers = [];
   for (const result of fcmResults) {
     if (result.success) {
@@ -269,9 +284,21 @@ async function processOutboxItem(outbox) {
       deliveryUpdates.errors.push(null);
       sentCount++;
     } else {
-      // Check if user is connected via socket (fallback)
+      // FCM failed — fall back to socket if the user is currently connected
       const isConnected = getConnectedRoomSize(`user_${result.userId}`) > 0;
       if (isConnected) {
+        // Send via socket as fallback (FCM failed but user is online)
+        const notif = notifIdMap.get(result.userId);
+        if (notif) {
+          const payload = {
+            id: notif.notification_id,
+            title: outbox.title,
+            body: outbox.body,
+            outboxId: outbox.id,
+            createdAt: notif.created_at instanceof Date ? notif.created_at.toISOString() : notif.created_at,
+          };
+          notificationEmitter?.to(`user_${result.userId}`).emit('app:notification', payload);
+        }
         deliveryUpdates.userIds.push(result.userId);
         deliveryUpdates.statuses.push('SENT');
         deliveryUpdates.errors.push(`FCM failed, delivered via socket: ${result.error}`);
@@ -289,7 +316,7 @@ async function processOutboxItem(outbox) {
     }
   }
 
-  // Process users missing FCM tokens
+  // Process users missing FCM tokens (already emitted via socket above in Step 3)
   for (const user of usersMissingTokens) {
     const isConnected = getConnectedRoomSize(`user_${user.user_id}`) > 0;
     if (isConnected) {
@@ -388,6 +415,9 @@ async function processOutboxItem(outbox) {
     `[NotificationWorker] outbox=${outbox.id} status=${outboxStatus} recipients=${totalRecipients} ` +
     `sent=${sentCount} failed=${failedCount} fcm_batch=${usersWithTokens.length} elapsed=${elapsed}ms`,
   );
+
+  // Release the processing lock for this outbox item
+  processingLock.delete(outbox.id);
 }
 
 // ─── DB Helper: Fetch Recipients ────────────────────────────────────
@@ -494,6 +524,7 @@ async function batchInsertNotifications(outbox, userIds) {
     `INSERT INTO notifications (user_id, title, message, notification_type, is_read, data, source_outbox_id)
      SELECT uid, $2, $3, 'system', FALSE, $4::jsonb, $5
      FROM unnest($1::uuid[]) AS uid
+     ON CONFLICT (user_id, source_outbox_id) DO NOTHING
      RETURNING notification_id, user_id, created_at`,
     [
       userIds,
