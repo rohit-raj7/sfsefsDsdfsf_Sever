@@ -41,10 +41,6 @@ function getConnectedRoomSize(roomName) {
 const scheduledOutboxTimers = new Map();
 const MAX_TIMER_MS = 2147483647;
 
-// ─── Processing Lock (prevent duplicate concurrent sends) ────────────
-// Tracks outbox IDs currently being processed to avoid double-delivery
-const processingLock = new Set();
-
 function clearScheduledTimer(outboxId) {
   const existing = scheduledOutboxTimers.get(outboxId);
   if (existing) {
@@ -191,235 +187,207 @@ export async function processNotifications() {
 
 // ─── Process Single Outbox Item (Batched) ───────────────────────────
 async function processOutboxItem(outbox) {
-  // Guard: skip if this outbox item is already being processed in this process
-  if (processingLock.has(outbox.id)) {
-    console.warn(`[NotificationWorker] Skipping duplicate processing for outbox=${outbox.id} (already in progress)`);
-    return;
-  }
-  processingLock.add(outbox.id);
+  const startTime = Date.now();
+  clearScheduledTimer(outbox.id);
 
-  try {
-    const startTime = Date.now();
-    clearScheduledTimer(outbox.id);
+  // ── Step 1: Fetch recipients ──────────────────────────────────────
+  const users = await fetchRecipients(outbox);
+  const totalRecipients = users.length;
 
-    // ── Step 1: Fetch recipients ──────────────────────────────────────
-    const users = await fetchRecipients(outbox);
-    const totalRecipients = users.length;
-
-    if (totalRecipients === 0) {
-      await pool.query(
-        `UPDATE notification_outbox
-         SET status = 'FAILED', last_error = $2
-         WHERE id = $1`,
-        [outbox.id, 'No active target users found for this notification'],
-      );
-      return;
-    }
-
-    // ── Step 2: Batch INSERT notifications + deliveries ───────────────
-    const userIds = users.map((u) => u.user_id);
-    const notificationRows = await batchInsertNotifications(outbox, userIds);
-    await batchInsertDeliveries(outbox.id, userIds);
-
-    // Build notification ID map: userId -> notificationId
-    const notifIdMap = new Map();
-    for (const row of notificationRows) {
-      notifIdMap.set(row.user_id, row);
-    }
-
-    // ── Step 3: Socket broadcast — ONLY for users without FCM tokens ──
-    // Users with FCM tokens will receive push notifications in Step 4.
-    // Sending socket events to ALL users causes duplicates for users
-    // who have both an active socket connection AND an FCM token.
-    const usersWithTokens = users.filter((u) => Boolean(u.fcm_token));
-    const usersMissingTokens = users.filter((u) => !u.fcm_token);
-
-    // Emit via socket only to users that have no FCM token (their only real-time channel)
-    for (const user of usersMissingTokens) {
-      const notif = notifIdMap.get(user.user_id);
-      if (!notif) continue;
-      const payload = {
-        id: notif.notification_id,
-        title: outbox.title,
-        body: outbox.body,
-        outboxId: outbox.id,
-        createdAt: notif.created_at instanceof Date ? notif.created_at.toISOString() : notif.created_at,
-      };
-      notificationEmitter?.to(`user_${user.user_id}`).emit('app:notification', payload);
-    }
-
-    // ── Step 4: Batch FCM send ────────────────────────────────────────
-    const fcmResults = usersWithTokens.length > 0
-      ? await sendBatchFCM(
-        usersWithTokens.map((u) => ({
-          userId: u.user_id,
-          token: u.fcm_token,
-          title: outbox.title,
-          body: outbox.body,
-          data: {
-            outboxId: String(outbox.id),
-            notificationId: String(notifIdMap.get(u.user_id)?.notification_id || ''),
-            type: 'admin_notification',
-          },
-        })),
-      )
-      : [];
-
-    // ── Step 5: Classify results and batch update deliveries ──────────
-    const deliveryUpdates = { userIds: [], statuses: [], errors: [] };
-    let sentCount = 0;
-    let failedCount = 0;
-    const failureReasonCounts = new Map();
-
-    const trackFailure = (reason) => {
-      const normalized = String(reason || 'Unknown delivery error').trim() || 'Unknown delivery error';
-      failureReasonCounts.set(normalized, (failureReasonCounts.get(normalized) || 0) + 1);
-    };
-
-    // Process FCM results — use socket as fallback only when FCM fails
-    const invalidTokenUsers = [];
-    for (const result of fcmResults) {
-      if (result.success) {
-        deliveryUpdates.userIds.push(result.userId);
-        deliveryUpdates.statuses.push('SENT');
-        deliveryUpdates.errors.push(null);
-        sentCount++;
-      } else {
-        // FCM failed — fall back to socket if the user is currently connected
-        const isConnected = getConnectedRoomSize(`user_${result.userId}`) > 0;
-        if (isConnected) {
-          // Send via socket as fallback (FCM failed but user is online)
-          const notif = notifIdMap.get(result.userId);
-          if (notif) {
-            const payload = {
-              id: notif.notification_id,
-              title: outbox.title,
-              body: outbox.body,
-              outboxId: outbox.id,
-              createdAt: notif.created_at instanceof Date ? notif.created_at.toISOString() : notif.created_at,
-            };
-            notificationEmitter?.to(`user_${result.userId}`).emit('app:notification', payload);
-          }
-          deliveryUpdates.userIds.push(result.userId);
-          deliveryUpdates.statuses.push('SENT');
-          deliveryUpdates.errors.push(`FCM failed, delivered via socket: ${result.error}`);
-          sentCount++;
-        } else {
-          deliveryUpdates.userIds.push(result.userId);
-          deliveryUpdates.statuses.push('FAILED');
-          deliveryUpdates.errors.push(result.error);
-          failedCount++;
-          trackFailure(result.error);
-        }
-        if (result.isInvalidToken) {
-          invalidTokenUsers.push({ userId: result.userId, token: result.token, error: result.error });
-        }
-      }
-    }
-
-    // Process users missing FCM tokens (already emitted via socket above in Step 3)
-    for (const user of usersMissingTokens) {
-      const isConnected = getConnectedRoomSize(`user_${user.user_id}`) > 0;
-      if (isConnected) {
-        deliveryUpdates.userIds.push(user.user_id);
-        deliveryUpdates.statuses.push('SENT');
-        deliveryUpdates.errors.push('FCM token missing, delivered via active socket session');
-        sentCount++;
-      } else {
-        deliveryUpdates.userIds.push(user.user_id);
-        deliveryUpdates.statuses.push('FAILED');
-        deliveryUpdates.errors.push('No registered FCM token');
-        failedCount++;
-        trackFailure('No registered FCM token');
-      }
-    }
-
-    // Batch UPDATE all delivery statuses in one query
-    if (deliveryUpdates.userIds.length > 0) {
-      await pool.query(
-        `UPDATE notification_deliveries
-         SET status = batch.new_status,
-             delivered_at = CASE WHEN batch.new_status = 'SENT' THEN CURRENT_TIMESTAMP ELSE delivered_at END,
-             last_error = batch.new_error,
-             retry_count = CASE WHEN batch.new_status = 'FAILED' THEN retry_count + 1 ELSE retry_count END
-         FROM (
-           SELECT unnest($1::uuid[]) AS uid,
-                  unnest($2::text[]) AS new_status,
-                  unnest($3::text[]) AS new_error
-         ) AS batch
-         WHERE notification_deliveries.outbox_id = $4
-           AND notification_deliveries.user_id = batch.uid`,
-        [deliveryUpdates.userIds, deliveryUpdates.statuses, deliveryUpdates.errors, outbox.id],
-      );
-    }
-
-    // ── Step 6: Clear invalid tokens (async, non-blocking) ────────────
-    for (const inv of invalidTokenUsers) {
-      User.clearFcmToken(inv.userId, inv.token).catch((e) => {
-        console.error(`[NotificationWorker] Failed to clear invalid token user=${inv.userId}: ${e.message}`);
-      });
-    }
-
-    // ── Step 7: Update outbox status ──────────────────────────────────
-    const outboxStatus = sentCount > 0 ? 'SENT' : 'FAILED';
-    const deliveredAt = outboxStatus === 'SENT' ? new Date() : null;
-    const summarizedFailures = Array.from(failureReasonCounts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 3)
-      .map(([reason, count]) => `${reason} (${count})`)
-      .join(', ');
-
-    const allFailedMissingToken =
-      failedCount === totalRecipients &&
-      failureReasonCounts.size === 1 &&
-      failureReasonCounts.has('No registered FCM token');
-
-    const outboxLastError =
-      totalRecipients === 0
-        ? 'No active target users found for this notification'
-        : allFailedMissingToken
-          ? `Delivery failed for ${failedCount}/${totalRecipients} recipients: no registered FCM token (${failedCount}). Ask the user to open the updated app once so the device token can sync.`
-          : failedCount > 0
-            ? summarizedFailures
-              ? `Delivery failed for ${failedCount}/${totalRecipients} recipients: ${summarizedFailures}`
-              : `Delivery failed for ${failedCount}/${totalRecipients} recipients`
-            : null;
-
+  if (totalRecipients === 0) {
     await pool.query(
       `UPDATE notification_outbox
-       SET status = $2, delivered_at = $3, retry_count = retry_count + 1, last_error = $4, delivered_count = $5
+       SET status = 'FAILED', last_error = $2
        WHERE id = $1`,
-      [outbox.id, outboxStatus, deliveredAt, outboxLastError, sentCount],
+      [outbox.id, 'No active target users found for this notification'],
     );
-
-    // ── Step 8: Schedule next recurrence ──────────────────────────────
-    if (outbox.repeat_interval && outbox.schedule_at) {
-      const interval = outbox.repeat_interval === 'daily' ? '1 day' : '7 days';
-      const nextOutbox = await pool.query(
-        `INSERT INTO notification_outbox (
-           title, body, target_role, target_user_ids,
-           schedule_at, repeat_interval, created_by, language_filter
-         )
-         VALUES ($1, $2, $3, $4, $5::timestamp + $6::interval, $7, $8, $9)
-         RETURNING id, schedule_at, status`,
-        [
-          outbox.title, outbox.body, outbox.target_role, outbox.target_user_ids,
-          outbox.schedule_at, interval, outbox.repeat_interval, outbox.created_by,
-          outbox.language_filter || null,
-        ],
-      );
-      scheduleOutboxProcessing(nextOutbox.rows[0]);
-    }
-
-    const elapsed = Date.now() - startTime;
-    console.log(
-      `[NotificationWorker] outbox=${outbox.id} status=${outboxStatus} recipients=${totalRecipients} ` +
-      `sent=${sentCount} failed=${failedCount} fcm_batch=${usersWithTokens.length} elapsed=${elapsed}ms`,
-    );
-  } finally {
-    // Always release the processing lock — even on early return or thrown exception
-    processingLock.delete(outbox.id);
+    return;
   }
+
+  // ── Step 2: Batch INSERT notifications + deliveries ───────────────
+  const userIds = users.map((u) => u.user_id);
+  const notificationRows = await batchInsertNotifications(outbox, userIds);
+  await batchInsertDeliveries(outbox.id, userIds);
+
+  // Build notification ID map: userId -> notificationId
+  const notifIdMap = new Map();
+  for (const row of notificationRows) {
+    notifIdMap.set(row.user_id, row);
+  }
+
+  // ── Step 3: Socket broadcast to connected users ───────────────────
+  for (const user of users) {
+    const notif = notifIdMap.get(user.user_id);
+    if (!notif) continue;
+    const payload = {
+      id: notif.notification_id,
+      title: outbox.title,
+      body: outbox.body,
+      outboxId: outbox.id,
+      createdAt: notif.created_at instanceof Date ? notif.created_at.toISOString() : notif.created_at,
+    };
+    notificationEmitter?.to(`user_${user.user_id}`).emit('app:notification', payload);
+  }
+
+  // ── Step 4: Batch FCM send ────────────────────────────────────────
+  const usersWithTokens = users.filter((u) => Boolean(u.fcm_token));
+  const usersMissingTokens = users.filter((u) => !u.fcm_token);
+
+  const fcmResults = usersWithTokens.length > 0
+    ? await sendBatchFCM(
+      usersWithTokens.map((u) => ({
+        userId: u.user_id,
+        token: u.fcm_token,
+        title: outbox.title,
+        body: outbox.body,
+        data: {
+          outboxId: String(outbox.id),
+          notificationId: String(notifIdMap.get(u.user_id)?.notification_id || ''),
+          type: 'admin_notification',
+        },
+      })),
+    )
+    : [];
+
+  // ── Step 5: Classify results and batch update deliveries ──────────
+  const deliveryUpdates = { userIds: [], statuses: [], errors: [] };
+  let sentCount = 0;
+  let failedCount = 0;
+  const failureReasonCounts = new Map();
+
+  const trackFailure = (reason) => {
+    const normalized = String(reason || 'Unknown delivery error').trim() || 'Unknown delivery error';
+    failureReasonCounts.set(normalized, (failureReasonCounts.get(normalized) || 0) + 1);
+  };
+
+  // Process FCM results
+  const invalidTokenUsers = [];
+  for (const result of fcmResults) {
+    if (result.success) {
+      deliveryUpdates.userIds.push(result.userId);
+      deliveryUpdates.statuses.push('SENT');
+      deliveryUpdates.errors.push(null);
+      sentCount++;
+    } else {
+      // Check if user is connected via socket (fallback)
+      const isConnected = getConnectedRoomSize(`user_${result.userId}`) > 0;
+      if (isConnected) {
+        deliveryUpdates.userIds.push(result.userId);
+        deliveryUpdates.statuses.push('SENT');
+        deliveryUpdates.errors.push(`FCM failed, delivered via socket: ${result.error}`);
+        sentCount++;
+      } else {
+        deliveryUpdates.userIds.push(result.userId);
+        deliveryUpdates.statuses.push('FAILED');
+        deliveryUpdates.errors.push(result.error);
+        failedCount++;
+        trackFailure(result.error);
+      }
+      if (result.isInvalidToken) {
+        invalidTokenUsers.push({ userId: result.userId, token: result.token, error: result.error });
+      }
+    }
+  }
+
+  // Process users missing FCM tokens
+  for (const user of usersMissingTokens) {
+    const isConnected = getConnectedRoomSize(`user_${user.user_id}`) > 0;
+    if (isConnected) {
+      deliveryUpdates.userIds.push(user.user_id);
+      deliveryUpdates.statuses.push('SENT');
+      deliveryUpdates.errors.push('FCM token missing, delivered via active socket session');
+      sentCount++;
+    } else {
+      deliveryUpdates.userIds.push(user.user_id);
+      deliveryUpdates.statuses.push('FAILED');
+      deliveryUpdates.errors.push('No registered FCM token');
+      failedCount++;
+      trackFailure('No registered FCM token');
+    }
+  }
+
+  // Batch UPDATE all delivery statuses in one query
+  if (deliveryUpdates.userIds.length > 0) {
+    await pool.query(
+      `UPDATE notification_deliveries
+       SET status = batch.new_status,
+           delivered_at = CASE WHEN batch.new_status = 'SENT' THEN CURRENT_TIMESTAMP ELSE delivered_at END,
+           last_error = batch.new_error,
+           retry_count = CASE WHEN batch.new_status = 'FAILED' THEN retry_count + 1 ELSE retry_count END
+       FROM (
+         SELECT unnest($1::uuid[]) AS uid,
+                unnest($2::text[]) AS new_status,
+                unnest($3::text[]) AS new_error
+       ) AS batch
+       WHERE notification_deliveries.outbox_id = $4
+         AND notification_deliveries.user_id = batch.uid`,
+      [deliveryUpdates.userIds, deliveryUpdates.statuses, deliveryUpdates.errors, outbox.id],
+    );
+  }
+
+  // ── Step 6: Clear invalid tokens (async, non-blocking) ────────────
+  for (const inv of invalidTokenUsers) {
+    User.clearFcmToken(inv.userId, inv.token).catch((e) => {
+      console.error(`[NotificationWorker] Failed to clear invalid token user=${inv.userId}: ${e.message}`);
+    });
+  }
+
+  // ── Step 7: Update outbox status ──────────────────────────────────
+  const outboxStatus = sentCount > 0 ? 'SENT' : 'FAILED';
+  const deliveredAt = outboxStatus === 'SENT' ? new Date() : null;
+  const summarizedFailures = Array.from(failureReasonCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([reason, count]) => `${reason} (${count})`)
+    .join(', ');
+
+  const allFailedMissingToken =
+    failedCount === totalRecipients &&
+    failureReasonCounts.size === 1 &&
+    failureReasonCounts.has('No registered FCM token');
+
+  const outboxLastError =
+    totalRecipients === 0
+      ? 'No active target users found for this notification'
+      : allFailedMissingToken
+        ? `Delivery failed for ${failedCount}/${totalRecipients} recipients: no registered FCM token (${failedCount}). Ask the user to open the updated app once so the device token can sync.`
+        : failedCount > 0
+          ? summarizedFailures
+            ? `Delivery failed for ${failedCount}/${totalRecipients} recipients: ${summarizedFailures}`
+            : `Delivery failed for ${failedCount}/${totalRecipients} recipients`
+          : null;
+
+  await pool.query(
+    `UPDATE notification_outbox
+     SET status = $2, delivered_at = $3, retry_count = retry_count + 1, last_error = $4, delivered_count = $5
+     WHERE id = $1`,
+    [outbox.id, outboxStatus, deliveredAt, outboxLastError, sentCount],
+  );
+
+  // ── Step 8: Schedule next recurrence ──────────────────────────────
+  if (outbox.repeat_interval && outbox.schedule_at) {
+    const interval = outbox.repeat_interval === 'daily' ? '1 day' : '7 days';
+    const nextOutbox = await pool.query(
+      `INSERT INTO notification_outbox (
+         title, body, target_role, target_user_ids,
+         schedule_at, repeat_interval, created_by, language_filter
+       )
+       VALUES ($1, $2, $3, $4, $5::timestamp + $6::interval, $7, $8, $9)
+       RETURNING id, schedule_at, status`,
+      [
+        outbox.title, outbox.body, outbox.target_role, outbox.target_user_ids,
+        outbox.schedule_at, interval, outbox.repeat_interval, outbox.created_by,
+        outbox.language_filter || null,
+      ],
+    );
+    scheduleOutboxProcessing(nextOutbox.rows[0]);
+  }
+
+  const elapsed = Date.now() - startTime;
+  console.log(
+    `[NotificationWorker] outbox=${outbox.id} status=${outboxStatus} recipients=${totalRecipients} ` +
+    `sent=${sentCount} failed=${failedCount} fcm_batch=${usersWithTokens.length} elapsed=${elapsed}ms`,
+  );
 }
 
 // ─── DB Helper: Fetch Recipients ────────────────────────────────────
@@ -526,7 +494,6 @@ async function batchInsertNotifications(outbox, userIds) {
     `INSERT INTO notifications (user_id, title, message, notification_type, is_read, data, source_outbox_id)
      SELECT uid, $2, $3, 'system', FALSE, $4::jsonb, $5
      FROM unnest($1::uuid[]) AS uid
-     ON CONFLICT (user_id, source_outbox_id) DO NOTHING
      RETURNING notification_id, user_id, created_at`,
     [
       userIds,

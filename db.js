@@ -805,28 +805,6 @@ async function ensureSchema() {
     `;
     await pool.query(alterNotificationsSql);
 
-    // Unique constraint to prevent duplicate notifications per user per outbox (double-send guard)
-    await pool.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'uq_notifications_user_outbox'
-        ) THEN
-          -- Remove any existing duplicates before adding the constraint
-          DELETE FROM notifications n1
-          USING notifications n2
-          WHERE n1.notification_id > n2.notification_id
-            AND n1.user_id = n2.user_id
-            AND n1.source_outbox_id = n2.source_outbox_id
-            AND n1.source_outbox_id IS NOT NULL;
-          -- Add the unique constraint
-          ALTER TABLE notifications
-            ADD CONSTRAINT uq_notifications_user_outbox UNIQUE (user_id, source_outbox_id);
-        END IF;
-      END$$;
-    `);
-
     const createContactMessagesSql = `
       CREATE TABLE IF NOT EXISTS contact_messages (
         contact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
