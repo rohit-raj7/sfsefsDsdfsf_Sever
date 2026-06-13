@@ -438,14 +438,50 @@ router.get('/stats/leaderboard', authenticate, async (req, res) => {
       ? requestedPeriod
       : 'weekly';
 
+    const requestedSortBy = String(req.query.sortBy || 'duration').toLowerCase();
+    const allowedSortBy = new Set(['duration', 'rating', 'followers']);
+    const sortBy = allowedSortBy.has(requestedSortBy)
+      ? requestedSortBy
+      : 'duration';
+
     let callPeriodClause = '';
     let ratingPeriodClause = '';
+    let followerPeriodClause = '';
+
     if (period === 'weekly') {
       callPeriodClause = ` AND c.created_at >= NOW() - INTERVAL '7 days'`;
       ratingPeriodClause = ` AND r.created_at >= NOW() - INTERVAL '7 days'`;
+      followerPeriodClause = ` AND created_at >= NOW() - INTERVAL '7 days'`;
     } else if (period === 'monthly') {
       callPeriodClause = ` AND c.created_at >= NOW() - INTERVAL '30 days'`;
       ratingPeriodClause = ` AND r.created_at >= NOW() - INTERVAL '30 days'`;
+      followerPeriodClause = ` AND created_at >= NOW() - INTERVAL '30 days'`;
+    }
+
+    let orderBySql = '';
+    if (sortBy === 'rating') {
+      orderBySql = `
+        COALESCE(rs.average_rating, l.average_rating, 0) DESC,
+        COALESCE(cs.total_minutes, 0) DESC,
+        COALESCE(fs.followers_count, 0) DESC,
+        l.created_at ASC
+      `;
+    } else if (sortBy === 'followers') {
+      orderBySql = `
+        COALESCE(fs.followers_count, 0) DESC,
+        COALESCE(rs.average_rating, l.average_rating, 0) DESC,
+        COALESCE(cs.total_minutes, 0) DESC,
+        l.created_at ASC
+      `;
+    } else {
+      // Default: duration
+      orderBySql = `
+        COALESCE(cs.total_minutes, 0) DESC,
+        COALESCE(rs.average_rating, l.average_rating, 0) DESC,
+        COALESCE(cs.total_calls, 0) DESC,
+        COALESCE(fs.followers_count, 0) DESC,
+        l.created_at ASC
+      `;
     }
 
     const leaderboardQuery = `
@@ -482,6 +518,15 @@ router.get('/stats/leaderboard', authenticate, async (req, res) => {
           ${ratingPeriodClause}
         GROUP BY r.listener_id
       ),
+      follower_stats AS (
+        SELECT
+          listener_user_id,
+          COUNT(*)::int AS followers_count
+        FROM user_listener_follows
+        WHERE 1=1
+          ${followerPeriodClause}
+        GROUP BY listener_user_id
+      ),
       ranked AS (
         SELECT
           l.listener_id,
@@ -492,16 +537,15 @@ router.get('/stats/leaderboard', authenticate, async (req, res) => {
           COALESCE(cs.total_minutes, 0) AS total_minutes,
           COALESCE(rs.average_rating, l.average_rating, 0) AS average_rating,
           COALESCE(rs.total_ratings, l.total_ratings, 0) AS total_ratings,
+          COALESCE(fs.followers_count, 0) AS followers_count,
           RANK() OVER (
             ORDER BY
-              COALESCE(cs.total_minutes, 0) DESC,
-              COALESCE(rs.average_rating, l.average_rating, 0) DESC,
-              COALESCE(cs.total_calls, 0) DESC,
-              l.created_at ASC
+              ${orderBySql}
           ) AS rank
         FROM listeners l
         LEFT JOIN call_stats cs ON cs.listener_id = l.listener_id
         LEFT JOIN rating_stats rs ON rs.listener_id = l.listener_id
+        LEFT JOIN follower_stats fs ON fs.listener_user_id = l.user_id
         WHERE l.is_active = TRUE
           AND (l.verification_status = 'approved' OR l.is_verified = TRUE)
       )
@@ -514,9 +558,10 @@ router.get('/stats/leaderboard', authenticate, async (req, res) => {
         total_minutes,
         average_rating,
         total_ratings,
+        followers_count,
         rank
       FROM ranked
-      WHERE total_calls > 0 OR total_ratings > 0
+      WHERE total_calls > 0 OR total_ratings > 0 OR followers_count > 0
       ORDER BY rank ASC
       LIMIT 10
     `;
@@ -560,6 +605,15 @@ router.get('/stats/leaderboard', authenticate, async (req, res) => {
             ${ratingPeriodClause}
           GROUP BY r.listener_id
         ),
+        follower_stats AS (
+          SELECT
+            listener_user_id,
+            COUNT(*)::int AS followers_count
+          FROM user_listener_follows
+          WHERE 1=1
+            ${followerPeriodClause}
+          GROUP BY listener_user_id
+        ),
         ranked AS (
           SELECT
             l.listener_id,
@@ -568,20 +622,19 @@ router.get('/stats/leaderboard', authenticate, async (req, res) => {
             COALESCE(cs.total_minutes, 0) AS total_minutes,
             COALESCE(rs.average_rating, l.average_rating, 0) AS average_rating,
             COALESCE(rs.total_ratings, l.total_ratings, 0) AS total_ratings,
+            COALESCE(fs.followers_count, 0) AS followers_count,
             RANK() OVER (
               ORDER BY
-                COALESCE(cs.total_minutes, 0) DESC,
-                COALESCE(rs.average_rating, l.average_rating, 0) DESC,
-                COALESCE(cs.total_calls, 0) DESC,
-                l.created_at ASC
+                ${orderBySql}
             ) AS rank
           FROM listeners l
           LEFT JOIN call_stats cs ON cs.listener_id = l.listener_id
           LEFT JOIN rating_stats rs ON rs.listener_id = l.listener_id
+          LEFT JOIN follower_stats fs ON fs.listener_user_id = l.user_id
           WHERE l.is_active = TRUE
             AND (l.verification_status = 'approved' OR l.is_verified = TRUE)
         )
-        SELECT rank, total_calls, total_minutes, average_rating, total_ratings
+        SELECT rank, total_calls, total_minutes, average_rating, total_ratings, followers_count
         FROM ranked
         WHERE user_id = $1
       `;
@@ -597,6 +650,7 @@ router.get('/stats/leaderboard', authenticate, async (req, res) => {
     res.json({
       success: true,
       period,
+      sortBy,
       leaderboard,
       myStats,
     });
