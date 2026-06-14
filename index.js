@@ -1903,11 +1903,14 @@ io.on('connection', (socket) => {
 
     console.log(`[SOCKET] Disconnected: ${socket.id} (User: ${userId}, Listener: ${listenerUserId})`);
 
+    let isInGracePeriod = false;
+
     // Clear any active call timers for this user's calls (matches both caller and listener)
     for (const [callId, timerData] of activeCallTimers.entries()) {
       const isCaller = String(timerData.callerId) === String(userId);
       const isListener = timerData.listenerUserId && String(timerData.listenerUserId) === String(userId);
       if (isCaller || isListener) {
+        isInGracePeriod = true;
         if (reconnectGracePeriods.has(callId)) {
           continue; // Already in grace period
         }
@@ -1986,7 +1989,7 @@ io.on('connection', (socket) => {
       }
 
       // BUSY: Clear busy on disconnect (safety net)
-      if (busyUsers.has(listenerUserId)) {
+      if (busyUsers.has(listenerUserId) && !isInGracePeriod) {
         busyUsers.delete(listenerUserId);
         io.emit('listener_busy_status', { listenerUserId, busy: false });
         console.log(`[SOCKET] Listener ${listenerUserId} busy cleared on disconnect`);
@@ -1997,7 +2000,7 @@ io.on('connection', (socket) => {
     // Handle user cleanup and active calls
     if (userId) {
       // BUSY: Clear busy if this userId is a busy listener (covers both listenerUserId and userId)
-      if (busyUsers.has(userId)) {
+      if (busyUsers.has(userId) && !isInGracePeriod) {
         busyUsers.delete(userId);
         io.emit('listener_busy_status', { listenerUserId: userId, busy: false });
         console.log(`[SOCKET] User ${userId} busy cleared on disconnect (userId path)`);
